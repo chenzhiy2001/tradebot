@@ -1,0 +1,4 @@
+private_key.py
+.venv/
+__pycache__/
+trades.json
