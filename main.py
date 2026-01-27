@@ -52,8 +52,6 @@ def get_15min_crypto_markets():
     
     # Crypto slugs: btc, eth, sol, xrp
     cryptos = ["btc", "eth", "sol", "xrp"]
-    # But we only do btc for now
-    cryptos = ["btc"]
     
     for epoch in [current_epoch, next_epoch]:
         for crypto in cryptos:
@@ -142,4 +140,4 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
 
 if __name__ == "__main__":
     # Run bot for 15-minute crypto markets (stops after 10 buys)
-    run_bot(threshold=0.9, buy_amount=40, max_buys=15)
+    run_bot(threshold=0.9, buy_amount=10, max_buys=15)

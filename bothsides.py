@@ -15,6 +15,8 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137  # Polygon mainnet
 PRIVATE_KEY = private_key
 FUNDER_ADDRESS = founder_address
+LIMIT_PRICE = 0.48
+ORDER_SIZE = 25  # Total size per market (split between both sides)
 
 # Initialize client
 client = ClobClient(
@@ -27,10 +29,10 @@ client = ClobClient(
 client.set_api_creds(client.create_or_derive_api_creds())
 
 def get_future_15min_crypto_markets():
-    """Fetch 15-minute crypto markets that start after now+10 minutes"""
+    """Fetch 15-minute crypto markets that start after now+2 minutes"""
     markets = []
     now = datetime.now(timezone.utc)
-    cutoff_time = now + timedelta(minutes=10)
+    cutoff_time = now + timedelta(minutes=2)
     
     # Check markets starting from now up to 2 hours ahead
     start_window = now.replace(second=0, microsecond=0)
@@ -45,11 +47,12 @@ def get_future_15min_crypto_markets():
     
     # Check next 8 fifteen-minute windows (2 hours)
     for i in range(8):
-        window = start_window + timedelta(minutes=15 * i)
-        epoch = int(window.timestamp())
+        window_start = start_window + timedelta(minutes=15 * i)
+        window_end = window_start + timedelta(minutes=15)
+        epoch = int(window_end.timestamp())  # Slug uses END time, not start time
         
         # Skip if this window starts before cutoff
-        if window < cutoff_time:
+        if window_start < cutoff_time:
             continue
         
         for crypto in cryptos:
@@ -61,7 +64,8 @@ def get_future_15min_crypto_markets():
                     for market in event.get("markets", []):
                         if not market.get("closed"):
                             # Add market with start time info
-                            market["start_time"] = window.isoformat()
+                            market["start_time"] = window_start.isoformat()
+                            market["end_time"] = window_end.isoformat()
                             markets.append(market)
             except Exception as e:
                 pass  # Silently skip missing markets
@@ -89,8 +93,8 @@ def save_trade(market_question, tokens, start_time):
         "market": market_question,
         "tokens": tokens,
         "start_time": start_time,
-        "limit_price": 0.4,
-        "size": 25
+        "limit_price": LIMIT_PRICE,
+        "size": ORDER_SIZE
     }
     with open("bothsides_trades.json", "a") as f:
         f.write(json.dumps(record) + "\n")
@@ -138,8 +142,8 @@ def place_bothside_orders(max_markets=10):
             try:
                 order = OrderArgs(
                     token_id=token,
-                    price=0.4,
-                    size=25.0,
+                    price=LIMIT_PRICE,
+                    size=ORDER_SIZE,
                     side=BUY
                 )
                 signed = client.create_order(order)
@@ -166,4 +170,4 @@ def place_bothside_orders(max_markets=10):
     print(f"{'='*60}")
 
 if __name__ == "__main__":
-    place_bothside_orders(max_markets=10)
+    place_bothside_orders(max_markets=16)
