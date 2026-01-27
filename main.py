@@ -69,35 +69,23 @@ def get_15min_crypto_markets():
     
     return markets
 
-def get_existing_orders_tokens():
-    """Query Polymarket for tokens we already have open orders on"""
+def get_existing_orders():
+    """Query Polymarket for all open orders with details"""
     try:
         open_orders = client.get_orders(OpenOrderParams())
-        # Extract token IDs from open orders
-        token_ids = set()
-        for order in open_orders:
-            token_id = order.get("asset_id")
-            if token_id:
-                token_ids.add(token_id)
-        return token_ids
+        return open_orders
     except Exception as e:
         print(f"Warning: Failed to fetch open orders: {e}")
-        return set()
+        return []
 
-def get_filled_trades_tokens():
-    """Query Polymarket for tokens we have filled trades on"""
+def get_filled_trades():
+    """Query Polymarket for filled trades with details"""
     try:
         trades = client.get_trades()
-        # Extract token IDs from filled trades
-        token_ids = set()
-        for trade in trades:
-            token_id = trade.get("asset_id")
-            if token_id:
-                token_ids.add(token_id)
-        return token_ids
+        return trades
     except Exception as e:
         print(f"Warning: Failed to fetch trades: {e}")
-        return set()
+        return []
 
 def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
     """Main bot loop: buy $1 when price > 80%"""
@@ -105,10 +93,6 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
     
     while buy_count < max_buys:
         try:
-            # Query existing orders and filled trades from Polymarket
-            existing_order_tokens = get_existing_orders_tokens()
-            filled_trades_tokens = get_filled_trades_tokens()
-            
             markets = get_15min_crypto_markets()
             for market in markets:
                 if buy_count >= max_buys:
@@ -118,6 +102,17 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                 question = market.get("question", "N/A")
                 tokens_string = market.get("clobTokenIds", "[]") # clobTokenIds is a STRING representing a list of token IDs
                 tokens = json.loads(tokens_string)
+                
+                # Fetch fresh data for each market
+                existing_orders = get_existing_orders()
+                filled_trades = get_filled_trades()
+                
+                # Extract token IDs from filled trades for the "both sides filled" check
+                filled_trades_tokens = set()
+                for trade in filled_trades:
+                    token_id = trade.get("asset_id")
+                    if token_id:
+                        filled_trades_tokens.add(token_id)
                 
                 # Check if we already have filled trades on BOTH sides (up and down)
                 # tokens[0] = UP token ID, tokens[1] = DOWN token ID
@@ -138,16 +133,36 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                 for token in tokens:
                     if buy_count >= max_buys:
                         break
-                        
-                    # Note: We don't check for existing open orders here
-                    # Open limit orders (e.g., at 40¢ from bothsides.py) can coexist
-                    # with market buys when price hits threshold (e.g., 90¢)
-                        
-                    # Get current price
-                    price_resp = client.get_price(token, "BUY")
-                    price = float(price_resp.get("price", 0))
-                    print(f"Current price: {price}")
+                    
+                    price_data = client.get_price(token, side=BUY)
+                    price = float(price_data.get("price", 0))
                     if price > threshold:
+                        # Check if we already have an open order OR filled trade with same token, price, and amount
+                        # (This prevents duplicate orders from main.py)
+                        has_duplicate = False
+                        
+                        # Check open orders
+                        for order in existing_orders:
+                            if (order.get("asset_id") == token and 
+                                abs(float(order.get("price", 0)) - price) < 0.01 and
+                                abs(float(order.get("original_size", 0)) * price - buy_amount) < 0.1):
+                                has_duplicate = True
+                                print(f"⊘ Skipping - already have OPEN order at {price} for ${buy_amount}")
+                                break
+                        
+                        # Check filled trades (recent ones)
+                        if not has_duplicate:
+                            for trade in filled_trades:
+                                if (trade.get("asset_id") == token and 
+                                    abs(float(trade.get("price", 0)) - price) < 0.01 and
+                                    abs(float(trade.get("size", 0)) * float(trade.get("price", 0)) - buy_amount) < 0.1):
+                                    has_duplicate = True
+                                    print(f"⊘ Skipping - already have FILLED trade at {price} for ${buy_amount}")
+                                    break
+                        
+                        if has_duplicate:
+                            continue
+                            
                         print(f"Price {price} > {threshold}, attempting to buy ${buy_amount}")
                         
                         # Use create_and_post_order - properly handles signature_type=1
