@@ -90,6 +90,7 @@ def get_filled_trades():
 def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
     """Main bot loop: buy $1 when price > 80%"""
     buy_count = 0  # Track number of successful buys
+    recent_buys = []  # Track buys in this session (token, price, amount)
     
     while buy_count < max_buys:
         try:
@@ -141,14 +142,24 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                         # (This prevents duplicate orders from main.py)
                         has_duplicate = False
                         
-                        # Check open orders
-                        for order in existing_orders:
-                            if (order.get("asset_id") == token and 
-                                abs(float(order.get("price", 0)) - price) < 0.01 and
-                                abs(float(order.get("original_size", 0)) * price - buy_amount) < 0.1):
+                        # Check recent buys in this session first (most reliable)
+                        for recent_token, recent_price, recent_amount in recent_buys:
+                            if (recent_token == token and 
+                                abs(recent_price - price) < 0.01 and
+                                abs(recent_amount - buy_amount) < 0.1):
                                 has_duplicate = True
-                                print(f"⊘ Skipping - already have OPEN order at {price} for ${buy_amount}")
+                                print(f"⊘ Skipping - already bought in this session at {price} for ${buy_amount}")
                                 break
+                        
+                        # Check open orders
+                        if not has_duplicate:
+                            for order in existing_orders:
+                                if (order.get("asset_id") == token and 
+                                    abs(float(order.get("price", 0)) - price) < 0.01 and
+                                    abs(float(order.get("original_size", 0)) * price - buy_amount) < 0.1):
+                                    has_duplicate = True
+                                    print(f"⊘ Skipping - already have OPEN order at {price} for ${buy_amount}")
+                                    break
                         
                         # Check filled trades (recent ones)
                         if not has_duplicate:
@@ -173,6 +184,8 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                             resp = client.post_order(signed, OrderType.FAK)
                             
                             buy_count += 1
+                            # Add to recent buys cache immediately
+                            recent_buys.append((token, price, buy_amount))
                             trade_record = {
                                 "timestamp": datetime.utcnow().isoformat(),
                                 "market": question,
