@@ -4,7 +4,7 @@ from py_clob_client import MarketOrderArgs, PartialCreateOrderOptions
 import requests
 import json
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams
 from py_clob_client.order_builder.constants import BUY
 from private_key import private_key,founder_address  # Importing from local file
 # Configuration
@@ -69,13 +69,46 @@ def get_15min_crypto_markets():
     
     return markets
 
+def get_existing_orders_tokens():
+    """Query Polymarket for tokens we already have open orders on"""
+    try:
+        open_orders = client.get_orders(OpenOrderParams())
+        # Extract token IDs from open orders
+        token_ids = set()
+        for order in open_orders:
+            token_id = order.get("asset_id")
+            if token_id:
+                token_ids.add(token_id)
+        return token_ids
+    except Exception as e:
+        print(f"Warning: Failed to fetch open orders: {e}")
+        return set()
+
+def get_filled_trades_tokens():
+    """Query Polymarket for tokens we have filled trades on"""
+    try:
+        trades = client.get_trades()
+        # Extract token IDs from filled trades
+        token_ids = set()
+        for trade in trades:
+            token_id = trade.get("asset_id")
+            if token_id:
+                token_ids.add(token_id)
+        return token_ids
+    except Exception as e:
+        print(f"Warning: Failed to fetch trades: {e}")
+        return set()
+
 def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
     """Main bot loop: buy $1 when price > 80%"""
-    traded_tokens = set()  # Track tokens we've already bought
     buy_count = 0  # Track number of successful buys
     
     while buy_count < max_buys:
         try:
+            # Query existing orders and filled trades from Polymarket
+            existing_order_tokens = get_existing_orders_tokens()
+            filled_trades_tokens = get_filled_trades_tokens()
+            
             markets = get_15min_crypto_markets()
             for market in markets:
                 if buy_count >= max_buys:
@@ -83,16 +116,32 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                     return
                     
                 question = market.get("question", "N/A")
-                print(f"Processing market: {question}")
                 tokens_string = market.get("clobTokenIds", "[]") # clobTokenIds is a STRING representing a list of token IDs
                 tokens = json.loads(tokens_string)
+                
+                # Check if we already have filled trades on BOTH sides (up and down)
+                # tokens[0] = UP token ID, tokens[1] = DOWN token ID
+                # filled_trades_tokens = set of all token IDs we've ever successfully traded
+                # This check returns True only if BOTH token IDs are in the set
+                # (meaning we've filled at least one UP trade AND at least one DOWN trade)
+                # Examples:
+                #   - 2 UP trades + 0 DOWN = False (won't skip)
+                #   - 0 UP + 2 DOWN = False (won't skip)
+                #   - 1 UP + 1 DOWN = True (will skip)
+                if len(tokens) == 2:
+                    both_sides_filled = all(token in filled_trades_tokens for token in tokens)
+                    if both_sides_filled:
+                        print(f"⊘ Skipping {question} (both sides already filled)")
+                        continue
+                
+                print(f"Processing market: {question}")
                 for token in tokens:
                     if buy_count >= max_buys:
                         break
                         
-                    # Skip if we've already bought this token
-                    if token in traded_tokens:
-                        continue
+                    # Note: We don't check for existing open orders here
+                    # Open limit orders (e.g., at 40¢ from bothsides.py) can coexist
+                    # with market buys when price hits threshold (e.g., 90¢)
                         
                     # Get current price
                     price_resp = client.get_price(token, "BUY")
@@ -119,13 +168,11 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                                 "response": str(resp)
                             }
                             
-                            # Save to file
+                            # Log to file (write-only)
                             with open("trades.json", "a") as f:
                                 f.write(json.dumps(trade_record) + "\n")
                             
                             print(f"✓ Order successful ({buy_count}/{max_buys})")
-                            # Mark this token as traded
-                            traded_tokens.add(token)
                         except Exception as e:
                             print(f"✗ Order failed: {e}")
 
@@ -140,4 +187,4 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
 
 if __name__ == "__main__":
     # Run bot for 15-minute crypto markets (stops after 10 buys)
-    run_bot(threshold=0.9, buy_amount=10, max_buys=15)
+    run_bot(threshold=0.9, buy_amount=50, max_buys=15)

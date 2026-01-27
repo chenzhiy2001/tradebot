@@ -4,7 +4,7 @@ from py_clob_client import MarketOrderArgs, PartialCreateOrderOptions
 import requests
 import json
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams
 from py_clob_client.order_builder.constants import BUY, SELL
 from private_key import private_key, founder_address
 from datetime import datetime, timezone, timedelta
@@ -15,8 +15,8 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137  # Polygon mainnet
 PRIVATE_KEY = private_key
 FUNDER_ADDRESS = founder_address
-LIMIT_PRICE = 0.48
-ORDER_SIZE = 25  # Total size per market (split between both sides)
+LIMIT_PRICE = 0.4
+ORDER_SIZE = 20  # Total size per market (split between both sides)
 
 # Initialize client
 client = ClobClient(
@@ -72,22 +72,23 @@ def get_future_15min_crypto_markets():
     
     return markets
 
-def load_traded_markets():
-    """Load set of market IDs we've already placed orders on"""
-    traded = set()
-    if os.path.exists("bothsides_trades.json"):
-        with open("bothsides_trades.json", "r") as f:
-            for line in f:
-                try:
-                    record = json.loads(line.strip())
-                    # Use question as unique ID
-                    traded.add(record.get("market"))
-                except:
-                    pass
-    return traded
+def get_existing_orders_tokens():
+    """Query Polymarket for tokens we already have open orders on"""
+    try:
+        open_orders = client.get_orders(OpenOrderParams())
+        # Extract token IDs from open orders
+        token_ids = set()
+        for order in open_orders:
+            token_id = order.get("asset_id")
+            if token_id:
+                token_ids.add(token_id)
+        return token_ids
+    except Exception as e:
+        print(f"Warning: Failed to fetch open orders: {e}")
+        return set()
 
-def save_trade(market_question, tokens, start_time):
-    """Save trade record to file"""
+def save_trade_log(market_question, tokens, start_time):
+    """Save trade record to log file (write-only)"""
     record = {
         "timestamp": datetime.utcnow().isoformat(),
         "market": market_question,
@@ -100,8 +101,10 @@ def save_trade(market_question, tokens, start_time):
         f.write(json.dumps(record) + "\n")
 
 def place_bothside_orders(max_markets=10):
-    """Place limit orders on both sides of future markets"""
-    traded_markets = load_traded_markets()
+    # Query Polymarket for existing orders
+    print("Checking existing open orders...")
+    existing_order_tokens = get_existing_orders_tokens()
+    print(f"Found {len(existing_order_tokens)} tokens with open orders")
     
     print("Fetching future 15-minute crypto markets...")
     markets = get_future_15min_crypto_markets()
@@ -118,20 +121,21 @@ def place_bothside_orders(max_markets=10):
         question = market.get("question", "N/A")
         start_time = market.get("start_time", "N/A")
         
-        # Skip if already traded this market
-        if question in traded_markets:
-            print(f"⊘ Skipping {question} (already traded)")
-            continue
-        
-        print(f"\n📊 Market: {question}")
-        print(f"   Starts: {start_time}")
-        
         tokens_string = market.get("clobTokenIds", "[]")
         tokens = json.loads(tokens_string)
         
         if len(tokens) != 2:
             print(f"   ⚠ Expected 2 tokens, got {len(tokens)}, skipping")
             continue
+        
+        # Check if we already have orders on any token in this market
+        has_existing_order = any(token in existing_order_tokens for token in tokens)
+        if has_existing_order:
+            print(f"⊘ Skipping {question} (already has open orders)")
+            continue
+        
+        print(f"\n📊 Market: {question}")
+        print(f"   Starts: {start_time}")
         
         # Place orders on both tokens (up and down)
         success = True
@@ -157,8 +161,8 @@ def place_bothside_orders(max_markets=10):
                 break
         
         if success:
-            # Save to file
-            save_trade(question, placed_tokens, start_time)
+            # Log to file
+            save_trade_log(question, placed_tokens, start_time)
             markets_traded += 1
             print(f"   ✓ Both sides placed successfully ({markets_traded}/{max_markets})")
         else:
