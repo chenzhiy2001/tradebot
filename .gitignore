@@ -4,4 +4,4 @@ __pycache__/
 trades.json
 bothsides_trades.json
 .env
-trades/
+trades_records/
