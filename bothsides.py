@@ -170,4 +170,4 @@ def place_bothside_orders(max_markets=10):
     print(f"{'='*60}")
 
 if __name__ == "__main__":
-    place_bothside_orders(max_markets=16)
+    place_bothside_orders(max_markets=32)
