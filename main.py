@@ -7,12 +7,16 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams
 from py_clob_client.order_builder.constants import BUY
 from private_key import private_key,founder_address  # Importing from local file
+from config import limit_price
 # Configuration
 HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137  # Polygon mainnet
 PRIVATE_KEY = private_key
 FUNDER_ADDRESS = founder_address  # Your Polymarket proxy wallet
+
+# Trading parameters
+LIMIT_PRICE = limit_price  # Price used in bothsides.py for limit orders (should match bothsides.py)
 
 # Initialize client (use signature_type=2 for browser wallet, 1 for Magic/email)
 client = ClobClient(
@@ -108,26 +112,31 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                 existing_orders = get_existing_orders()
                 filled_trades = get_filled_trades()
                 
-                # Extract token IDs from filled trades for the "both sides filled" check
-                filled_trades_tokens = set()
+                # Check if BOTH sides have limit orders filled (from bothsides.py)
+                # This prevents buying when both UP and DOWN already hit at low prices
+                filled_limit_tokens = set()
                 for trade in filled_trades:
                     token_id = trade.get("asset_id")
-                    if token_id:
-                        filled_trades_tokens.add(token_id)
+                    trade_price = float(trade.get("price", 0))
+                    # Only count trades near LIMIT_PRICE (limit orders from bothsides.py)
+                    if token_id and abs(trade_price - LIMIT_PRICE) < 0.05:
+                        filled_limit_tokens.add(token_id)
                 
                 # Check if we already have filled trades on BOTH sides (up and down)
                 # tokens[0] = UP token ID, tokens[1] = DOWN token ID
-                # filled_trades_tokens = set of all token IDs we've ever successfully traded
+                # filled_limit_tokens = set of token IDs with 40¢ limit orders filled
+                # This check returns True only if BOTH token Ilimit price orders filled
                 # This check returns True only if BOTH token IDs are in the set
-                # (meaning we've filled at least one UP trade AND at least one DOWN trade)
+                # (meaning we've filled at least one limit price UP trade AND at least one limit price DOWN trade)
                 # Examples:
-                #   - 2 UP trades + 0 DOWN = False (won't skip)
-                #   - 0 UP + 2 DOWN = False (won't skip)
-                #   - 1 UP + 1 DOWN = True (will skip)
+                #   - Limit UP filled + 0 DOWN filled = False (won't skip, can still buy DOWN at high price)
+                #   - 0 UP filled + Limit DOWN filled = False (won't skip, can still buy UP at high price)
+                #   - Limit UP filled + Limit DOWN filled = True (will skip, both sides already won)
+                #   - High price UP filled + 0 DOWN filled = False (won't skip, high price doesn't count)
                 if len(tokens) == 2:
-                    both_sides_filled = all(token in filled_trades_tokens for token in tokens)
+                    both_sides_filled = all(token in filled_limit_tokens for token in tokens)
                     if both_sides_filled:
-                        print(f"⊘ Skipping {question} (both sides already filled)")
+                        print(f"⊘ Skipping {question} (both limit price orders already filled)")
                         continue
                 
                 print(f"Processing market: {question}")
@@ -137,6 +146,29 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                     
                     price_data = client.get_price(token, side=BUY)
                     price = float(price_data.get("price", 0))
+                    
+                    # Show all orders and trades for this token
+                    print(f"\n  Token: {token}")
+                    print(f"  Current price: {price}")
+                    
+                    # Show open orders for this token
+                    token_open_orders = [o for o in existing_orders if o.get("asset_id") == token]
+                    if token_open_orders:
+                        print(f"  Open orders ({len(token_open_orders)}):")
+                        for order in token_open_orders:
+                            print(f"    - Price: {order.get('price')}, Size: {order.get('original_size')}, Total: ${float(order.get('original_size', 0)) * float(order.get('price', 0)):.2f}")
+                    else:
+                        print(f"  Open orders: None")
+                    
+                    # Show filled trades for this token
+                    token_filled_trades = [t for t in filled_trades if t.get("asset_id") == token]
+                    if token_filled_trades:
+                        print(f"  Filled trades ({len(token_filled_trades)}):")
+                        for trade in token_filled_trades:
+                            print(f"    - Price: {trade.get('price')}, Size: {trade.get('size')}, Total: ${float(trade.get('size', 0)) * float(trade.get('price', 0)):.2f}")
+                    else:
+                        print(f"  Filled trades: None")
+                    
                     if price > threshold:
                         # Check if we already have an open order OR filled trade with same token, price, and amount
                         # (This prevents duplicate orders from main.py)
@@ -145,7 +177,7 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                         # Check recent buys in this session first (most reliable)
                         for recent_token, recent_price, recent_amount in recent_buys:
                             if (recent_token == token and 
-                                abs(recent_price - price) < 0.01 and
+                                abs(recent_price - price) < 0.1 and
                                 abs(recent_amount - buy_amount) < 0.1):
                                 has_duplicate = True
                                 print(f"⊘ Skipping - already bought in this session at {price} for ${buy_amount}")
@@ -155,7 +187,7 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                         if not has_duplicate:
                             for order in existing_orders:
                                 if (order.get("asset_id") == token and 
-                                    abs(float(order.get("price", 0)) - price) < 0.01 and
+                                    abs(float(order.get("price", 0)) - price) < 0.1 and
                                     abs(float(order.get("original_size", 0)) * price - buy_amount) < 0.1):
                                     has_duplicate = True
                                     print(f"⊘ Skipping - already have OPEN order at {price} for ${buy_amount}")
@@ -165,7 +197,7 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                         if not has_duplicate:
                             for trade in filled_trades:
                                 if (trade.get("asset_id") == token and 
-                                    abs(float(trade.get("price", 0)) - price) < 0.01 and
+                                    abs(float(trade.get("price", 0)) - price) < 0.1 and
                                     abs(float(trade.get("size", 0)) * float(trade.get("price", 0)) - buy_amount) < 0.1):
                                     has_duplicate = True
                                     print(f"⊘ Skipping - already have FILLED trade at {price} for ${buy_amount}")
@@ -204,7 +236,7 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                         except Exception as e:
                             print(f"✗ Order failed: {e}")
 
-            time.sleep(5)  # Poll every 5 seconds
+            time.sleep(3)  # Poll every 5 seconds
             # refresh terminal output
             os.system('cls' if os.name == 'nt' else 'clear')
             
@@ -215,4 +247,4 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
 
 if __name__ == "__main__":
     # Run bot for 15-minute crypto markets (stops after 10 buys)
-    run_bot(threshold=0.9, buy_amount=50, max_buys=15)
+    run_bot(threshold=0.9, buy_amount=50, max_buys=16)

@@ -8,6 +8,7 @@ from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams
 from py_clob_client.order_builder.constants import BUY, SELL
 from private_key import private_key, founder_address
 from datetime import datetime, timezone, timedelta
+from config import limit_price
 
 # Configuration
 HOST = "https://clob.polymarket.com"
@@ -15,8 +16,8 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137  # Polygon mainnet
 PRIVATE_KEY = private_key
 FUNDER_ADDRESS = founder_address
-LIMIT_PRICE = 0.4
-ORDER_SIZE = 20  # Total size per market (split between both sides)
+LIMIT_PRICE = limit_price
+ORDER_SIZE = 8  # Total size per market (split between both sides)
 
 # Initialize client
 client = ClobClient(
@@ -34,14 +35,9 @@ def get_future_15min_crypto_markets():
     now = datetime.now(timezone.utc)
     cutoff_time = now + timedelta(minutes=2)
     
-    # Check markets starting from now up to 2 hours ahead
-    start_window = now.replace(second=0, microsecond=0)
-    # Round to next 15-minute mark
-    minutes = ((start_window.minute // 15) + 1) * 15
-    if minutes >= 60:
-        start_window = start_window.replace(hour=start_window.hour + 1, minute=0)
-    else:
-        start_window = start_window.replace(minute=minutes)
+    # Start from the current 15-minute window
+    minutes = (now.minute // 15) * 15
+    start_window = now.replace(minute=minutes, second=0, microsecond=0)
     
     cryptos = ["btc", "eth", "sol", "xrp"]
     
@@ -49,7 +45,7 @@ def get_future_15min_crypto_markets():
     for i in range(8):
         window_start = start_window + timedelta(minutes=15 * i)
         window_end = window_start + timedelta(minutes=15)
-        epoch = int(window_end.timestamp())  # Slug uses END time, not start time
+        epoch = int(window_start.timestamp())  # Slug uses START time (eventStartTime)
         
         # Skip if this window starts before cutoff
         if window_start < cutoff_time:
