@@ -4,3 +4,4 @@ __pycache__/
 trades.json
 bothsides_trades.json
 .env
+decision_log.txt
