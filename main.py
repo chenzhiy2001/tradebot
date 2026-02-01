@@ -325,7 +325,7 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                         except Exception as e:
                             log_decision(f"✗ Order failed: {e}")
 
-            time.sleep(3)  # Poll every 5 seconds
+            # time.sleep(3)  # Poll every 5 seconds
             # refresh terminal output
             os.system('cls' if os.name == 'nt' else 'clear')
             
@@ -336,4 +336,4 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
 
 if __name__ == "__main__":
     # Run bot for 15-minute crypto markets (stops after 10 buys)
-    run_bot(threshold=0.9, buy_amount=50, max_buys=16)
+    run_bot(threshold=0.9, buy_amount=100, max_buys=888)
