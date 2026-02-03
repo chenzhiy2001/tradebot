@@ -17,7 +17,7 @@ CHAIN_ID = 137  # Polygon mainnet
 PRIVATE_KEY = private_key
 FUNDER_ADDRESS = founder_address
 LIMIT_PRICE = limit_price
-ORDER_SIZE = 10  # Total size per market (split between both sides)
+ORDER_SIZE = 15  # Total size per market (split between both sides)
 
 # Initialize client
 client = ClobClient(
