@@ -41,8 +41,8 @@ def get_future_15min_crypto_markets():
     
     cryptos = ["btc", "eth", "sol", "xrp"]
     
-    # Check next 8 fifteen-minute windows (2 hours)
-    for i in range(8):
+    # Check next 48 fifteen-minute windows (12 hours)
+    for i in range(48):
         window_start = start_window + timedelta(minutes=15 * i)
         window_end = window_start + timedelta(minutes=15)
         epoch = int(window_start.timestamp())  # Slug uses START time (eventStartTime)
