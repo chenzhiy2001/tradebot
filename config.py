@@ -1,1 +1,1 @@
-limit_price = 0.4
+limit_price = 0.45
