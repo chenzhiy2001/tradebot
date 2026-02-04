@@ -104,7 +104,7 @@ def get_filled_trades():
         return []
 
 def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
-    """Main bot loop: buy $1 when price > 80%"""
+    """Main bot loop: buy buy_amount when price >= threshold"""
     buy_count = 0  # Track number of successful buys
     recent_buys = []  # Track buys in this session (token, price, amount)
     
@@ -257,7 +257,7 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                     else:
                         log_decision(f"  YOUR Filled trades: None")
                     
-                    if price > threshold:
+                    if price >= threshold:
                         # Check if we already have an open order OR filled trade with same token, price, and amount
                         # (This prevents duplicate orders from main.py)
                         has_duplicate = False
@@ -294,7 +294,7 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
                         if has_duplicate:
                             continue
                             
-                        log_decision(f"Price {price} > {threshold}, attempting to buy ${buy_amount}")
+                        log_decision(f"Price {price} >= {threshold}, attempting to buy ${buy_amount}")
                         log_decision(f"DECISION: BUY token {token[:20]}... at price {price}")
                         
                         # Use create_and_post_order - properly handles signature_type=1
