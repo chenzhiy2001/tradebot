@@ -336,4 +336,4 @@ def run_bot(threshold=0.80, buy_amount=1.0, max_buys=10):
 
 if __name__ == "__main__":
     # Run bot for 15-minute crypto markets (stops after 10 buys)
-    run_bot(threshold=0.9, buy_amount=160, max_buys=888)
+    run_bot(threshold=0.85, buy_amount=160, max_buys=888)
