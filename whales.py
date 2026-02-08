@@ -20,13 +20,14 @@ FUNDER_ADDRESS = founder_address
 
 # Trading parameters
 BUY_AMOUNT = 5             # Amount in $ to buy per trade
-MAX_PRICE = 0.80           # Only buy if chosen side price < this
-PROFIT_EXIT = 0.40         # Sell if price increased by this much since buy
+MAX_PRICE = 0.60           # Only buy if chosen side price < this
+PROFIT_EXIT = 0.35         # Sell if price increased by this much since buy
+STOP_LOSS = 0.10           # Sell if price dropped by this much since buy
 TOP_HOLDERS = 10           # Number of top holders to check per side
 SCAN_WINDOWS = 1           # Number of 15-min windows to scan (current)
 MIN_ELAPSED = 1            # Minimum minutes elapsed since market start
 POLL_INTERVAL = 1          # Seconds between scans
-SHOW_HOLDERS = TOP_HOLDERS # Number of top holders to display per side
+SHOW_HOLDERS = 1           # Number of top holders to display per side
 
 # Log file
 DECISION_LOG = "whales_log.txt"
@@ -225,7 +226,7 @@ def run_whales():
 
     log(f"\n{'='*60}")
     log(f"Whale-following bot started")
-    log(f"Buy amount: ${BUY_AMOUNT}, Max price: {MAX_PRICE}, Profit exit: +{PROFIT_EXIT}")
+    log(f"Buy amount: ${BUY_AMOUNT}, Max price: {MAX_PRICE}, Profit exit: +{PROFIT_EXIT}, Stop loss: -{STOP_LOSS}")
     log(f"Top holders to check: {TOP_HOLDERS}, Min elapsed: {MIN_ELAPSED}min")
     log(f"{'='*60}\n")
 
@@ -478,6 +479,56 @@ def run_whales():
                 gain = current_price - buy_price
 
                 if not cid:
+                    continue
+
+                # STOP LOSS check
+                if gain <= -STOP_LOSS:
+                    log(f"\n🛑 STOP LOSS: {market_name} {side_name}")
+                    log(f"  Price: bought {buy_price} → now {current_price} ({gain:+.2f}), loss exceeds -{STOP_LOSS}")
+
+                    try:
+                        # Cancel existing limit sell orders for this token
+                        existing_orders = client.get_orders(OpenOrderParams())
+                        for order in existing_orders:
+                            if order.get("asset_id") == token_id and order.get("side") == "SELL":
+                                try:
+                                    client.cancel(order.get("id"))
+                                    log(f"  ✓ Cancelled limit sell order")
+                                except Exception:
+                                    pass
+
+                        actual_balance = get_actual_share_balance(token_id)
+                        if actual_balance and actual_balance > 0.1:
+                            sz = math.floor(actual_balance * 100) / 100
+                            sell_order = OrderArgs(
+                                token_id=token_id,
+                                price=0.01,
+                                size=sz,
+                                side=SELL
+                            )
+                            signed = client.create_order(sell_order)
+                            resp = client.post_order(signed, OrderType.FOK)
+                            log(f"  ✓ Sold {sz} shares at ~{current_price}: {resp}")
+
+                            record = {
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "action": "STOP_LOSS_SELL",
+                                "market": market_name,
+                                "side": side_name,
+                                "token": token_id,
+                                "buy_price": buy_price,
+                                "sell_price": current_price,
+                                "gain": gain,
+                                "response": str(resp)
+                            }
+                            with open("whales_trades.json", "a") as f:
+                                f.write(json.dumps(record) + "\n")
+
+                            tokens_to_remove.append(token_id)
+                        else:
+                            log(f"  ⊘ No balance to sell ({actual_balance})")
+                    except Exception as e:
+                        log(f"  ✗ Stop loss sell failed: {e}")
                     continue
 
                 # Re-check whale scores
