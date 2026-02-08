@@ -5,3 +5,7 @@ trades.json
 bothsides_trades.json
 .env
 decision_log.txt
+coinflip_log.txt
+coinflip_trades.json
+whales_log.txt
+whales_trades.json
