@@ -296,17 +296,12 @@ def run_whales():
             existing_orders = get_existing_orders()
             filled_trades = get_filled_trades()
 
-            # Build set of tokens we already have orders/trades on
+            # Build set of tokens we currently hold or have open orders on
             known_tokens = set(positions.keys())
             for order in existing_orders:
                 tid = order.get("asset_id")
                 if tid:
                     known_tokens.add(tid)
-            for trade in filled_trades:
-                if trade.get("maker_address", "").lower() == FUNDER_ADDRESS.lower():
-                    tid = str(trade.get("asset_id", ""))
-                    if tid:
-                        known_tokens.add(tid)
 
             # =================================================================
             # STEP 1: Find new opportunities
