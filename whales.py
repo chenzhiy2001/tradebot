@@ -25,6 +25,7 @@ FUNDER_ADDRESS = founder_address
 # Trading parameters
 BUY_AMOUNT = 10            # Amount in $ to buy per trade
 MAX_PRICE = 0.95           # Only buy if chosen side price < this
+MIN_PRICE = 0.30           # Only buy if chosen side price > this
 PROFIT_EXIT = 0.20         # Sell if price increased by this much since buy
 STOP_LOSS = 0.10           # Sell if price dropped by this much since buy
 TOP_HOLDERS = 10           # Number of top holders to check per side
@@ -380,9 +381,12 @@ def run_whales():
 
                 log(f"  → Whales favor {chosen_side} ({chosen_score:.2f} vs {other_score:.2f})")
 
-                # Only buy if price is below MAX_PRICE
+                # Only buy if price is within range
                 if chosen_price >= MAX_PRICE:
                     log(f"  ⊘ Price {chosen_price} >= {MAX_PRICE}, too expensive")
+                    continue
+                if chosen_price <= MIN_PRICE:
+                    log(f"  ⊘ Price {chosen_price} <= {MIN_PRICE}, too cheap")
                     continue
 
                 chosen_token = tokens[chosen_idx]
