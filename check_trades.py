@@ -1,5 +1,10 @@
+import os
 from py_clob_client.client import ClobClient
-from private_key import private_key, founder_address
+from dotenv import load_dotenv
+
+load_dotenv()
+private_key = os.getenv("PRIVATE_KEY")
+founder_address = os.getenv("FUNDER_ADDRESS")
 
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137

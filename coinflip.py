@@ -8,7 +8,11 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
 from py_clob_client import MarketOrderArgs
-from private_key import private_key, founder_address
+from dotenv import load_dotenv
+
+load_dotenv()
+private_key = os.getenv("PRIVATE_KEY")
+founder_address = os.getenv("FUNDER_ADDRESS")
 
 # Configuration
 HOST = "https://clob.polymarket.com"

@@ -7,8 +7,12 @@ from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams
 from py_clob_client.order_builder.constants import BUY
-from private_key import private_key,founder_address  # Importing from local file
+from dotenv import load_dotenv
 from config import limit_price
+
+load_dotenv()
+private_key = os.getenv("PRIVATE_KEY")
+founder_address = os.getenv("FUNDER_ADDRESS")
 
 # Configuration
 HOST = "https://clob.polymarket.com"
