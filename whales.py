@@ -23,7 +23,7 @@ CHAIN_ID = 137
 FUNDER_ADDRESS = founder_address
 
 # Trading parameters
-BUY_AMOUNT = 5             # Amount in $ to buy per trade
+BUY_AMOUNT = 10             # Amount in $ to buy per trade
 MAX_PRICE = 0.60           # Only buy if chosen side price < this
 PROFIT_EXIT = 0.4         # Sell if price increased by this much since buy
 STOP_LOSS = 0.20           # Sell if price dropped by this much since buy
