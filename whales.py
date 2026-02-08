@@ -24,8 +24,8 @@ FUNDER_ADDRESS = founder_address
 
 # Trading parameters
 BUY_AMOUNT = 10            # Amount in $ to buy per trade
-MAX_PRICE = 0.60           # Only buy if chosen side price < this
-PROFIT_EXIT = 0.40         # Sell if price increased by this much since buy
+MAX_PRICE = 0.80           # Only buy if chosen side price < this
+PROFIT_EXIT = 0.20         # Sell if price increased by this much since buy
 STOP_LOSS = 0.20           # Sell if price dropped by this much since buy
 TOP_HOLDERS = 10           # Number of top holders to check per side
 SCAN_WINDOWS = 1           # Number of 15-min windows to scan (current)
