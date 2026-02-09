@@ -1,9 +1,7 @@
 import os
 import time
-import math
 import requests
 import json
-import threading
 from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams, BalanceAllowanceParams, AssetType
@@ -23,14 +21,13 @@ CHAIN_ID = 137
 FUNDER_ADDRESS = founder_address
 
 # Trading parameters
-BUY_AMOUNT = 5            # Amount in $ to buy per trade
-MAX_PRICE = 0.25           # Only buy if price < this (extreme value zone)
-PROFIT_EXIT = 0.20         # Sell if price increased by this much since buy
-STOP_LOSS = 0.10           # Sell if price dropped by this much since buy
+BUY_AMOUNT = 10            # Amount in $ to buy per trade
+MAX_PRICE = 0.95           # Only buy if chosen side price < this
+MIN_PRICE = 0.30           # Only buy if chosen side price > this
 TOP_HOLDERS = 10           # Number of top holders to check per side
 SCAN_WINDOWS = 1           # Number of 15-min windows to scan (current)
 MIN_ELAPSED = 1            # Minimum minutes elapsed since market start
-POLL_INTERVAL = 0          # Seconds between scans
+POLL_INTERVAL = 1          # Seconds between scans
 SHOW_HOLDERS = 1           # Number of top holders to display per side
 
 # Log file
@@ -230,7 +227,7 @@ def run_whales():
 
     log(f"\n{'='*60}")
     log(f"Whale-following bot started")
-    log(f"Buy amount: ${BUY_AMOUNT}, Max price: {MAX_PRICE}, Profit exit: +{PROFIT_EXIT}, Stop loss: -{STOP_LOSS}")
+    log(f"Buy amount: ${BUY_AMOUNT}, Max price: {MAX_PRICE}, Min price: {MIN_PRICE}")
     log(f"Top holders to check: {TOP_HOLDERS}, Min elapsed: {MIN_ELAPSED}min")
     log(f"{'='*60}\n")
 
@@ -361,36 +358,32 @@ def run_whales():
 
                 log(f"  Total Score: UP={up_total_score:.2f}, DOWN={down_total_score:.2f}")
 
-                # Buy the cheapest side if it's in the extreme zone
-                # Skip only if whale signal strongly opposes that cheap side
-                if price_up <= price_down:
-                    cheap_idx = 0
-                    cheap_side = "UP"
-                    cheap_price = price_up
-                    cheap_score = up_total_score
+                # Decide which side to buy
+                if up_total_score > down_total_score:
+                    chosen_idx = 0
+                    chosen_side = "UP"
+                    chosen_price = price_up
+                    chosen_score = up_total_score
                     other_score = down_total_score
-                else:
-                    cheap_idx = 1
-                    cheap_side = "DOWN"
-                    cheap_price = price_down
-                    cheap_score = down_total_score
+                elif down_total_score > up_total_score:
+                    chosen_idx = 1
+                    chosen_side = "DOWN"
+                    chosen_price = price_down
+                    chosen_score = down_total_score
                     other_score = up_total_score
-
-                if cheap_price >= MAX_PRICE:
-                    log(f"  ⊘ Cheapest side {cheap_side} at {cheap_price} >= {MAX_PRICE}, not extreme enough")
+                else:
+                    log(f"  ⊘ Equal PnL, skipping")
                     continue
 
-                # Skip if whales strongly favor the OTHER side (cheap side score is negative)
-                if cheap_score < 0 and other_score > 0:
-                    log(f"  ⊘ Whales oppose {cheap_side} (score {cheap_score:.0f} vs {other_score:.0f}), skipping")
+                log(f"  → Whales favor {chosen_side} ({chosen_score:.2f} vs {other_score:.2f})")
+
+                # Only buy if price is within range
+                if chosen_price >= MAX_PRICE:
+                    log(f"  ⊘ Price {chosen_price} >= {MAX_PRICE}, too expensive")
                     continue
-
-                chosen_idx = cheap_idx
-                chosen_side = cheap_side
-                chosen_price = cheap_price
-                chosen_score = cheap_score
-
-                log(f"  → Buying cheap side {chosen_side} at {chosen_price} (score: {chosen_score:.0f} vs {other_score:.0f})")
+                if chosen_price <= MIN_PRICE:
+                    log(f"  ⊘ Price {chosen_price} <= {MIN_PRICE}, too cheap")
+                    continue
 
                 chosen_token = tokens[chosen_idx]
 
@@ -424,34 +417,6 @@ def run_whales():
 
                     log(f"  ✓ Bought {actual_shares:.2f} shares of {chosen_side} at {chosen_price}")
 
-                    # Place limit sell in background thread (waits for on-chain settlement)
-                    sell_price = min(round(chosen_price + PROFIT_EXIT, 2), 0.99)
-                    if actual_shares > 0:
-                        def place_limit_sell(token, sp, shares, market_q, side_s):
-                            time.sleep(10)
-                            try:
-                                actual_balance = get_actual_share_balance(token)
-                                if actual_balance and actual_balance > 0.1:
-                                    sz = math.floor(actual_balance * 100) / 100
-                                else:
-                                    sz = math.floor(shares * 100) / 100
-                                sell_order = OrderArgs(
-                                    token_id=token,
-                                    price=sp,
-                                    size=sz,
-                                    side=SELL
-                                )
-                                signed_sell = client.create_order(sell_order)
-                                sell_resp = client.post_order(signed_sell, OrderType.GTC)
-                                log(f"  ✓ Limit sell placed: {sz} shares of {side_s} at {sp}")
-                            except Exception as e:
-                                log(f"  ⚠ Limit sell failed for {side_s}: {e}")
-                        threading.Thread(
-                            target=place_limit_sell,
-                            args=(chosen_token, sell_price, actual_shares, question, chosen_side),
-                            daemon=True
-                        ).start()
-
                     record = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "action": "BUY",
@@ -471,157 +436,31 @@ def run_whales():
                     log(f"  ✗ Buy failed: {e}")
 
             # =================================================================
-            # STEP 2: Check for signal reversal on held positions
+            # STEP 2: Clean up expired positions (market window passed)
             # =================================================================
             tokens_to_remove = []
+            current_market_tokens = set()
+            for market in markets:
+                for t in json.loads(market.get("clobTokenIds", "[]")):
+                    current_market_tokens.add(t)
 
             for token_id, pos in positions.items():
-                current_price = get_price(token_id, side=SELL)
-                market_name = pos["market"]
-                side_name = pos["side"]
-                buy_price = pos["buy_price"]
-                cid = pos.get("condition_id", "")
-                outcome_idx = pos.get("outcome_idx", 0)
-                gain = current_price - buy_price
-
-                if not cid:
-                    continue
-
-                # STOP LOSS check
-                if gain <= -STOP_LOSS:
-                    log(f"\n🛑 STOP LOSS: {market_name} {side_name}")
-                    log(f"  Price: bought {buy_price} → now {current_price} ({gain:+.2f}), loss exceeds -{STOP_LOSS}")
-
-                    try:
-                        # Cancel existing limit sell orders for this token
-                        existing_orders = client.get_orders(OpenOrderParams())
-                        for order in existing_orders:
-                            if order.get("asset_id") == token_id and order.get("side") == "SELL":
-                                try:
-                                    client.cancel(order.get("id"))
-                                    log(f"  ✓ Cancelled limit sell order")
-                                except Exception:
-                                    pass
-
-                        actual_balance = get_actual_share_balance(token_id)
-                        if actual_balance and actual_balance > 0.1:
-                            sz = math.floor(actual_balance * 100) / 100
-                            sell_order = OrderArgs(
-                                token_id=token_id,
-                                price=0.01,
-                                size=sz,
-                                side=SELL
-                            )
-                            signed = client.create_order(sell_order)
-                            resp = client.post_order(signed, OrderType.FOK)
-                            log(f"  ✓ Sold {sz} shares at ~{current_price}: {resp}")
-
-                            record = {
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "action": "STOP_LOSS_SELL",
-                                "market": market_name,
-                                "side": side_name,
-                                "token": token_id,
-                                "buy_price": buy_price,
-                                "sell_price": current_price,
-                                "gain": gain,
-                                "response": str(resp)
-                            }
-                            with open("whales_trades.json", "a") as f:
-                                f.write(json.dumps(record) + "\n")
-
-                            tokens_to_remove.append(token_id)
-                        else:
-                            log(f"  ⊘ No balance to sell ({actual_balance})")
-                    except Exception as e:
-                        log(f"  ✗ Stop loss sell failed: {e}")
-                    continue
-
-                # Re-check whale scores
-                holders = get_market_top_holders(cid)
-                up_holders = holders.get(0, [])[:TOP_HOLDERS]
-                down_holders = holders.get(1, [])[:TOP_HOLDERS]
-
-                up_score = 0.0
-                for wallet, shares in up_holders:
-                    pnl = get_user_pnl(wallet)
-                    bet = get_user_bet_on_market(wallet, cid, 0)
-                    up_score += pnl * bet
-
-                down_score = 0.0
-                for wallet, shares in down_holders:
-                    pnl = get_user_pnl(wallet)
-                    bet = get_user_bet_on_market(wallet, cid, 1)
-                    down_score += pnl * bet
-
-                # Check if signal reversed
-                my_score = up_score if outcome_idx == 0 else down_score
-                other_score = down_score if outcome_idx == 0 else up_score
-                reversed = other_score > my_score
-
-                if reversed and gain >= 0:
-                    log(f"\n🔄 SIGNAL REVERSAL: {market_name} {side_name}")
-                    log(f"  My side score: {my_score:.2f}, Other side: {other_score:.2f}")
-                    log(f"  Price: bought {buy_price} → now {current_price} ({gain:+.2f}), selling at no loss")
-
-                    try:
-                        # Cancel existing limit sell orders for this token
-                        for order in existing_orders:
-                            if order.get("asset_id") == token_id and order.get("side") == "SELL":
-                                try:
-                                    client.cancel(order.get("id"))
-                                    log(f"  ✓ Cancelled limit sell order")
-                                except Exception:
-                                    pass
-
-                        # Market sell
-                        actual_balance = get_actual_share_balance(token_id)
-                        if actual_balance and actual_balance > 0.1:
-                            sz = math.floor(actual_balance * 100) / 100
-                            sell_order = OrderArgs(
-                                token_id=token_id,
-                                price=0.01,
-                                size=sz,
-                                side=SELL
-                            )
-                            signed = client.create_order(sell_order)
-                            resp = client.post_order(signed, OrderType.FOK)
-                            log(f"  ✓ Sold {sz} shares at ~{current_price}: {resp}")
-
-                            record = {
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "action": "SIGNAL_REVERSAL_SELL",
-                                "market": market_name,
-                                "side": side_name,
-                                "token": token_id,
-                                "buy_price": buy_price,
-                                "sell_price": current_price,
-                                "gain": gain,
-                                "my_score": my_score,
-                                "other_score": other_score,
-                                "response": str(resp)
-                            }
-                            with open("whales_trades.json", "a") as f:
-                                f.write(json.dumps(record) + "\n")
-
-                            tokens_to_remove.append(token_id)
-                        else:
-                            log(f"  ⊘ No balance to sell ({actual_balance})")
-                    except Exception as e:
-                        log(f"  ✗ Reversal sell failed: {e}")
+                if token_id not in current_market_tokens:
+                    # Market window has passed, position auto-resolves on-chain
+                    log(f"\n✅ Market expired: {pos['market']} {pos['side']} (bought at {pos['buy_price']})")
+                    tokens_to_remove.append(token_id)
 
             for token_id in tokens_to_remove:
                 del positions[token_id]
 
             # Status line
             if positions:
-                log(f"\n📊 Monitoring {len(positions)} positions:")
+                log(f"\n📊 Holding {len(positions)} positions (ride to resolution):")
                 for token_id, pos in positions.items():
                     cp = get_price(token_id, side=SELL)
                     gain = cp - pos["buy_price"]
-                    target = round(pos["buy_price"] + PROFIT_EXIT, 2)
                     status = "📈" if gain >= 0 else "📉"
-                    log(f"  {status} {pos['market']} {pos['side']}: bought {pos['buy_price']} → now {cp} ({gain:+.2f}), sell@{target}")
+                    log(f"  {status} {pos['market']} {pos['side']}: bought {pos['buy_price']} → now {cp} ({gain:+.2f})")
 
             time.sleep(POLL_INTERVAL)
 
