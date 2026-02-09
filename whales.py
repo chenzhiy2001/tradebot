@@ -31,7 +31,7 @@ STOP_LOSS = 0.10           # Sell if price dropped by this much since buy
 TOP_HOLDERS = 10           # Number of top holders to check per side
 SCAN_WINDOWS = 1           # Number of 15-min windows to scan (current)
 MIN_ELAPSED = 1            # Minimum minutes elapsed since market start
-POLL_INTERVAL = 1          # Seconds between scans
+POLL_INTERVAL = 0          # Seconds between scans
 SHOW_HOLDERS = 1           # Number of top holders to display per side
 
 # Log file
