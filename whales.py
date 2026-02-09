@@ -25,7 +25,7 @@ FUNDER_ADDRESS = founder_address
 # Trading parameters
 BUY_AMOUNT = 10            # Amount in $ to buy per trade
 MAX_PRICE = 0.95           # Only buy if chosen side price < this
-MIN_PRICE = 0.30           # Only buy if chosen side price > this
+MIN_PRICE = 0.45           # Only buy if chosen side price > this
 TOP_HOLDERS = 10           # Number of top holders to check per side
 SCAN_WINDOWS = 1           # Number of 15-min windows to scan (current)
 MIN_ELAPSED = 1            # Minimum minutes elapsed since market start
@@ -378,6 +378,11 @@ def run_whales():
                     continue
 
                 log(f"  → Whales favor {chosen_side} ({chosen_score:.2f} vs {other_score:.2f})")
+
+                # Skip when opposing side score is negative ("strong" signals are actually traps)
+                if other_score < 0:
+                    log(f"  ⊘ Other side score {other_score:.2f} < 0, weak market — skipping")
+                    continue
 
                 # Only buy if price is within range
                 if chosen_price >= MAX_PRICE:
