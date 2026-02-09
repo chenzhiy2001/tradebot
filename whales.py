@@ -23,9 +23,8 @@ CHAIN_ID = 137
 FUNDER_ADDRESS = founder_address
 
 # Trading parameters
-BUY_AMOUNT = 10            # Amount in $ to buy per trade
-MAX_PRICE = 0.95           # Only buy if chosen side price < this
-MIN_PRICE = 0.30           # Only buy if chosen side price > this
+BUY_AMOUNT = 5            # Amount in $ to buy per trade
+MAX_PRICE = 0.25           # Only buy if price < this (extreme value zone)
 PROFIT_EXIT = 0.20         # Sell if price increased by this much since buy
 STOP_LOSS = 0.10           # Sell if price dropped by this much since buy
 TOP_HOLDERS = 10           # Number of top holders to check per side
@@ -362,32 +361,36 @@ def run_whales():
 
                 log(f"  Total Score: UP={up_total_score:.2f}, DOWN={down_total_score:.2f}")
 
-                # Decide which side to buy
-                if up_total_score > down_total_score:
-                    chosen_idx = 0
-                    chosen_side = "UP"
-                    chosen_price = price_up
-                    chosen_score = up_total_score
+                # Buy the cheapest side if it's in the extreme zone
+                # Skip only if whale signal strongly opposes that cheap side
+                if price_up <= price_down:
+                    cheap_idx = 0
+                    cheap_side = "UP"
+                    cheap_price = price_up
+                    cheap_score = up_total_score
                     other_score = down_total_score
-                elif down_total_score > up_total_score:
-                    chosen_idx = 1
-                    chosen_side = "DOWN"
-                    chosen_price = price_down
-                    chosen_score = down_total_score
-                    other_score = up_total_score
                 else:
-                    log(f"  ⊘ Equal PnL, skipping")
+                    cheap_idx = 1
+                    cheap_side = "DOWN"
+                    cheap_price = price_down
+                    cheap_score = down_total_score
+                    other_score = up_total_score
+
+                if cheap_price >= MAX_PRICE:
+                    log(f"  ⊘ Cheapest side {cheap_side} at {cheap_price} >= {MAX_PRICE}, not extreme enough")
                     continue
 
-                log(f"  → Whales favor {chosen_side} ({chosen_score:.2f} vs {other_score:.2f})")
+                # Skip if whales strongly favor the OTHER side (cheap side score is negative)
+                if cheap_score < 0 and other_score > 0:
+                    log(f"  ⊘ Whales oppose {cheap_side} (score {cheap_score:.0f} vs {other_score:.0f}), skipping")
+                    continue
 
-                # Only buy if price is within range
-                if chosen_price >= MAX_PRICE:
-                    log(f"  ⊘ Price {chosen_price} >= {MAX_PRICE}, too expensive")
-                    continue
-                if chosen_price <= MIN_PRICE:
-                    log(f"  ⊘ Price {chosen_price} <= {MIN_PRICE}, too cheap")
-                    continue
+                chosen_idx = cheap_idx
+                chosen_side = cheap_side
+                chosen_price = cheap_price
+                chosen_score = cheap_score
+
+                log(f"  → Buying cheap side {chosen_side} at {chosen_price} (score: {chosen_score:.0f} vs {other_score:.0f})")
 
                 chosen_token = tokens[chosen_idx]
 
