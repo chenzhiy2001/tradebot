@@ -1,7 +1,9 @@
 import os
 import time
+import math
 import requests
 import json
+import threading
 from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams, BalanceAllowanceParams, AssetType
@@ -416,6 +418,33 @@ def run_whales():
                     }
 
                     log(f"  ✓ Bought {actual_shares:.2f} shares of {chosen_side} at {chosen_price}")
+
+                    # Place limit sell at 0.99 in background (waits for on-chain settlement)
+                    if actual_shares > 0:
+                        def place_limit_sell(token, shares, market_q, side_s):
+                            time.sleep(10)
+                            try:
+                                actual_balance = get_actual_share_balance(token)
+                                if actual_balance and actual_balance > 0.1:
+                                    sz = math.floor(actual_balance * 100) / 100
+                                else:
+                                    sz = math.floor(shares * 100) / 100
+                                sell_order = OrderArgs(
+                                    token_id=token,
+                                    price=0.99,
+                                    size=sz,
+                                    side=SELL
+                                )
+                                signed_sell = client.create_order(sell_order)
+                                sell_resp = client.post_order(signed_sell, OrderType.GTC)
+                                log(f"  ✓ Limit sell placed: {sz} shares of {side_s} at 0.99")
+                            except Exception as e:
+                                log(f"  ⚠ Limit sell failed for {side_s}: {e}")
+                        threading.Thread(
+                            target=place_limit_sell,
+                            args=(chosen_token, actual_shares, question, chosen_side),
+                            daemon=True
+                        ).start()
 
                     record = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
