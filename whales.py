@@ -24,7 +24,7 @@ FUNDER_ADDRESS = founder_address
 
 # Trading parameters
 BUY_AMOUNT = 10            # Amount in $ to buy per trade
-MAX_PRICE = 0.95           # Only buy if chosen side price < this
+MAX_PRICE = 0.60           # Only buy if chosen side price < this
 MIN_PRICE = 0.45           # Only buy if chosen side price > this
 TOP_HOLDERS = 10           # Number of top holders to check per side
 SCAN_WINDOWS = 1           # Number of 15-min windows to scan (current)
@@ -61,7 +61,7 @@ def get_current_crypto_markets():
     minutes = (now.minute // 15) * 15
     current_window = now.replace(minute=minutes, second=0, microsecond=0)
 
-    cryptos = ["btc", "eth", "sol", "xrp"]
+    cryptos = ["btc", "eth", "sol"]
 
     for i in range(SCAN_WINDOWS):
         window_start = current_window + timedelta(minutes=15 * i)
