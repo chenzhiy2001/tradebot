@@ -11,5 +11,8 @@ run:
 	.venv/bin/python utility.py
 	.venv/bin/python strategy.py
 
+update-wallets:
+	.venv/bin/python utility.py
+
 clean:
 	rm -rf .venv
