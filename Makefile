@@ -14,5 +14,13 @@ run:
 update-wallets:
 	.venv/bin/python utility.py
 
+# give full paths of strategy_log.txt, strategy_trades.json and data.json
+strategy_logs_paths:
+	@echo "Full paths:"
+	@echo $(CURDIR)/strategy_log.txt
+	@echo $(CURDIR)/strategy_trades.json
+	@echo $(CURDIR)/data.json
+	
+
 clean:
 	rm -rf .venv
