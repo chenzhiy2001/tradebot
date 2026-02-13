@@ -20,6 +20,7 @@ strategy_logs_paths:
 	@echo $(CURDIR)/strategy_log.txt
 	@echo $(CURDIR)/strategy_trades.json
 	@echo $(CURDIR)/data.json
+	@echo $(CURDIR)/perf.json
 	
 
 clean:
