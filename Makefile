@@ -11,6 +11,9 @@ run:
 	.venv/bin/python utility.py
 	.venv/bin/python strategy.py
 
+just-run:
+	.venv/bin/python strategy.py --resume
+
 update-wallets:
 	.venv/bin/python utility.py
 
