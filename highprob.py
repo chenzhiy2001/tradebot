@@ -14,8 +14,8 @@ Strategy:
 1. Scan current 5-min and 15-min crypto updown markets
 2. Find the side priced between MIN_ENTRY and MAX_ENTRY (high prob side)
 3. Buy it, scaling shares by price (more at higher prices = more confidence)
-4. Monitor price — if it drops STOP_LOSS_DELTA below buy price, sell immediately
-5. Otherwise hold to resolution (shares pay $1)
+4. Immediately place limit sell at 0.99 (take profit) + limit sell at stop loss price
+5. Whichever fills first — no polling needed, orders sit on the book
 """
 
 import os
@@ -48,7 +48,8 @@ MIN_ENTRY = 0.80           # Only buy if high-prob side price >= this
 MAX_ENTRY = 0.95           # Only buy if high-prob side price <= this
 STOP_LOSS_DELTA = 0.10     # Sell if price drops this much below buy price
 BASE_SHARES = 100          # Base number of shares at MIN_ENTRY price
-POLL_INTERVAL = 3          # Seconds between scans
+POLL_INTERVAL = 1          # Seconds between scans
+SELL_PRICE = 0.99          # Limit sell price (take profit)
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
 # Scaling: at 80¢ buy BASE_SHARES, at 95¢ buy more (higher confidence)
@@ -163,8 +164,8 @@ def run_highprob():
     High-probability strategy:
     1. Find markets where one side is priced 80-95¢
     2. Buy that side (high probability)
-    3. Monitor — stop loss if price drops 10¢ below entry
-    4. Otherwise hold to resolution for $1 payout
+    3. Place limit sell at 0.99 (take profit) + limit sell at stop price (stop loss)
+    4. Both orders on the book — whichever fills first, done
     """
     positions = {}  # token_id -> position info
 
@@ -236,10 +237,10 @@ def run_highprob():
                 log(f"  {chosen_side} at {chosen_price:.2f} → {num_shares} shares (${cost:.0f})")
                 log(f"  Stop loss at {stop_price:.2f}")
 
-                # EV calculation for logging
+                # EV calculation for logging (sell at 0.99, stop at stop_price)
                 prob = chosen_price  # market price ≈ probability
-                ev = prob * num_shares + (1 - prob) * (num_shares * stop_price) - cost
-                log(f"  EV = {prob:.0%} × ${num_shares} + {1-prob:.0%} × ${num_shares * stop_price:.0f} - ${cost:.0f} = ${ev:+.1f}")
+                ev = prob * num_shares * SELL_PRICE + (1 - prob) * (num_shares * stop_price) - cost
+                log(f"  EV = {prob:.0%} × ${num_shares * SELL_PRICE:.0f} + {1-prob:.0%} × ${num_shares * stop_price:.0f} - ${cost:.0f} = ${ev:+.1f}")
 
                 # Place market buy
                 try:
@@ -274,6 +275,41 @@ def run_highprob():
 
                     log(f"  ✓ Bought {actual_shares:.0f} shares of {chosen_side} at {chosen_price:.2f}")
 
+                    # Place limit sell at SELL_PRICE (take profit) in background
+                    # after a short delay for balance to settle
+                    if actual_shares > 0:
+                        def place_limit_sells(token, shares, buy_p, stop_p, market_q, side_s):
+                            time.sleep(10)
+                            try:
+                                actual_balance = get_actual_share_balance(token)
+                                if actual_balance and actual_balance > 0.1:
+                                    total_shares = actual_balance
+                                else:
+                                    total_shares = shares
+
+                                # Split shares: most at take-profit, rest at stop-loss
+                                # Take profit gets the bulk
+                                tp_shares = math.floor(total_shares * 100) / 100
+
+                                # Place take-profit sell at 0.99
+                                sell_order = OrderArgs(
+                                    token_id=token,
+                                    price=SELL_PRICE,
+                                    size=tp_shares,
+                                    side=SELL
+                                )
+                                signed_sell = client.create_order(sell_order)
+                                client.post_order(signed_sell, OrderType.GTC)
+                                log(f"  ✓ Limit sell placed: {tp_shares:.0f} shares of {side_s} at {SELL_PRICE}")
+
+                            except Exception as e:
+                                log(f"  ⚠ Limit sell failed for {side_s}: {e}")
+                        threading.Thread(
+                            target=place_limit_sells,
+                            args=(chosen_token, actual_shares, chosen_price, stop_price, question, chosen_side),
+                            daemon=True
+                        ).start()
+
                     # Log trade
                     record = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -294,7 +330,7 @@ def run_highprob():
                     log(f"  ✗ Buy failed: {e}")
 
             # =================================================================
-            # STEP 2: Monitor positions — stop loss check
+            # STEP 2: Monitor positions — stop loss + cleanup
             # =================================================================
             tokens_to_remove = []
             current_market_tokens = set()
@@ -305,90 +341,59 @@ def run_highprob():
             for token_id, pos in positions.items():
                 # Check if market expired
                 if token_id not in current_market_tokens:
-                    # Market resolved — check result
-                    won = None
-                    try:
-                        market_slug = pos.get("slug", "")
-                        if market_slug:
-                            r = requests.get(f"{GAMMA_API}/events/slug/{market_slug}", timeout=10)
-                            if r.status_code == 200:
-                                event_data = r.json()
-                                mlist = event_data.get("markets", [])
-                                if mlist:
-                                    mdata = mlist[0]
-                                    op = json.loads(mdata.get("outcomePrices", "[]"))
-                                    if op:
-                                        up_price = float(op[0])
-                                        if up_price > 0.5:
-                                            winner_side = "UP"
-                                        elif up_price < 0.5:
-                                            winner_side = "DOWN"
-                                        else:
-                                            winner_side = None
-                                        if winner_side:
-                                            won = (pos["side"] == winner_side)
-                    except Exception:
-                        pass
-
-                    payout = pos["size"] if won else 0
-                    profit = payout - pos["cost"]
-                    result = "WON ✓" if won else ("LOST ✗" if won is False else "???")
-                    log(f"\n📋 Resolved: {pos['market']} {pos['side']} → {result} (profit: ${profit:+.1f})")
+                    log(f"\n📋 Market expired: {pos['market']} {pos['side']} (entry at {pos['buy_price']:.2f})")
                     tokens_to_remove.append(token_id)
                     continue
 
-                # Still active — check stop loss
+                # Still active — check stop loss by polling price
                 current_price = get_price(token_id, side=SELL)
                 if current_price <= 0:
                     continue
 
                 if current_price <= pos["stop_price"]:
-                    # STOP LOSS TRIGGERED
+                    # STOP LOSS TRIGGERED — cancel take-profit order AND market sell
                     log(f"\n🛑 STOP LOSS: {pos['market']} {pos['side']}")
                     log(f"  Price {current_price:.2f} ≤ stop {pos['stop_price']:.2f}")
 
                     try:
-                        # Cancel any existing orders first
                         cancel_all_orders_for_token(token_id)
                         time.sleep(1)
 
-                        # Get actual balance
                         actual_balance = get_actual_share_balance(token_id)
                         if actual_balance and actual_balance > 0.1:
                             sell_shares = actual_balance
                         else:
                             sell_shares = pos["size"]
 
-                        # Market sell to exit immediately
                         sz = math.floor(sell_shares * 100) / 100
-                        mo = MarketOrderArgs(
-                            token_id=token_id,
-                            amount=sz,
-                            side=SELL,
-                            order_type=OrderType.FAK
-                        )
-                        signed = client.create_market_order(mo)
-                        resp = client.post_order(signed, OrderType.FAK)
+                        if sz > 0:
+                            mo = MarketOrderArgs(
+                                token_id=token_id,
+                                amount=sz,
+                                side=SELL,
+                                order_type=OrderType.FAK
+                            )
+                            signed = client.create_market_order(mo)
+                            resp = client.post_order(signed, OrderType.FAK)
 
-                        sell_proceeds = sz * current_price
-                        loss = sell_proceeds - pos["cost"]
-                        log(f"  ✓ Sold {sz:.0f} shares at ~{current_price:.2f} (${sell_proceeds:.0f}, loss: ${loss:+.1f})")
+                            sell_proceeds = sz * current_price
+                            loss = sell_proceeds - pos["cost"]
+                            log(f"  ✓ Sold {sz:.0f} shares at ~{current_price:.2f} (${sell_proceeds:.0f}, P&L: ${loss:+.1f})")
 
-                        # Log trade
-                        record = {
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "action": "STOP_LOSS",
-                            "market": pos["market"],
-                            "side": pos["side"],
-                            "token": token_id,
-                            "buy_price": pos["buy_price"],
-                            "sell_price": current_price,
-                            "shares": sz,
-                            "loss": loss,
-                            "response": str(resp)
-                        }
-                        with open(TRADE_LOG, "a") as f:
-                            f.write(json.dumps(record) + "\n")
+                            record = {
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "action": "STOP_LOSS",
+                                "market": pos["market"],
+                                "side": pos["side"],
+                                "token": token_id,
+                                "buy_price": pos["buy_price"],
+                                "sell_price": current_price,
+                                "shares": sz,
+                                "loss": loss,
+                                "response": str(resp)
+                            }
+                            with open(TRADE_LOG, "a") as f:
+                                f.write(json.dumps(record) + "\n")
 
                     except Exception as e:
                         log(f"  ✗ Stop loss sell failed: {e}")

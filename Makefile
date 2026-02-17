@@ -14,6 +14,9 @@ run:
 just-run:
 	.venv/bin/python strategy.py --resume
 
+highprob:
+	.venv/bin/python highprob.py
+
 update-wallets:
 	.venv/bin/python utility.py
 
