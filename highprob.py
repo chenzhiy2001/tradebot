@@ -44,7 +44,7 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-MIN_ENTRY = 0.80           # Only buy if high-prob side price >= this
+MIN_ENTRY = 0.89           # Only buy if high-prob side price >= this
 MAX_ENTRY = 0.95           # Only buy if high-prob side price <= this
 STOP_LOSS_DELTA = 0.10     # Sell if price drops this much below buy price
 BASE_SHARES = 100          # Base number of shares at MIN_ENTRY price
@@ -52,10 +52,10 @@ POLL_INTERVAL = 1          # Seconds between scans
 SELL_PRICE = 0.99          # Limit sell price (take profit)
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
-# Scaling: at 80¢ buy BASE_SHARES, at 95¢ buy more (higher confidence)
+# Scaling: at MIN_ENTRY buy BASE_SHARES, at MAX_ENTRY buy more (higher confidence)
 # shares = BASE_SHARES * (price / MIN_ENTRY)
-# e.g. at 90¢: 100 * (0.90/0.80) = 112 shares ($101 cost)
-# e.g. at 95¢: 100 * (0.95/0.80) = 119 shares ($113 cost)
+# e.g. at 90¢: 100 * (0.90/0.89) = 101 shares ($91 cost)
+# e.g. at 95¢: 100 * (0.95/0.89) = 107 shares ($102 cost)
 
 # Log files
 DECISION_LOG = "highprob_log.txt"
