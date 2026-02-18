@@ -3,33 +3,29 @@
 Flow Bot: Follow the money, not specific wallets.
 
 Strategy:
-  For each 5-min and 15-min crypto market, track total shares per side
-  over time. When a large, lopsided surge of buying appears on one side,
-  follow that money.
+  For each 5-min and 15-min crypto market, pull the live trade feed
+  (same data as the Activity tab on polymarket.com).
 
-  This avoids the stale-wallet problem: we don't care WHO is buying,
-  only that disproportionate money is flowing in one direction.
+  Compute net flow = (buy volume) - (sell volume) for each side.
+  When one side has heavy net buying that dwarfs the other, follow it.
 
 Signals (all must be true to trigger):
-  1. Net new shares on chosen side exceed MIN_FLOW threshold
+  1. Net buy volume on chosen side exceeds MIN_FLOW ($)
   2. Flow ratio (chosen / other) exceeds MIN_RATIO
-  3. The flow appeared recently (within FLOW_LOOKBACK seconds)
-  4. We don't already hold a position on this market
+  3. We don't already hold a position on this market
 
 Exit:
   - Limit sell at 0.99 (take profit)
-  - Copy-sell if the flow reverses (big money exits)
+  - Flow reversal: if net flow flips against us, market sell
 """
 
 import os
-import sys
 import time
 import math
 import requests
 import json
 import threading
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -51,14 +47,14 @@ FUNDER_ADDRESS = founder_address
 # STRATEGY PARAMETERS
 # =========================================================================
 BUY_AMOUNT = 20            # Base bet in $
-MIN_FLOW = 500             # Minimum new shares on chosen side to trigger
-MIN_RATIO = 2.0            # Flow on chosen side must be Nx the other side
+MIN_FLOW = 300             # Minimum net buy $ on chosen side to trigger
+MIN_RATIO = 2.0            # Net buy on chosen side must be Nx the other
 POLL_INTERVAL = 1          # Seconds between scans
 SELL_PRICE = 0.99          # Limit sell price (take profit)
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
 # Scaling: bet more when the flow is stronger
-# bet = BUY_AMOUNT * min(flow / MIN_FLOW, MAX_BET_MULTIPLIER)
+# bet = BUY_AMOUNT * min(net_flow / MIN_FLOW, MAX_BET_MULTIPLIER)
 MAX_BET_MULTIPLIER = 3.0
 
 # Log files
@@ -85,7 +81,7 @@ client.set_api_creds(client.create_or_derive_api_creds())
 
 
 # =========================================================================
-# API HELPERS (same as strategy.py)
+# API HELPERS
 # =========================================================================
 
 def get_current_crypto_markets():
@@ -119,37 +115,70 @@ def get_current_crypto_markets():
     return markets
 
 
-def get_market_holders(condition_id):
-    """Get holders for a market. Returns {0: [(wallet, shares), ...], 1: [...]}"""
+def get_market_trades(condition_id):
+    """
+    Fetch trade activity for a market from the data API.
+    Same data as the Activity tab on polymarket.com.
+    Returns list of trades sorted by timestamp.
+    """
     try:
         r = requests.get(
-            f"{DATA_API}/holders",
-            params={"market": condition_id, "limit": 50, "minBalance": 50},
+            f"{DATA_API}/trades",
+            params={"market": condition_id, "limit": 100},
             timeout=15
         )
-        if r.status_code != 200:
-            return {0: [], 1: []}
-        data = r.json()
+        if r.status_code == 200:
+            return r.json()
     except Exception:
-        return {0: [], 1: []}
+        pass
+    return []
 
-    result = {0: [], 1: []}
-    for token_group in data:
-        for h in token_group.get("holders", []):
-            wallet = h.get("proxyWallet", "").lower()
-            amount = float(h.get("amount", 0))
-            outcome = h.get("outcomeIndex", 0)
-            if wallet and amount > 0:
-                result[outcome].append((wallet, amount))
+
+def compute_trade_flow(condition_id, tokens):
+    """
+    Analyze the trade feed for a market.
+    Returns dict with net buy flow per side ($ volume: buys - sells).
+    """
+    trades = get_market_trades(condition_id)
+    up_token = tokens[0]
+
+    result = {
+        "up_buys": 0.0, "up_sells": 0.0,
+        "down_buys": 0.0, "down_sells": 0.0,
+        "up_net": 0.0, "down_net": 0.0,
+        "trade_count": len(trades),
+        "big_trades": [],
+    }
+
+    for t in trades:
+        asset = t.get("asset", "")
+        side = t.get("side", "")
+        size = float(t.get("size", 0))
+        price = float(t.get("price", 0))
+        cost = size * price
+        is_up = (asset == up_token)
+
+        if is_up:
+            if side == "BUY":
+                result["up_buys"] += cost
+            else:
+                result["up_sells"] += cost
+        else:
+            if side == "BUY":
+                result["down_buys"] += cost
+            else:
+                result["down_sells"] += cost
+
+        # Track big trades for logging
+        if cost >= 50:
+            name = t.get("name", "") or t.get("pseudonym", "") or t.get("proxyWallet", "")[:12]
+            outcome = "UP" if is_up else "DN"
+            result["big_trades"].append(f"{name} {side} {size:.0f} {outcome} @{price:.2f} (${cost:.0f})")
+
+    result["up_net"] = result["up_buys"] - result["up_sells"]
+    result["down_net"] = result["down_buys"] - result["down_sells"]
+
     return result
-
-
-def get_side_totals(condition_id):
-    """Get total shares on each side. Returns (up_total, down_total)."""
-    holders = get_market_holders(condition_id)
-    up_total = sum(shares for _, shares in holders.get(0, []))
-    down_total = sum(shares for _, shares in holders.get(1, []))
-    return up_total, down_total
 
 
 def get_price(token_id, side=BUY):
@@ -203,73 +232,30 @@ def get_existing_orders():
 
 
 # =========================================================================
-# FLOW TRACKING
-# =========================================================================
-
-# Track snapshots per market: {condition_id: {"first": (up, down), "prev": (up, down), "epoch": int}}
-flow_state = {}
-
-
-def compute_flow(condition_id, epoch):
-    """
-    Compare current side totals to the first snapshot for this market window.
-    Returns (up_delta, down_delta) — net new shares since first seen.
-    """
-    up_now, down_now = get_side_totals(condition_id)
-
-    key = f"{condition_id}:{epoch}"
-    if key not in flow_state:
-        # First time seeing this market window — record baseline
-        flow_state[key] = {
-            "first_up": up_now,
-            "first_down": down_now,
-            "prev_up": up_now,
-            "prev_down": down_now,
-        }
-        return 0.0, 0.0, up_now, down_now
-
-    state = flow_state[key]
-    up_delta = up_now - state["first_up"]
-    down_delta = down_now - state["first_down"]
-
-    # Update prev for next cycle
-    state["prev_up"] = up_now
-    state["prev_down"] = down_now
-
-    return up_delta, down_delta, up_now, down_now
-
-
-def cleanup_flow_state(active_epochs):
-    """Remove flow state for expired market windows."""
-    expired = [k for k in flow_state if k.split(":")[-1] not in active_epochs]
-    for k in expired:
-        del flow_state[k]
-
-
-# =========================================================================
 # MAIN BOT
 # =========================================================================
 
 def run_flow():
     """
     Flow strategy:
-    1. Scan current markets, track total shares per side over time
-    2. When one side gets a disproportionate surge of new shares, buy it
-    3. Place limit sell at 0.99
-    4. If flow reverses (big money leaves), market sell
+    1. For each market, fetch the trade feed (Activity tab data)
+    2. Compute net buy flow per side (buys $ - sells $)
+    3. When one side has strong net inflow, buy it
+    4. Place limit sell at 0.99
+    5. If flow reverses on next check, market sell
     """
     positions = {}  # token_id -> position info
 
     log(f"\n{'='*60}")
-    log(f"Flow bot started")
-    log(f"Min flow: {MIN_FLOW} shares, Min ratio: {MIN_RATIO}x")
+    log(f"Flow bot started (using trade activity feed)")
+    log(f"Min flow: ${MIN_FLOW}, Min ratio: {MIN_RATIO}x")
     log(f"Buy amount: ${BUY_AMOUNT}, Cryptos: {', '.join(CRYPTOS)}")
     log(f"{'='*60}\n")
 
     while True:
         try:
             os.system('cls' if os.name == 'nt' else 'clear')
-            print("💰 Tracking money flow...", flush=True)
+            print("💰 Analyzing trade activity...", flush=True)
 
             markets = get_current_crypto_markets()
             existing_orders = get_existing_orders()
@@ -281,11 +267,8 @@ def run_flow():
                 if tid:
                     known_tokens.add(tid)
 
-            # Track active epochs for cleanup
-            active_epochs = set()
-
             # =================================================================
-            # STEP 1: Detect flow signals and enter positions
+            # STEP 1: Analyze trade flow and enter positions
             # =================================================================
             for market in markets:
                 question = market.get("question", "N/A")
@@ -294,37 +277,42 @@ def run_flow():
                 elapsed = market.get("_elapsed_min", 0)
                 condition_id = market.get("conditionId", "")
                 slug = market.get("_slug", "")
-                epoch = str(market.get("_epoch", 0))
+                epoch = market.get("_epoch", 0)
                 tokens = json.loads(market.get("clobTokenIds", "[]"))
 
                 if len(tokens) != 2:
                     continue
 
-                active_epochs.add(epoch)
-
                 # Skip if we already have a position on this market
                 if any(t in known_tokens for t in tokens):
                     continue
 
-                # Compute flow since first snapshot
-                up_delta, down_delta, up_total, down_total = compute_flow(condition_id, epoch)
+                # Fetch and analyze trade activity
+                flow = compute_trade_flow(condition_id, tokens)
+                up_net = flow["up_net"]
+                down_net = flow["down_net"]
+                trade_count = flow["trade_count"]
 
-                # Log flow status
-                if up_delta != 0 or down_delta != 0:
-                    log(f"  {crypto} {interval}m: UP Δ{up_delta:+,.0f} ({up_total:,.0f}) | DOWN Δ{down_delta:+,.0f} ({down_total:,.0f})")
+                # Log flow for all markets
+                if trade_count > 0:
+                    log(f"  {crypto} {interval}m ({trade_count} trades): "
+                        f"UP net ${up_net:+,.0f} (${flow['up_buys']:,.0f}B/${flow['up_sells']:,.0f}S) | "
+                        f"DOWN net ${down_net:+,.0f} (${flow['down_buys']:,.0f}B/${flow['down_sells']:,.0f}S)")
+                else:
+                    log(f"  {crypto} {interval}m: no trades yet")
+                    continue
 
                 # Check for entry signal
-                # Need: one side has MIN_FLOW new shares AND is MIN_RATIO x the other
-                if up_delta >= MIN_FLOW and (down_delta <= 0 or up_delta / max(down_delta, 1) >= MIN_RATIO):
+                if up_net >= MIN_FLOW and (down_net <= 0 or up_net / max(down_net, 1) >= MIN_RATIO):
                     chosen_idx = 0
                     chosen_side = "UP"
-                    chosen_flow = up_delta
-                    other_flow = down_delta
-                elif down_delta >= MIN_FLOW and (up_delta <= 0 or down_delta / max(up_delta, 1) >= MIN_RATIO):
+                    chosen_net = up_net
+                    other_net = down_net
+                elif down_net >= MIN_FLOW and (up_net <= 0 or down_net / max(up_net, 1) >= MIN_RATIO):
                     chosen_idx = 1
                     chosen_side = "DOWN"
-                    chosen_flow = down_delta
-                    other_flow = up_delta
+                    chosen_net = down_net
+                    other_net = up_net
                 else:
                     continue  # No signal
 
@@ -335,15 +323,21 @@ def run_flow():
                     continue
 
                 # Scale bet by flow strength
-                flow_strength = chosen_flow / MIN_FLOW
+                flow_strength = chosen_net / MIN_FLOW
                 bet_multiplier = min(flow_strength, MAX_BET_MULTIPLIER)
                 scaled_amount = round(BUY_AMOUNT * bet_multiplier, 2)
 
-                ratio = chosen_flow / max(abs(other_flow), 1)
+                ratio = chosen_net / max(abs(other_net), 1)
 
                 log(f"\n💰 FLOW SIGNAL: {question}")
-                log(f"  {chosen_side} flow: {chosen_flow:+,.0f} shares (ratio {ratio:.1f}x)")
+                log(f"  {chosen_side} net flow: ${chosen_net:+,.0f} (ratio {ratio:.1f}x)")
                 log(f"  Price: {chosen_price:.2f}, Bet: ${scaled_amount:.0f} ({bet_multiplier:.1f}x)")
+
+                # Show big trades that drove the signal
+                if flow["big_trades"]:
+                    log(f"  Big trades:")
+                    for bt in flow["big_trades"][:5]:
+                        log(f"    {bt}")
 
                 # Place market buy
                 try:
@@ -373,7 +367,8 @@ def run_flow():
                         "slug": slug,
                         "epoch": epoch,
                         "cost": scaled_amount,
-                        "entry_flow": chosen_flow,
+                        "entry_net": chosen_net,
+                        "tokens": tokens,
                     }
 
                     log(f"  ✓ Bought {actual_shares:.0f} shares of {chosen_side} at {chosen_price:.2f}")
@@ -414,8 +409,9 @@ def run_flow():
                         "token": chosen_token,
                         "price": chosen_price,
                         "amount": scaled_amount,
-                        "flow": chosen_flow,
+                        "net_flow": chosen_net,
                         "ratio": round(ratio, 1),
+                        "big_trades": flow["big_trades"][:5],
                         "response": str(resp)
                     }
                     with open(TRADE_LOG, "a") as f:
@@ -440,23 +436,15 @@ def run_flow():
                     tokens_to_remove.append(token_id)
                     continue
 
-                # Still active — check for flow reversal
-                # If the shares on our side have dropped significantly, money is leaving
-                up_now, down_now = get_side_totals(pos["condition_id"])
-                key = f"{pos['condition_id']}:{pos['epoch']}"
-                state = flow_state.get(key)
-                if not state:
-                    continue
+                # Still active — re-check flow for reversal
+                flow = compute_trade_flow(pos["condition_id"], pos["tokens"])
+                our_net = flow["up_net"] if pos["outcome_idx"] == 0 else flow["down_net"]
 
-                our_total = up_now if pos["outcome_idx"] == 0 else down_now
-                our_first = state["first_up"] if pos["outcome_idx"] == 0 else state["first_down"]
-                our_delta_now = our_total - our_first
-
-                # Flow reversal: the delta that triggered us has evaporated
-                # If current delta dropped below 30% of what triggered our entry, exit
-                if pos["entry_flow"] > 0 and our_delta_now < pos["entry_flow"] * 0.3:
+                # Flow reversal: our side's net flow has gone negative
+                # (more selling than buying now) — money is leaving
+                if our_net < 0 and pos["entry_net"] > 0:
                     log(f"\n🔄 FLOW REVERSAL: {pos['market']} {pos['side']}")
-                    log(f"  Entry flow was {pos['entry_flow']:+,.0f}, now {our_delta_now:+,.0f}")
+                    log(f"  Entry net was ${pos['entry_net']:+,.0f}, now ${our_net:+,.0f}")
 
                     try:
                         cancel_all_orders_for_token(token_id)
@@ -504,9 +492,6 @@ def run_flow():
 
             for token_id in tokens_to_remove:
                 del positions[token_id]
-
-            # Cleanup old flow state
-            cleanup_flow_state(active_epochs)
 
             # =================================================================
             # Status display
