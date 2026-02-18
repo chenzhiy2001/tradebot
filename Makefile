@@ -17,6 +17,9 @@ just-run:
 highprob:
 	.venv/bin/python highprob.py
 
+flow:
+	.venv/bin/python flow.py
+
 update-wallets:
 	.venv/bin/python utility.py
 
