@@ -151,8 +151,11 @@ def get_current_crypto_markets():
 def get_market_trades(condition_id):
     """
     Fetch ALL trade activity for a market from the data API.
-    Paginates through all results (the API caps at ~200 per request).
-    Returns list of all trades.
+    Uses ?market=conditionId — the only endpoint that correctly filters.
+    Note: live/in-progress markets may have fewer trades than the website
+    shows (data-api lags real-time WebSocket by ~30-60s). Resolved markets
+    return full data (3000+ for BTC 5m).
+    Paginates through all results (API caps at ~200 per request).
     """
     all_trades = []
     offset = 0

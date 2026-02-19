@@ -131,12 +131,14 @@ def fetch_market_info(slug_info):
 # Step 2: Fetch ALL trades with pagination — store raw
 # ---------------------------------------------------------------------------
 def fetch_all_trades(condition_id):
-    """Fetch all trades for a market, paginating."""
+    """Fetch all trades for a market using ?market=conditionId.
+    This is the only endpoint that correctly filters trades to the market.
+    Resolved markets return full data (3000+ for BTC 5m)."""
     all_trades = []
-    offset = 0
     page_size = 200
-    max_pages = 20
+    max_pages = 20  # 20 * 200 = 4000 max
 
+    offset = 0
     for _ in range(max_pages):
         try:
             r = requests.get(
