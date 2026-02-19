@@ -47,17 +47,29 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BUY_AMOUNT = 5            # Base bet in $
-MIN_FLOW = 300             # Minimum net buy $ on chosen side to trigger
-MIN_RATIO = 2.0            # Net buy on chosen side must be Nx the other
+BUY_AMOUNT = 3             # Base bet in $ (smaller = less risk per trade)
+MIN_FLOW = 1000            # Minimum net buy $ on chosen side to trigger
+                           # Was 300 — too loose. Data shows:
+                           #   Flow>=300: 40% WR (losing)
+                           #   Flow>=1000: 50% WR (break even)
+                           #   Flow>=2000: 100% WR (4 trades, small sample)
+MIN_RATIO = 5.0            # Net buy on chosen side must be Nx the other
+                           # Was 2.0 — too loose. Data shows:
+                           #   Ratio>=2x: 40% WR | >=5x: 52% WR | >=10x: 73% WR
 POLL_INTERVAL = 1          # Seconds between scans
 SELL_PRICE = 0.99          # Limit sell price (take profit)
-MAX_ENTRY_PRICE = 0.55     # Skip if price already above this (edge disappears)
+MAX_ENTRY_PRICE = 0.52     # Skip if price already above this (tighter — less vig)
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
 # Scaling: bet more when the flow is stronger
 # bet = BUY_AMOUNT * min(net_flow / MIN_FLOW, MAX_BET_MULTIPLIER)
-MAX_BET_MULTIPLIER = 3.0
+MAX_BET_MULTIPLIER = 2.0   # Was 3.0 — cap risk
+
+# Risk management (NEW)
+MAX_CONCURRENT_POSITIONS = 3   # Don't spread too thin
+STARTING_BANKROLL = 0          # Set at runtime from actual balance
+SESSION_STOP_LOSS_PCT = 0.30   # Halt if down 30% of starting bankroll
+MIN_BALANCE_BUFFER = 5         # Keep $5 in reserve, never bet last dollars
 
 # Log files
 DECISION_LOG = "flow_log.txt"
@@ -70,6 +82,23 @@ def log(message):
     with open(DECISION_LOG, "a") as f:
         f.write(f"[{timestamp}] {message}\n")
     print(message)
+
+
+def get_usdc_balance():
+    """Get current USDC balance available for trading."""
+    try:
+        ba = client.get_balance_allowance(
+            params=BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                token_id="",
+                signature_type=1
+            )
+        )
+        raw = float(ba.get("balance", 0))
+        return raw / 1e6
+    except Exception as e:
+        log(f"  ⚠ Failed to get USDC balance: {e}")
+        return None
 
 
 # Initialize CLOB client
@@ -277,10 +306,27 @@ def run_flow():
     else:
         positions = {}
 
+    # Track session P&L and bankroll
+    global STARTING_BANKROLL
+    initial_balance = get_usdc_balance()
+    if initial_balance is not None:
+        STARTING_BANKROLL = initial_balance
+        log(f"\n💵 Starting USDC balance: ${STARTING_BANKROLL:.2f}")
+    else:
+        STARTING_BANKROLL = 100  # fallback
+        log(f"\n⚠ Could not read balance, assuming ${STARTING_BANKROLL}")
+
+    session_invested = 0.0
+    session_returned = 0.0  # from wins that resolve
+    trades_this_session = 0
+    halted = False
+
     log(f"\n{'='*60}")
     log(f"Flow bot started (using trade activity feed)")
     log(f"Min flow: ${MIN_FLOW}, Min ratio: {MIN_RATIO}x")
-    log(f"Buy amount: ${BUY_AMOUNT}, Cryptos: {', '.join(CRYPTOS)}")
+    log(f"Max entry price: {MAX_ENTRY_PRICE}, Max positions: {MAX_CONCURRENT_POSITIONS}")
+    log(f"Buy amount: ${BUY_AMOUNT} (max {MAX_BET_MULTIPLIER}x), Cryptos: {', '.join(CRYPTOS)}")
+    log(f"Session stop-loss: {SESSION_STOP_LOSS_PCT*100:.0f}% of ${STARTING_BANKROLL:.0f} = ${STARTING_BANKROLL * SESSION_STOP_LOSS_PCT:.0f}")
     log(f"{'='*60}\n")
 
     while True:
@@ -297,6 +343,29 @@ def run_flow():
                 tid = order.get("asset_id")
                 if tid:
                     known_tokens.add(tid)
+
+            # =================================================================
+            # STEP 0: Check if we should keep trading
+            # =================================================================
+            if halted:
+                # Just monitor existing positions, don't enter new ones
+                pass
+
+            # Check session stop-loss
+            current_balance = get_usdc_balance()
+            if current_balance is not None and STARTING_BANKROLL > 0:
+                session_loss = STARTING_BANKROLL - current_balance
+                max_loss = STARTING_BANKROLL * SESSION_STOP_LOSS_PCT
+                if session_loss >= max_loss and not halted:
+                    log(f"\n🛑 SESSION STOP-LOSS HIT: down ${session_loss:.2f} (limit ${max_loss:.2f})")
+                    log(f"  Starting: ${STARTING_BANKROLL:.2f}, Current: ${current_balance:.2f}")
+                    log(f"  Bot will monitor existing positions but NOT enter new trades.")
+                    halted = True
+
+            # Check position limit
+            at_position_limit = len(positions) >= MAX_CONCURRENT_POSITIONS
+            if at_position_limit and not halted:
+                log(f"  📊 At position limit ({MAX_CONCURRENT_POSITIONS}), waiting for exits...")
 
             # =================================================================
             # STEP 1: Analyze trade flow and enter positions
@@ -316,6 +385,10 @@ def run_flow():
 
                 # Skip if we already have a position on this market
                 if any(t in known_tokens for t in tokens):
+                    continue
+
+                # Skip if halted or at position limit
+                if halted or at_position_limit:
                     continue
 
                 # Fetch and analyze trade activity
@@ -347,6 +420,16 @@ def run_flow():
                 else:
                     continue  # No signal
 
+                # FILTER: Skip if total flow is heavily one-sided toward UP
+                # (retail trap — everyone piles into UP, but the market is 50/50)
+                total_flow = abs(up_net) + abs(down_net)
+                if total_flow > 0:
+                    up_share = up_net / total_flow
+                    # If >80% of all flow is on UP side & signal says UP, skip
+                    if chosen_side == "UP" and up_share > 0.85:
+                        log(f"  ⏭ Retail trap filter: {up_share:.0%} of flow is UP — skipping")
+                        continue
+
                 chosen_token = tokens[chosen_idx]
                 chosen_price = get_price(chosen_token, side=BUY)
 
@@ -357,10 +440,25 @@ def run_flow():
                     log(f"  ⏭ Skipping {question}: price {chosen_price:.2f} > max {MAX_ENTRY_PRICE}")
                     continue
 
+                # Check we have enough balance
+                if current_balance is not None:
+                    available = current_balance - MIN_BALANCE_BUFFER
+                    if available <= 0:
+                        log(f"  ⏭ Insufficient balance (${current_balance:.2f}), skipping")
+                        continue
+
                 # Scale bet by flow strength
                 flow_strength = chosen_net / MIN_FLOW
                 bet_multiplier = min(flow_strength, MAX_BET_MULTIPLIER)
                 scaled_amount = round(BUY_AMOUNT * bet_multiplier, 2)
+
+                # Cap to available balance
+                if current_balance is not None:
+                    max_bet = current_balance - MIN_BALANCE_BUFFER
+                    scaled_amount = min(scaled_amount, max_bet)
+                    if scaled_amount < 1:
+                        log(f"  ⏭ Bet too small after balance cap (${scaled_amount:.2f}), skipping")
+                        continue
 
                 ratio = chosen_net / max(abs(other_net), 1)
 
@@ -532,7 +630,7 @@ def run_flow():
             # Status display
             # =================================================================
             if positions:
-                log(f"\n📊 Holding {len(positions)} positions:")
+                log(f"\n📊 Holding {len(positions)}/{MAX_CONCURRENT_POSITIONS} positions:")
                 for token_id, pos in positions.items():
                     cp = get_price(token_id, side=SELL)
                     gain = cp - pos["buy_price"]
@@ -541,7 +639,10 @@ def run_flow():
                         f"entry {pos['buy_price']:.2f} → now {cp:.2f} ({gain:+.2f})")
 
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            log(f"\n⏰ {now_str} UTC | {len(positions)} positions | Next scan in {POLL_INTERVAL}s")
+            bal_str = f"${current_balance:.2f}" if current_balance else "?"
+            halt_str = " 🛑 HALTED" if halted else ""
+            session_pnl = (current_balance - STARTING_BANKROLL) if current_balance else 0
+            log(f"\n⏰ {now_str} UTC | {len(positions)} pos | bal {bal_str} | session ${session_pnl:+.2f}{halt_str}")
             time.sleep(POLL_INTERVAL)
 
         except KeyboardInterrupt:
