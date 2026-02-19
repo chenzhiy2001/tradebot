@@ -47,7 +47,7 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BUY_AMOUNT = 3             # Base bet in $ (smaller = less risk per trade)
+BUY_AMOUNT = 10             # Base bet in $ (smaller = less risk per trade)
 MIN_FLOW = 1000            # Minimum net buy $ on chosen side to trigger
                            # Was 300 — too loose. Data shows:
                            #   Flow>=300: 40% WR (losing)
@@ -66,7 +66,7 @@ CRYPTOS = ["btc", "eth", "sol", "xrp"]
 MAX_BET_MULTIPLIER = 2.0   # Was 3.0 — cap risk
 
 # Risk management (NEW)
-MAX_CONCURRENT_POSITIONS = 3   # Don't spread too thin
+MAX_CONCURRENT_POSITIONS = 1000   # Don't spread too thin
 STARTING_BANKROLL = 0          # Set at runtime from actual balance
 SESSION_STOP_LOSS_PCT = 0.30   # Halt if down 30% of starting bankroll
 MIN_BALANCE_BUFFER = 5         # Keep $5 in reserve, never bet last dollars
