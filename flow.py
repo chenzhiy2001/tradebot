@@ -405,12 +405,10 @@ def run_flow():
                 if len(tokens) != 2:
                     continue
 
-                # Skip if we already have a position on this market
-                if any(t in known_tokens for t in tokens):
-                    continue
+                already_holding = any(t in known_tokens for t in tokens)
 
-                # Skip if halted or at position limit
-                if halted or at_position_limit:
+                # Skip flow fetch if halted/at limit AND not holding (nothing to log or do)
+                if (halted or at_position_limit) and not already_holding:
                     continue
 
                 # Fetch and analyze trade activity
@@ -419,13 +417,18 @@ def run_flow():
                 down_net = flow["down_net"]
                 trade_count = flow["trade_count"]
 
-                # Log flow for all markets
+                # Log flow for all markets (including held ones)
                 if trade_count > 0:
-                    log(f"  {question} ({trade_count} trades): "
+                    held_tag = " [HELD]" if already_holding else ""
+                    log(f"  {question} ({trade_count} trades){held_tag}: "
                         f"UP net ${up_net:+,.0f} (${flow['up_buys']:,.0f}B/${flow['up_sells']:,.0f}S) | "
                         f"DOWN net ${down_net:+,.0f} (${flow['down_buys']:,.0f}B/${flow['down_sells']:,.0f}S)")
                 else:
                     log(f"  {question}: no trades yet")
+                    continue
+
+                # Don't enter if already holding, halted, or at limit
+                if already_holding or halted or at_position_limit:
                     continue
 
                 # Check for entry signal
