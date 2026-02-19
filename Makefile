@@ -31,6 +31,10 @@ strategy_logs_paths:
 	@echo $(CURDIR)/data.json
 	@echo $(CURDIR)/perf.json
 	
+flow_logs_paths:
+	@echo "Full paths:"
+	@echo $(CURDIR)/flow_log.txt
+	@echo $(CURDIR)/flow_trades.json
 
 clean:
 	rm -rf .venv
