@@ -52,7 +52,6 @@ MIN_FLOW = 300             # Minimum net buy $ on chosen side to trigger
 MIN_RATIO = 2.0            # Net buy on chosen side must be Nx the other
 POLL_INTERVAL = 1          # Seconds between scans
 SELL_PRICE = 0.99          # Limit sell price (take profit)
-STOP_LOSS_DELTA = 0.10     # Sell if price drops this much from entry
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
 # Scaling: bet more when the flow is stronger
@@ -467,26 +466,16 @@ def run_flow():
                     tokens_to_remove.append(token_id)
                     continue
 
-                # Still active — check price-based stop loss first
-                current_price = get_price(token_id, side=SELL)
-                stop_price = pos["buy_price"] - STOP_LOSS_DELTA
-                exit_reason = None
+                # Still active — re-check flow for reversal
+                flow = compute_trade_flow(pos["condition_id"], pos["tokens"])
+                our_net = flow["up_net"] if pos["outcome_idx"] == 0 else flow["down_net"]
 
-                if current_price <= stop_price:
-                    exit_reason = "STOP_LOSS"
-                    log(f"\n🛑 STOP LOSS: {pos['market']} {pos['side']}")
-                    log(f"  Entry {pos['buy_price']:.2f} → now {current_price:.2f} (stop was {stop_price:.2f})")
+                # Flow reversal: our side's net flow has gone negative
+                # (more selling than buying now) — money is leaving
+                if our_net < 0 and pos["entry_net"] > 0:
+                    log(f"\n🔄 FLOW REVERSAL: {pos['market']} {pos['side']}")
+                    log(f"  Entry net was ${pos['entry_net']:+,.0f}, now ${our_net:+,.0f}")
 
-                # Then check flow reversal
-                if not exit_reason:
-                    flow = compute_trade_flow(pos["condition_id"], pos["tokens"])
-                    our_net = flow["up_net"] if pos["outcome_idx"] == 0 else flow["down_net"]
-                    if our_net < 0 and pos["entry_net"] > 0:
-                        exit_reason = "FLOW_REVERSAL"
-                        log(f"\n🔄 FLOW REVERSAL: {pos['market']} {pos['side']}")
-                        log(f"  Entry net was ${pos['entry_net']:+,.0f}, now ${our_net:+,.0f}")
-
-                if exit_reason:
                     try:
                         cancel_all_orders_for_token(token_id)
                         time.sleep(1)
@@ -497,7 +486,7 @@ def run_flow():
                             sell_shares = math.floor(pos["size"] * 100) / 100
 
                         if sell_shares > 0:
-                            sell_price = get_price(token_id, side=SELL)
+                            current_price = get_price(token_id, side=SELL)
                             mo = MarketOrderArgs(
                                 token_id=token_id,
                                 amount=sell_shares,
@@ -507,18 +496,18 @@ def run_flow():
                             signed = client.create_market_order(mo)
                             resp = client.post_order(signed, OrderType.FAK)
 
-                            sell_proceeds = sell_shares * sell_price
+                            sell_proceeds = sell_shares * current_price
                             pnl = sell_proceeds - pos["cost"]
-                            log(f"  ✓ Sold {sell_shares:.0f} shares at ~{sell_price:.2f} (P&L: ${pnl:+.1f})")
+                            log(f"  ✓ Sold {sell_shares:.0f} shares at ~{current_price:.2f} (P&L: ${pnl:+.1f})")
 
                             record = {
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "action": exit_reason,
+                                "action": "FLOW_REVERSAL",
                                 "market": pos["market"],
                                 "side": pos["side"],
                                 "token": token_id,
                                 "buy_price": pos["buy_price"],
-                                "sell_price": sell_price,
+                                "sell_price": current_price,
                                 "shares": sell_shares,
                                 "pnl": pnl,
                                 "response": str(resp)
@@ -527,7 +516,7 @@ def run_flow():
                                 f.write(json.dumps(record) + "\n")
 
                     except Exception as e:
-                        log(f"  ✗ {exit_reason} sell failed: {e}")
+                        log(f"  ✗ Flow reversal sell failed: {e}")
 
                     tokens_to_remove.append(token_id)
 
