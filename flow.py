@@ -207,31 +207,29 @@ class TradeAccumulator:
                 await asyncio.sleep(2)
 
     async def _process_pending(self, ws):
-        """Send subscription updates if tokens changed."""
-        to_add = None
-        to_remove = None
+        """Send subscription updates if tokens changed.
+        Always re-sends the FULL subscription list because the server
+        replaces (not appends) on each 'type: market' message.
+        """
+        changed = False
         with self._lock:
             if self._pending_subscribe:
-                to_add = list(self._pending_subscribe)
                 self._subscribed.update(self._pending_subscribe)
                 self._pending_subscribe.clear()
+                changed = True
             if self._pending_unsubscribe:
-                to_remove = list(self._pending_unsubscribe)
-                self._subscribed -= set(to_remove)
+                self._subscribed -= self._pending_unsubscribe
+                # Clear trades for removed tokens
+                for token in self._pending_unsubscribe:
+                    self._trades.pop(token, None)
                 self._pending_unsubscribe.clear()
+                changed = True
 
-        if to_add:
+        if changed and self._subscribed:
             try:
-                await ws.send(json.dumps({"type": "market", "assets_ids": to_add}))
-            except Exception:
-                pass
-        if to_remove:
-            try:
-                await ws.send(json.dumps({
-                    "type": "market",
-                    "assets_ids": to_remove,
-                    "action": "unsubscribe"
-                }))
+                full_list = list(self._subscribed)
+                await ws.send(json.dumps({"type": "market", "assets_ids": full_list}))
+                log(f"  📡 WS subscribed to {len(full_list)} tokens")
             except Exception:
                 pass
 
@@ -264,9 +262,6 @@ class TradeAccumulator:
                 self._pending_subscribe.update(to_add)
             if to_remove:
                 self._pending_unsubscribe.update(to_remove)
-                # Clear accumulated trades for removed tokens
-                for token in to_remove:
-                    self._trades.pop(token, None)
 
     def get_trades(self, token_id):
         """Get accumulated trades for a token (thread-safe copy)."""
