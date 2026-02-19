@@ -71,9 +71,12 @@ STARTING_BANKROLL = 0          # Set at runtime from actual balance
 SESSION_STOP_LOSS_PCT = 0.30   # Halt if down 30% of starting bankroll
 MIN_BALANCE_BUFFER = 5         # Keep $5 in reserve, never bet last dollars
 
+# Dry-run mode: log signals without placing orders
+DRY_RUN = "--dry-run" in sys.argv
+
 # Log files
-DECISION_LOG = "flow_log.txt"
-TRADE_LOG = "flow_trades.json"
+DECISION_LOG = "flow_dry_log.txt" if DRY_RUN else "flow_log.txt"
+TRADE_LOG = "flow_dry_trades.json" if DRY_RUN else "flow_trades.json"
 POSITIONS_FILE = "flow_positions.json"
 
 
@@ -334,6 +337,9 @@ def run_flow():
     halted = False
 
     log(f"\n{'='*60}")
+    if DRY_RUN:
+        log(f"🧪 DRY-RUN MODE — no orders will be placed")
+        log(f"   Logging signals to {TRADE_LOG} for analysis")
     log(f"Flow bot started (using trade activity feed)")
     log(f"Min flow: ${MIN_FLOW}, Min ratio: {MIN_RATIO}x")
     log(f"Max entry price: {MAX_ENTRY_PRICE}, Max positions: {MAX_CONCURRENT_POSITIONS}")
@@ -432,16 +438,6 @@ def run_flow():
                 else:
                     continue  # No signal
 
-                # FILTER: Skip if total flow is heavily one-sided toward UP
-                # (retail trap — everyone piles into UP, but the market is 50/50)
-                total_flow = abs(up_net) + abs(down_net)
-                if total_flow > 0:
-                    up_share = up_net / total_flow
-                    # If >80% of all flow is on UP side & signal says UP, skip
-                    if chosen_side == "UP" and up_share > 0.85:
-                        log(f"  ⏭ Retail trap filter: {up_share:.0%} of flow is UP — skipping")
-                        continue
-
                 chosen_token = tokens[chosen_idx]
                 chosen_price = get_price(chosen_token, side=BUY)
 
@@ -484,7 +480,51 @@ def run_flow():
                     for bt in flow["big_trades"][:5]:
                         log(f"    {bt}")
 
-                # Place market buy
+                # Log signal (always, for both dry-run and live)
+                record = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "action": "DRY_SIGNAL" if DRY_RUN else "BUY",
+                    "market": question,
+                    "side": chosen_side,
+                    "token": chosen_token,
+                    "price": chosen_price,
+                    "amount": scaled_amount,
+                    "net_flow": chosen_net,
+                    "ratio": round(ratio, 1),
+                    "up_net": round(flow["up_net"], 2),
+                    "down_net": round(flow["down_net"], 2),
+                    "trade_count": flow["trade_count"],
+                    "big_trades": flow["big_trades"][:5],
+                    "slug": slug,
+                    "interval": interval,
+                    "crypto": crypto,
+                }
+
+                if DRY_RUN:
+                    # Don't place any orders — just log and track as fake position
+                    estimated_shares = scaled_amount / chosen_price if chosen_price > 0 else 0
+                    log(f"  🧪 DRY-RUN: would buy {estimated_shares:.0f} shares of {chosen_side} at {chosen_price:.2f}")
+                    record["response"] = "DRY_RUN"
+                    with open(TRADE_LOG, "a") as f:
+                        f.write(json.dumps(record) + "\n")
+
+                    # Track as virtual position so we don't re-signal same market
+                    positions[chosen_token] = {
+                        "market": question,
+                        "side": chosen_side,
+                        "buy_price": chosen_price,
+                        "size": estimated_shares,
+                        "condition_id": condition_id,
+                        "outcome_idx": chosen_idx,
+                        "slug": slug,
+                        "epoch": epoch,
+                        "cost": scaled_amount,
+                        "entry_net": chosen_net,
+                        "tokens": tokens,
+                    }
+                    continue
+
+                # Place market buy (LIVE only)
                 try:
                     mo = MarketOrderArgs(
                         token_id=chosen_token,
@@ -545,20 +585,7 @@ def run_flow():
                             daemon=True
                         ).start()
 
-                    # Log trade
-                    record = {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "action": "BUY",
-                        "market": question,
-                        "side": chosen_side,
-                        "token": chosen_token,
-                        "price": chosen_price,
-                        "amount": scaled_amount,
-                        "net_flow": chosen_net,
-                        "ratio": round(ratio, 1),
-                        "big_trades": flow["big_trades"][:5],
-                        "response": str(resp)
-                    }
+                    record["response"] = str(resp)
                     with open(TRADE_LOG, "a") as f:
                         f.write(json.dumps(record) + "\n")
 
@@ -590,6 +617,24 @@ def run_flow():
                 if our_net < 0 and pos["entry_net"] > 0:
                     log(f"\n🔄 FLOW REVERSAL: {pos['market']} {pos['side']}")
                     log(f"  Entry net was ${pos['entry_net']:+,.0f}, now ${our_net:+,.0f}")
+
+                    if DRY_RUN:
+                        log(f"  🧪 DRY-RUN: would sell position")
+                        record = {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "action": "DRY_FLOW_REVERSAL",
+                            "market": pos["market"],
+                            "side": pos["side"],
+                            "token": token_id,
+                            "buy_price": pos["buy_price"],
+                            "entry_net": pos["entry_net"],
+                            "current_net": our_net,
+                            "response": "DRY_RUN"
+                        }
+                        with open(TRADE_LOG, "a") as f:
+                            f.write(json.dumps(record) + "\n")
+                        tokens_to_remove.append(token_id)
+                        continue
 
                     try:
                         cancel_all_orders_for_token(token_id)
@@ -653,8 +698,9 @@ def run_flow():
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
             bal_str = f"${current_balance:.2f}" if current_balance else "?"
             halt_str = " 🛑 HALTED" if halted else ""
+            dry_str = " 🧪 DRY-RUN" if DRY_RUN else ""
             session_pnl = (current_balance - STARTING_BANKROLL) if current_balance else 0
-            log(f"\n⏰ {now_str} UTC | {len(positions)} pos | bal {bal_str} | session ${session_pnl:+.2f}{halt_str}")
+            log(f"\n⏰ {now_str} UTC | {len(positions)} pos | bal {bal_str} | session ${session_pnl:+.2f}{halt_str}{dry_str}")
             time.sleep(POLL_INTERVAL)
 
         except KeyboardInterrupt:

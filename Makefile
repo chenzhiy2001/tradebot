@@ -23,6 +23,9 @@ flow:
 flow-resume:
 	.venv/bin/python flow.py --resume
 
+flow-dry:
+	.venv/bin/python flow.py --dry-run
+
 update-wallets:
 	.venv/bin/python utility.py
 
