@@ -128,13 +128,11 @@ class TradeAccumulator:
     def __init__(self):
         self._lock = threading.Lock()
         self._trades = defaultdict(list)      # asset_id -> [trade_dict, ...]
-        self._subscribed = set()               # currently subscribed asset_ids
+        self._wanted = set()                   # tokens the main thread wants
+        self._active = set()                   # tokens actually subscribed on WS
         self._ws_connected = False
         self._ws_thread = None
         self._loop = None
-        self._ws = None
-        self._pending_subscribe = set()        # tokens to add
-        self._pending_unsubscribe = set()      # tokens to remove
 
     def start(self):
         """Start the background WebSocket thread."""
@@ -159,20 +157,15 @@ class TradeAccumulator:
         while True:
             try:
                 async with websockets.connect(WS_URL, close_timeout=5, open_timeout=10) as ws:
-                    self._ws = ws
                     self._ws_connected = True
+                    self._active = set()   # force re-subscribe on reconnect
                     log("  🔌 WebSocket connected")
-
-                    # Subscribe to any tokens already requested
-                    if self._subscribed:
-                        sub = {"type": "market", "assets_ids": list(self._subscribed)}
-                        await ws.send(json.dumps(sub))
 
                     # Heartbeat + listen loop
                     last_ping = time.time()
                     while True:
-                        # Process pending subscription updates
-                        await self._process_pending(ws)
+                        # Sync subscriptions: wanted vs active
+                        await self._sync_subscriptions(ws)
 
                         # Heartbeat every 10s
                         if time.time() - last_ping > 10:
@@ -206,32 +199,34 @@ class TradeAccumulator:
                 log(f"  ⚠ WebSocket disconnected: {e}, reconnecting in 2s...")
                 await asyncio.sleep(2)
 
-    async def _process_pending(self, ws):
-        """Send subscription updates if tokens changed.
-        Always re-sends the FULL subscription list because the server
-        replaces (not appends) on each 'type: market' message.
+    async def _sync_subscriptions(self, ws):
+        """Ensure WS subscriptions match what the main thread wants.
+        Compares wanted vs active on every call.  If ws.send() fails the
+        exception propagates → reconnect → _active is reset → auto-retry.
         """
-        changed = False
         with self._lock:
-            if self._pending_subscribe:
-                self._subscribed.update(self._pending_subscribe)
-                self._pending_subscribe.clear()
-                changed = True
-            if self._pending_unsubscribe:
-                self._subscribed -= self._pending_unsubscribe
-                # Clear trades for removed tokens
-                for token in self._pending_unsubscribe:
-                    self._trades.pop(token, None)
-                self._pending_unsubscribe.clear()
-                changed = True
+            wanted = set(self._wanted)          # snapshot under lock
 
-        if changed and self._subscribed:
-            try:
-                full_list = list(self._subscribed)
-                await ws.send(json.dumps({"type": "market", "assets_ids": full_list}))
-                log(f"  📡 WS subscribed to {len(full_list)} tokens")
-            except Exception:
-                pass
+        if wanted == self._active:
+            return
+
+        # Clear trades for tokens being removed
+        removed = self._active - wanted
+        if removed:
+            with self._lock:
+                for token in removed:
+                    self._trades.pop(token, None)
+
+        # Send the FULL list (server replaces, not appends)
+        if wanted:
+            await ws.send(json.dumps({"type": "market", "assets_ids": list(wanted)}))
+
+        added = wanted - self._active
+        log(f"  📡 WS subscribed to {len(wanted)} tokens"
+            f" (+{len(added)}, -{len(removed)})")
+
+        # Only mark active AFTER successful send
+        self._active = wanted
 
     def _ingest_trade(self, data):
         """Store a trade event from the WebSocket."""
@@ -249,19 +244,9 @@ class TradeAccumulator:
             self._trades[asset_id].append(trade)
 
     def update_subscriptions(self, wanted_tokens):
-        """Update which tokens we're subscribed to.
-        Call this each loop iteration with all current market tokens.
-        New tokens get subscribed; stale tokens get unsubscribed + cleared.
-        """
-        wanted = set(wanted_tokens)
+        """Set the desired subscription list.  The WS thread will converge."""
         with self._lock:
-            current = self._subscribed | self._pending_subscribe
-            to_add = wanted - current
-            to_remove = current - wanted
-            if to_add:
-                self._pending_subscribe.update(to_add)
-            if to_remove:
-                self._pending_unsubscribe.update(to_remove)
+            self._wanted = set(wanted_tokens)
 
     def get_trades(self, token_id):
         """Get accumulated trades for a token (thread-safe copy)."""
@@ -282,7 +267,7 @@ class TradeAccumulator:
 
     @property
     def subscribed_count(self):
-        return len(self._subscribed)
+        return len(self._active)
 
 
 # Global trade accumulator
