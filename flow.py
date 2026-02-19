@@ -380,6 +380,9 @@ def run_flow():
                     log(f"  Starting: ${STARTING_BANKROLL:.2f}, Current: ${current_balance:.2f}")
                     log(f"  Bot will monitor existing positions but NOT enter new trades.")
                     halted = True
+                elif halted and session_loss < max_loss:
+                    log(f"\n✅ UNHALT: balance recovered to ${current_balance:.2f} (loss ${session_loss:.2f} < limit ${max_loss:.2f})")
+                    halted = False
 
             # Check position limit
             at_position_limit = len(positions) >= MAX_CONCURRENT_POSITIONS
