@@ -130,6 +130,7 @@ class TradeAccumulator:
         self._trades = defaultdict(list)      # asset_id -> [trade_dict, ...]
         self._wanted = set()                   # tokens the main thread wants
         self._active = set()                   # tokens actually subscribed on WS
+        self._last_sub_time = 0.0              # epoch of last subscription send
         self._ws_connected = False
         self._ws_thread = None
         self._loop = None
@@ -201,13 +202,19 @@ class TradeAccumulator:
 
     async def _sync_subscriptions(self, ws):
         """Ensure WS subscriptions match what the main thread wants.
-        Compares wanted vs active on every call.  If ws.send() fails the
-        exception propagates → reconnect → _active is reset → auto-retry.
+        Compares wanted vs active on every call.  Also re-sends every 30s
+        in case the server silently dropped tokens (e.g. new market tokens
+        that weren't ready when first subscribed).
+        If ws.send() fails → exception → reconnect → _active reset → retry.
         """
         with self._lock:
             wanted = set(self._wanted)          # snapshot under lock
 
-        if wanted == self._active:
+        now = time.time()
+        changed = (wanted != self._active)
+        stale = (now - self._last_sub_time) > 5    # periodic refresh
+
+        if not changed and not stale:
             return
 
         # Clear trades for tokens being removed
@@ -221,9 +228,12 @@ class TradeAccumulator:
         if wanted:
             await ws.send(json.dumps({"type": "market", "assets_ids": list(wanted)}))
 
-        added = wanted - self._active
-        log(f"  📡 WS subscribed to {len(wanted)} tokens"
-            f" (+{len(added)}, -{len(removed)})")
+        self._last_sub_time = now
+
+        if changed:
+            added = wanted - self._active
+            log(f"  📡 WS subscribed to {len(wanted)} tokens"
+                f" (+{len(added)}, -{len(removed)})")
 
         # Only mark active AFTER successful send
         self._active = wanted
