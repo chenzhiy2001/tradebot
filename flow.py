@@ -52,6 +52,7 @@ MIN_FLOW = 300             # Minimum net buy $ on chosen side to trigger
 MIN_RATIO = 2.0            # Net buy on chosen side must be Nx the other
 POLL_INTERVAL = 1          # Seconds between scans
 SELL_PRICE = 0.99          # Limit sell price (take profit)
+MAX_ENTRY_PRICE = 0.55     # Skip if price already above this (edge disappears)
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
 # Scaling: bet more when the flow is stronger
@@ -350,6 +351,10 @@ def run_flow():
                 chosen_price = get_price(chosen_token, side=BUY)
 
                 if chosen_price <= 0 or chosen_price >= 1:
+                    continue
+
+                if chosen_price > MAX_ENTRY_PRICE:
+                    log(f"  ⏭ Skipping {question}: price {chosen_price:.2f} > max {MAX_ENTRY_PRICE}")
                     continue
 
                 # Scale bet by flow strength
