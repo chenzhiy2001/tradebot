@@ -421,11 +421,11 @@ def run_flow():
 
                 # Log flow for all markets
                 if trade_count > 0:
-                    log(f"  {crypto} {interval}m ({trade_count} trades): "
+                    log(f"  {question} ({trade_count} trades): "
                         f"UP net ${up_net:+,.0f} (${flow['up_buys']:,.0f}B/${flow['up_sells']:,.0f}S) | "
                         f"DOWN net ${down_net:+,.0f} (${flow['down_buys']:,.0f}B/${flow['down_sells']:,.0f}S)")
                 else:
-                    log(f"  {crypto} {interval}m: no trades yet")
+                    log(f"  {question}: no trades yet")
                     continue
 
                 # Check for entry signal
