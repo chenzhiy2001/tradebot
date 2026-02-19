@@ -48,14 +48,12 @@ FUNDER_ADDRESS = founder_address
 # STRATEGY PARAMETERS
 # =========================================================================
 BUY_AMOUNT = 10             # Base bet in $ (smaller = less risk per trade)
-MIN_FLOW = 1000            # Minimum net buy $ on chosen side to trigger
-                           # Was 300 — too loose. Data shows:
-                           #   Flow>=300: 40% WR (losing)
-                           #   Flow>=1000: 50% WR (break even)
-                           #   Flow>=2000: 100% WR (4 trades, small sample)
-MIN_RATIO = 5.0            # Net buy on chosen side must be Nx the other
-                           # Was 2.0 — too loose. Data shows:
-                           #   Ratio>=2x: 40% WR | >=5x: 52% WR | >=10x: 73% WR
+MIN_FLOW = 100             # Minimum net buy $ on chosen side to trigger
+                           # Backtest (48h, 172 markets, time-filtered):
+                           #   Low threshold is fine — MIN_RATIO does the filtering
+MIN_RATIO = 3.0            # Net buy on chosen side must be Nx the other
+                           # Backtest: $100/3.0x at 50% cutoff → 89.3% WR (25W/3L)
+                           #           $100/3.0x at 60% cutoff → 92.7% WR (38W/3L)
 POLL_INTERVAL = 1          # Seconds between scans
 SELL_PRICE = 0.99          # Limit sell price (take profit)
 MAX_ENTRY_PRICE = 0.52     # Skip if price already above this (tighter — less vig)
