@@ -47,7 +47,7 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BUY_AMOUNT = 20            # Base bet in $
+BUY_AMOUNT = 5            # Base bet in $
 MIN_FLOW = 300             # Minimum net buy $ on chosen side to trigger
 MIN_RATIO = 2.0            # Net buy on chosen side must be Nx the other
 POLL_INTERVAL = 1          # Seconds between scans
