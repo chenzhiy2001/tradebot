@@ -20,6 +20,7 @@ Exit:
 """
 
 import os
+import sys
 import time
 import math
 import requests
@@ -61,6 +62,7 @@ MAX_BET_MULTIPLIER = 3.0
 # Log files
 DECISION_LOG = "flow_log.txt"
 TRADE_LOG = "flow_trades.json"
+POSITIONS_FILE = "flow_positions.json"
 
 
 def log(message):
@@ -236,6 +238,24 @@ def get_existing_orders():
 # MAIN BOT
 # =========================================================================
 
+def save_positions(positions):
+    """Save positions to disk so they survive restarts."""
+    try:
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(positions, f, indent=2)
+    except Exception as e:
+        log(f"⚠ Failed to save positions: {e}")
+
+
+def load_positions():
+    """Load positions from disk."""
+    try:
+        with open(POSITIONS_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 def run_flow():
     """
     Flow strategy:
@@ -245,7 +265,17 @@ def run_flow():
     4. Place limit sell at 0.99
     5. If flow reverses on next check, market sell
     """
-    positions = {}  # token_id -> position info
+    resume = "--resume" in sys.argv
+    if resume:
+        positions = load_positions()
+        if positions:
+            log(f"\n🔄 Resumed {len(positions)} positions from {POSITIONS_FILE}")
+            for tid, pos in positions.items():
+                log(f"  {pos['market']} {pos['side']} (entry {pos['buy_price']:.2f})")
+        else:
+            log(f"\n🔄 --resume specified but no saved positions found")
+    else:
+        positions = {}
 
     log(f"\n{'='*60}")
     log(f"Flow bot started (using trade activity feed)")
@@ -521,6 +551,16 @@ def run_flow():
             time.sleep(POLL_INTERVAL)
 
         except KeyboardInterrupt:
+            if positions:
+                save_positions(positions)
+                log(f"\n💾 Saved {len(positions)} positions to {POSITIONS_FILE}")
+                log("  Restart with --resume to continue monitoring them")
+            else:
+                # Clean up stale file if no positions
+                try:
+                    os.remove(POSITIONS_FILE)
+                except FileNotFoundError:
+                    pass
             log("\nBot stopped by user")
             break
         except Exception as e:

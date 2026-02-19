@@ -20,6 +20,9 @@ highprob:
 flow:
 	.venv/bin/python flow.py
 
+flow-resume:
+	.venv/bin/python flow.py --resume
+
 update-wallets:
 	.venv/bin/python utility.py
 
