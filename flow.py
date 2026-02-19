@@ -25,7 +25,9 @@ import time
 import math
 import requests
 import json
+import asyncio
 import threading
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams, BalanceAllowanceParams, AssetType
@@ -40,7 +42,7 @@ founder_address = os.getenv("FUNDER_ADDRESS")
 # Configuration
 HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
-DATA_API = "https://data-api.polymarket.com"
+WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CHAIN_ID = 137
 FUNDER_ADDRESS = founder_address
 
@@ -114,6 +116,185 @@ client.set_api_creds(client.create_or_derive_api_creds())
 
 
 # =========================================================================
+# WEBSOCKET TRADE FEED
+# =========================================================================
+
+class TradeAccumulator:
+    """Thread-safe accumulator for real-time trade events from WebSocket.
+    Stores trades per asset_id (token). The WS market channel sends
+    'last_trade_price' events with: asset_id, side, size, price, timestamp.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._trades = defaultdict(list)      # asset_id -> [trade_dict, ...]
+        self._subscribed = set()               # currently subscribed asset_ids
+        self._ws_connected = False
+        self._ws_thread = None
+        self._loop = None
+        self._ws = None
+        self._pending_subscribe = set()        # tokens to add
+        self._pending_unsubscribe = set()      # tokens to remove
+
+    def start(self):
+        """Start the background WebSocket thread."""
+        self._ws_thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._ws_thread.start()
+
+    def _run_loop(self):
+        """Run the asyncio event loop in a background thread."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._ws_loop())
+
+    async def _ws_loop(self):
+        """Connect, subscribe, listen. Auto-reconnect on failure."""
+        try:
+            import websockets
+        except ImportError:
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets"])
+            import websockets
+
+        while True:
+            try:
+                async with websockets.connect(WS_URL, close_timeout=5, open_timeout=10) as ws:
+                    self._ws = ws
+                    self._ws_connected = True
+                    log("  🔌 WebSocket connected")
+
+                    # Subscribe to any tokens already requested
+                    if self._subscribed:
+                        sub = {"type": "market", "assets_ids": list(self._subscribed)}
+                        await ws.send(json.dumps(sub))
+
+                    # Heartbeat + listen loop
+                    last_ping = time.time()
+                    while True:
+                        # Process pending subscription updates
+                        await self._process_pending(ws)
+
+                        # Heartbeat every 10s
+                        if time.time() - last_ping > 10:
+                            try:
+                                await ws.send("ping")
+                                last_ping = time.time()
+                            except Exception:
+                                break
+
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        try:
+                            data = json.loads(msg)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+                        # Handle trade events
+                        if isinstance(data, dict):
+                            if data.get("event_type") == "last_trade_price":
+                                self._ingest_trade(data)
+                        elif isinstance(data, list):
+                            # Book snapshot — ignore, but check for embedded trade info
+                            pass
+
+            except Exception as e:
+                self._ws_connected = False
+                self._ws = None
+                log(f"  ⚠ WebSocket disconnected: {e}, reconnecting in 2s...")
+                await asyncio.sleep(2)
+
+    async def _process_pending(self, ws):
+        """Send subscription updates if tokens changed."""
+        to_add = None
+        to_remove = None
+        with self._lock:
+            if self._pending_subscribe:
+                to_add = list(self._pending_subscribe)
+                self._subscribed.update(self._pending_subscribe)
+                self._pending_subscribe.clear()
+            if self._pending_unsubscribe:
+                to_remove = list(self._pending_unsubscribe)
+                self._subscribed -= set(to_remove)
+                self._pending_unsubscribe.clear()
+
+        if to_add:
+            try:
+                await ws.send(json.dumps({"type": "market", "assets_ids": to_add}))
+            except Exception:
+                pass
+        if to_remove:
+            try:
+                await ws.send(json.dumps({
+                    "type": "market",
+                    "assets_ids": to_remove,
+                    "action": "unsubscribe"
+                }))
+            except Exception:
+                pass
+
+    def _ingest_trade(self, data):
+        """Store a trade event from the WebSocket."""
+        asset_id = data.get("asset_id", "")
+        if not asset_id:
+            return
+        trade = {
+            "asset": asset_id,
+            "side": data.get("side", ""),
+            "size": float(data.get("size", 0)),
+            "price": float(data.get("price", 0)),
+            "timestamp": data.get("timestamp", ""),
+        }
+        with self._lock:
+            self._trades[asset_id].append(trade)
+
+    def update_subscriptions(self, wanted_tokens):
+        """Update which tokens we're subscribed to.
+        Call this each loop iteration with all current market tokens.
+        New tokens get subscribed; stale tokens get unsubscribed + cleared.
+        """
+        wanted = set(wanted_tokens)
+        with self._lock:
+            current = self._subscribed | self._pending_subscribe
+            to_add = wanted - current
+            to_remove = current - wanted
+            if to_add:
+                self._pending_subscribe.update(to_add)
+            if to_remove:
+                self._pending_unsubscribe.update(to_remove)
+                # Clear accumulated trades for removed tokens
+                for token in to_remove:
+                    self._trades.pop(token, None)
+
+    def get_trades(self, token_id):
+        """Get accumulated trades for a token (thread-safe copy)."""
+        with self._lock:
+            return list(self._trades.get(token_id, []))
+
+    def get_all_trades_for_market(self, tokens):
+        """Get all accumulated trades for a market's tokens."""
+        with self._lock:
+            result = []
+            for t in tokens:
+                result.extend(self._trades.get(t, []))
+            return result
+
+    @property
+    def connected(self):
+        return self._ws_connected
+
+    @property
+    def subscribed_count(self):
+        return len(self._subscribed)
+
+
+# Global trade accumulator
+trade_ws = TradeAccumulator()
+
+
+# =========================================================================
 # API HELPERS
 # =========================================================================
 
@@ -148,46 +329,12 @@ def get_current_crypto_markets():
     return markets
 
 
-def get_market_trades(condition_id):
-    """
-    Fetch ALL trade activity for a market from the data API.
-    Uses ?market=conditionId — the only endpoint that correctly filters.
-    Note: live/in-progress markets may have fewer trades than the website
-    shows (data-api lags real-time WebSocket by ~30-60s). Resolved markets
-    return full data (3000+ for BTC 5m).
-    Paginates through all results (API caps at ~200 per request).
-    """
-    all_trades = []
-    offset = 0
-    page_size = 200
-    max_pages = 20  # Safety cap: 20 * 200 = 4000 trades max
-    try:
-        for _ in range(max_pages):
-            r = requests.get(
-                f"{DATA_API}/trades",
-                params={"market": condition_id, "limit": page_size, "offset": offset},
-                timeout=15
-            )
-            if r.status_code != 200:
-                break
-            batch = r.json()
-            if not batch:
-                break
-            all_trades.extend(batch)
-            if len(batch) < page_size:
-                break  # Last page
-            offset += page_size
-    except Exception:
-        pass
-    return all_trades
-
-
 def compute_trade_flow(condition_id, tokens):
     """
-    Analyze the trade feed for a market.
+    Analyze real-time trade flow from the WebSocket accumulator.
     Returns dict with net buy flow per side ($ volume: buys - sells).
     """
-    trades = get_market_trades(condition_id)
+    trades = trade_ws.get_all_trades_for_market(tokens)
     up_token = tokens[0]
 
     result = {
@@ -341,7 +488,9 @@ def run_flow():
     if DRY_RUN:
         log(f"🧪 DRY-RUN MODE — no orders will be placed")
         log(f"   Logging signals to {TRADE_LOG} for analysis")
-    log(f"Flow bot started (using trade activity feed)")
+    # Start WebSocket trade feed
+    trade_ws.start()
+    log(f"Flow bot started (using real-time WebSocket trade feed)")
     log(f"Min flow: ${MIN_FLOW}, Min ratio: {MIN_RATIO}x")
     log(f"Max entry price: {MAX_ENTRY_PRICE}, Max positions: {MAX_CONCURRENT_POSITIONS}")
     log(f"Buy amount: ${BUY_AMOUNT} (max {MAX_BET_MULTIPLIER}x), Cryptos: {', '.join(CRYPTOS)}")
@@ -355,6 +504,12 @@ def run_flow():
 
             markets = get_current_crypto_markets()
             existing_orders = get_existing_orders()
+
+            # Update WebSocket subscriptions for current market tokens
+            all_market_tokens = []
+            for m in markets:
+                all_market_tokens.extend(json.loads(m.get("clobTokenIds", "[]")))
+            trade_ws.update_subscriptions(all_market_tokens)
 
             # Build set of tokens we already hold
             known_tokens = set(positions.keys())
@@ -706,8 +861,9 @@ def run_flow():
             bal_str = f"${current_balance:.2f}" if current_balance else "?"
             halt_str = " 🛑 HALTED" if halted else ""
             dry_str = " 🧪 DRY-RUN" if DRY_RUN else ""
+            ws_str = "🟢" if trade_ws.connected else "🔴"
             session_pnl = (current_balance - STARTING_BANKROLL) if current_balance else 0
-            log(f"\n⏰ {now_str} UTC | {len(positions)} pos | bal {bal_str} | session ${session_pnl:+.2f}{halt_str}{dry_str}")
+            log(f"\n⏰ {now_str} UTC | {len(positions)} pos | bal {bal_str} | session ${session_pnl:+.2f} | WS {ws_str}{halt_str}{dry_str}")
             time.sleep(POLL_INTERVAL)
 
         except KeyboardInterrupt:
