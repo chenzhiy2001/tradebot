@@ -149,21 +149,33 @@ def get_current_crypto_markets():
 
 def get_market_trades(condition_id):
     """
-    Fetch trade activity for a market from the data API.
-    Same data as the Activity tab on polymarket.com.
-    Returns list of trades sorted by timestamp.
+    Fetch ALL trade activity for a market from the data API.
+    Paginates through all results (the API caps at ~200 per request).
+    Returns list of all trades.
     """
+    all_trades = []
+    offset = 0
+    page_size = 200
+    max_pages = 20  # Safety cap: 20 * 200 = 4000 trades max
     try:
-        r = requests.get(
-            f"{DATA_API}/trades",
-            params={"market": condition_id, "limit": 100},
-            timeout=15
-        )
-        if r.status_code == 200:
-            return r.json()
+        for _ in range(max_pages):
+            r = requests.get(
+                f"{DATA_API}/trades",
+                params={"market": condition_id, "limit": page_size, "offset": offset},
+                timeout=15
+            )
+            if r.status_code != 200:
+                break
+            batch = r.json()
+            if not batch:
+                break
+            all_trades.extend(batch)
+            if len(batch) < page_size:
+                break  # Last page
+            offset += page_size
     except Exception:
         pass
-    return []
+    return all_trades
 
 
 def compute_trade_flow(condition_id, tokens):
