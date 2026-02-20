@@ -47,7 +47,7 @@ flow_logs_paths:
 # and delete original files
 flow_logs_backup:
 	mkdir -p archives
-	zip -j -9 archives/flow_logs_$(date +%Y%m%d_%H%M%S).zip flow_log.txt flow_trades.json flow_positions.json
+	zip -j -9 archives/flow_logs_$$(date +%Y%m%d_%H%M%S).zip flow_log.txt flow_trades.json flow_positions.json
 	rm -f flow_log.txt flow_trades.json flow_positions.json
 
 clean:
