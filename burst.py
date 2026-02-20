@@ -69,13 +69,18 @@ BURST_WINDOW = 5.0           # Seconds — detect bursts within this window
 BURST_THRESHOLD = 500        # $ net volume in the window to trigger (was 200, too low)
 MIN_ENTRY_PRICE = 0.08       # Don't buy fade token below this (dead side)
 MAX_ENTRY_PRICE = 0.55       # Don't buy fade token above this (too expensive for contrarian)
-MIN_BURST_PRICE = 0.50       # Burst side must be >= this to fade (ensures one-sided market)
+MIN_BURST_PRICE = 0.60       # Burst side must be >= this to fade (strong signal only)
 
 # Fees — real Polymarket formula: fee = C * feeRate * (p * (1-p))^exponent
 # For 5m/15m crypto: feeRate=0.25, exponent=2. Max ~1.56% at p=0.50.
 # Maker (GTC limit) = 0% fee. Taker (FAK market) = formula-based fee.
 CRYPTO_FEE_RATE = 0.25       # feeRate for 5m/15m crypto markets
 CRYPTO_FEE_EXPONENT = 2      # exponent for 5m/15m crypto markets
+
+# Limit buy entry (maker = 0% fee)
+LIMIT_BUY_OFFSET = 0.01      # Place limit buy at ask - this (catch the reversion)
+LIMIT_BUY_TIMEOUT = 10       # Seconds to wait for limit buy fill before cancelling
+LIMIT_BUY_CHECK_INTERVAL = 0.5  # How often to check if limit buy filled
 
 # Quick flip exit
 PROFIT_TARGET = 0.03         # Limit sell at entry + this (maker, 0% fee) (was 0.05, unreachable)
@@ -496,13 +501,17 @@ def quick_flip(token_id, entry_price, shares, pos_info):
     target_price = round(entry_price + PROFIT_TARGET, 2)
     stop_price = entry_price - STOP_LOSS
 
-    # Estimate entry fee for logging (using real fee formula)
-    entry_fee_est = compute_taker_fee(shares, entry_price)
-    target_net_pnl, _, _ = compute_pnl_with_fees(entry_price, target_price, shares, exit_is_maker=True)
+    # Both entry and exit are maker (0% fee)
+    entry_is_maker = pos_info.get("entry_is_maker", False)
+    target_gross_pnl = (target_price - entry_price) * shares
 
     log(f"  ⏱ Flip monitor started: {side_label} {shares:.0f}sh @ {entry_price:.2f}")
     log(f"    Limit sell: {target_price:.2f} (maker 0% fee) | Stop: {stop_price:.2f} | Timeout: {FLIP_TIMEOUT}s")
-    log(f"    Entry fee: ~${entry_fee_est:.2f} | Net P&L if target hit: ~${target_net_pnl:+.2f}")
+    if entry_is_maker:
+        log(f"    Entry: maker (0% fee) | Net P&L if target hit: ~${target_gross_pnl:+.2f}")
+    else:
+        entry_fee_est = compute_taker_fee(shares, entry_price)
+        log(f"    Entry fee: ~${entry_fee_est:.2f} | Net P&L if target hit: ~${target_gross_pnl - entry_fee_est:+.2f}")
 
     # Step 1: Place GTC limit sell at profit target (maker = 0% fee)
     # Retry multiple times since shares take time to settle on-chain
@@ -582,19 +591,22 @@ def quick_flip(token_id, entry_price, shares, pos_info):
 
     # Step 3: Execute exit
     pnl = 0.0
-    net_pnl, entry_fee, exit_fee = compute_pnl_with_fees(
-        entry_price, exit_price, shares, exit_is_maker=exit_is_maker
-    )
+    gross_pnl = (exit_price - entry_price) * shares
+    # Compute fees: entry is maker (0%) if limit buy filled, else taker
+    entry_fee = 0.0 if entry_is_maker else compute_taker_fee(shares, entry_price)
+    exit_fee = 0.0 if exit_is_maker else compute_taker_fee(shares, exit_price)
+    net_pnl = gross_pnl - entry_fee - exit_fee
 
     if DRY_RUN:
         pnl = net_pnl
-        fee_str = f"entry fee ${entry_fee:.2f}" + (f" + exit fee ${exit_fee:.2f}" if exit_fee > 0 else " + exit fee $0")
-        log(f"  🧪 DRY-RUN flip: {exit_reason} at {exit_price:.2f} | Gross ${(exit_price-entry_price)*shares:+.2f} | Fees: {fee_str} | Net: ${pnl:+.2f}")
+        fee_str = f"entry {'0%' if entry_is_maker else f'${entry_fee:.2f}'}" + f" + exit {'0%' if exit_is_maker else f'${exit_fee:.2f}'}"
+        log(f"  🧪 DRY-RUN flip: {exit_reason} at {exit_price:.2f} | Gross ${gross_pnl:+.2f} | Fees: {fee_str} | Net: ${pnl:+.2f}")
     else:
         if exit_reason == "profit" and exit_is_maker:
             # Limit order already filled — no action needed
             pnl = net_pnl
-            log(f"  ✓ Limit filled (profit): {target_price:.2f} | Net P&L: ${pnl:+.2f} (0% exit fee)")
+            fee_note = "0% both sides" if entry_is_maker else f"entry ${entry_fee:.2f}"
+            log(f"  ✓ Limit filled (profit): {target_price:.2f} | Net P&L: ${pnl:+.2f} ({fee_note})")
         else:
             # Cancel limit order, then market sell
             if limit_placed:
@@ -616,7 +628,8 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                     resp = client.post_order(signed, OrderType.FAK)
 
                     pnl = net_pnl
-                    log(f"  ✓ Market sell ({exit_reason}): {sell_shares:.0f}sh at ~{exit_price:.2f} | Net P&L: ${pnl:+.2f} (fees: ${entry_fee+exit_fee:.2f})")
+                    fee_note = f"fees: ${entry_fee+exit_fee:.2f}" if (entry_fee + exit_fee) > 0 else "entry 0%"
+                    log(f"  ✓ Market sell ({exit_reason}): {sell_shares:.0f}sh at ~{exit_price:.2f} | Net P&L: ${pnl:+.2f} ({fee_note})")
                 else:
                     log(f"  ⚠ No shares to sell (balance: {actual})")
             except Exception as e:
@@ -631,10 +644,11 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             "entry_price": entry_price,
             "exit_price": exit_price,
             "shares": shares,
-            "gross_pnl": round((exit_price - entry_price) * shares, 4),
+            "gross_pnl": round(gross_pnl, 4),
             "entry_fee": round(entry_fee, 4),
             "exit_fee": round(exit_fee, 4),
             "net_pnl": round(pnl, 4),
+            "entry_is_maker": entry_is_maker,
             "exit_is_maker": exit_is_maker,
             "elapsed": round(time.time() - start, 1),
         }
@@ -723,14 +737,16 @@ def run_burst():
 
         log(f"\n🔄 FADE BURST: {market} — {fade_reason}")
         log(f"  Burst: ${net_volume:.0f} {direction} on {burst_side} (price {burst_price:.2f})")
-        est_shares = amount / price
-        entry_fee = compute_taker_fee(est_shares, price)
-        eff_rate = (entry_fee / amount * 100) if amount > 0 else 0
-        log(f"  Buying {fade_side} at {price:.2f}, Bet: ${amount:.0f} (fee ~${entry_fee:.2f}, {eff_rate:.2f}%)")
+        limit_buy_price = round(price - LIMIT_BUY_OFFSET, 2)
+        if limit_buy_price < MIN_ENTRY_PRICE:
+            limit_buy_price = round(price, 2)  # Don't go below min, use ask price
+        est_shares = amount / limit_buy_price
+        log(f"  Limit buy {fade_side} at {limit_buy_price:.2f} (ask {price:.2f}), Bet: ${amount:.0f} (maker 0% fee)")
 
         if DRY_RUN:
-            shares = amount / price
-            log(f"  🧪 DRY-RUN: would buy {shares:.0f} shares of {fade_side}")
+            # Simulate: assume limit buy fills at our price after a short delay
+            shares = amount / limit_buy_price
+            log(f"  🧪 DRY-RUN: limit buy {shares:.0f}sh of {fade_side} at {limit_buy_price:.2f} (0% fee)")
             record = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "action": "DRY_FADE_BUY",
@@ -741,60 +757,85 @@ def run_burst():
                 "fade_reason": fade_reason,
                 "token": fade_token,
                 "burst_token": token_id,
-                "price": price,
+                "price": limit_buy_price,
+                "ask_price": price,
                 "burst_price": burst_price,
                 "amount": amount,
                 "burst_net": net_volume,
+                "entry_is_maker": True,
             }
             with open(TRADE_LOG, "a") as f:
                 f.write(json.dumps(record) + "\n")
 
             # Track position and start flip monitor
-            pos_info = {"market": market, "side": fade_side, "entry_price": price, "shares": shares,
-                        "fade_reason": fade_reason, "burst_side": burst_side}
+            pos_info = {"market": market, "side": fade_side, "entry_price": limit_buy_price, "shares": shares,
+                        "fade_reason": fade_reason, "burst_side": burst_side, "entry_is_maker": True}
             with positions_lock:
                 positions[fade_token] = pos_info
 
-            reason, pnl = quick_flip(fade_token, price, shares, pos_info)
+            reason, pnl = quick_flip(fade_token, limit_buy_price, shares, pos_info)
             session_pnl[0] += pnl
             with positions_lock:
                 positions.pop(fade_token, None)
             return
 
-        # LIVE: place market buy on the FADE token (contrarian)
+        # LIVE: place GTC limit buy on the FADE token (maker = 0% fee)
         try:
-            mo = MarketOrderArgs(
+            buy_shares = round(amount / limit_buy_price, 2)
+            if buy_shares < 5:
+                log(f"  ⚠ Shares {buy_shares:.1f} below min order size 5 — skipping")
+                return
+
+            buy_order = OrderArgs(
                 token_id=fade_token,
-                amount=amount,
+                price=limit_buy_price,
+                size=buy_shares,
                 side=BUY,
-                order_type=OrderType.FAK,
             )
-            signed = client.create_market_order(mo)
-            resp = client.post_order(signed, OrderType.FAK)
+            signed = client.create_order(buy_order)
+            resp = client.post_order(signed, OrderType.GTC)
+            order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
+            log(f"  ✓ Limit buy placed: {buy_shares:.0f}sh of {fade_side} at {limit_buy_price:.2f} (GTC, 0% fee)")
 
-            # Determine actual shares received and real fill price
-            actual_shares = 0
-            if isinstance(resp, dict):
-                taking = resp.get("takingAmount", "0")
-                actual_shares = float(taking) if taking else 0
-            # Fallback: check on-chain balance
-            if actual_shares == 0:
-                time.sleep(1)
-                chain_bal = get_actual_share_balance(fade_token)
-                if chain_bal and chain_bal > 0.5:
-                    actual_shares = chain_bal
+            # Wait for fill with timeout
+            filled = False
+            fill_start = time.time()
+            while time.time() - fill_start < LIMIT_BUY_TIMEOUT:
+                time.sleep(LIMIT_BUY_CHECK_INTERVAL)
+                actual = get_actual_share_balance(fade_token)
+                if actual is not None and actual >= buy_shares * 0.9:  # 90% filled = good enough
+                    filled = True
+                    buy_shares = math.floor(actual * 100) / 100
+                    break
+
+            if not filled:
+                # Cancel unfilled limit buy
+                try:
+                    if order_id:
+                        client.cancel(order_id)
+                    else:
+                        cancel_all_orders_for_token(fade_token)
+                except Exception:
+                    pass
+                # Check if partially filled
+                actual = get_actual_share_balance(fade_token)
+                if actual is not None and actual >= 5:  # Min order size
+                    buy_shares = math.floor(actual * 100) / 100
+                    filled = True
+                    log(f"  ⏳ Partial fill: {buy_shares:.0f}sh (continuing with partial)")
                 else:
-                    actual_shares = amount / price  # last resort estimate
+                    # Dump any dust shares
+                    if actual and actual > 0:
+                        try:
+                            mo = MarketOrderArgs(token_id=fade_token, amount=actual, side=SELL, order_type=OrderType.FAK)
+                            signed_dump = client.create_market_order(mo)
+                            client.post_order(signed_dump, OrderType.FAK)
+                        except Exception:
+                            pass
+                    log(f"  ⏳ Limit buy not filled in {LIMIT_BUY_TIMEOUT}s — cancelled, skipping trade")
+                    return
 
-            # Compute REAL entry price from amount spent / shares received
-            # This accounts for slippage — the actual cost basis
-            real_entry_price = amount / actual_shares if actual_shares > 0 else price
-            real_entry_price = round(real_entry_price, 4)
-
-            if abs(real_entry_price - price) > 0.02:
-                log(f"  ⚠ Slippage: asked {price:.2f}, got {real_entry_price:.2f} ({actual_shares:.1f}sh for ${amount})")
-
-            log(f"  ✓ Bought {actual_shares:.0f} shares of {fade_side} at {real_entry_price:.2f} (ask was {price:.2f}) [{fade_reason}]")
+            log(f"  ✓ Limit buy filled: {buy_shares:.0f}sh of {fade_side} at {limit_buy_price:.2f} (0% fee) [{fade_reason}]")
 
             record = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -807,26 +848,25 @@ def run_burst():
                 "token": fade_token,
                 "burst_token": token_id,
                 "ask_price": price,
-                "fill_price": real_entry_price,
+                "fill_price": limit_buy_price,
                 "burst_price": burst_price,
                 "amount": amount,
-                "shares": actual_shares,
+                "shares": buy_shares,
                 "burst_net": net_volume,
+                "entry_is_maker": True,
                 "response": str(resp),
             }
             with open(TRADE_LOG, "a") as f:
                 f.write(json.dumps(record) + "\n")
 
-            # Track and start flip in this thread (WS thread)
-            # Use a separate thread so WS keeps receiving
-            # IMPORTANT: use real_entry_price not the ask price for P&L
-            pos_info = {"market": market, "side": fade_side, "entry_price": real_entry_price, "shares": actual_shares,
-                        "fade_reason": fade_reason, "burst_side": burst_side}
+            # Track and start flip in separate thread so WS keeps receiving
+            pos_info = {"market": market, "side": fade_side, "entry_price": limit_buy_price, "shares": buy_shares,
+                        "fade_reason": fade_reason, "burst_side": burst_side, "entry_is_maker": True}
             with positions_lock:
                 positions[fade_token] = pos_info
 
             def do_flip():
-                reason, pnl = quick_flip(fade_token, real_entry_price, actual_shares, pos_info)
+                reason, pnl = quick_flip(fade_token, limit_buy_price, buy_shares, pos_info)
                 session_pnl[0] += pnl
                 with positions_lock:
                     positions.pop(fade_token, None)
@@ -846,7 +886,8 @@ def run_burst():
     log(f"🔄 CONTRARIAN burst bot (fade-the-burst)")
     log(f"Detection: {BURST_WINDOW}s window, ${BURST_THRESHOLD} threshold (buy + sell bursts)")
     log(f"Fade logic: buy bursts → buy opposite side | sell bursts → buy same side")
-    log(f"Quick flip: +{PROFIT_TARGET} profit (limit GTC, 0% fee) / -{STOP_LOSS} stop / {FLIP_TIMEOUT}s timeout")
+    log(f"Entry: limit buy at ask-{LIMIT_BUY_OFFSET} (maker 0% fee), {LIMIT_BUY_TIMEOUT}s fill timeout")
+    log(f"Exit: limit sell at +{PROFIT_TARGET} (maker 0% fee) / -{STOP_LOSS} stop / {FLIP_TIMEOUT}s timeout")
     log(f"Fade price: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}, Burst min: {MIN_BURST_PRICE}")
     log(f"Cooldowns: {COOLDOWN_AFTER_ENTRY}s/token, {MARKET_COOLDOWN}s/market, Limit retries: {LIMIT_SELL_RETRIES}")
     log(f"Max positions: {MAX_CONCURRENT_POSITIONS}")
