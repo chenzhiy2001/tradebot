@@ -79,14 +79,14 @@ CRYPTO_FEE_EXPONENT = 2      # exponent for 5m/15m crypto markets
 
 # Limit buy entry (maker = 0% fee)
 LIMIT_BUY_OFFSET = 0.01      # Place limit buy at ask - this (catch the reversion)
-LIMIT_BUY_TIMEOUT = 10       # Seconds to wait for limit buy fill before cancelling
+LIMIT_BUY_TIMEOUT = 5        # Seconds to wait for limit buy fill before cancelling
 LIMIT_BUY_CHECK_INTERVAL = 0.5  # How often to check if limit buy filled
 
 # Quick flip exit
 PROFIT_TARGET = 0.03         # Limit sell at entry + this (maker, 0% fee) (was 0.05, unreachable)
 STOP_LOSS = 0.05             # Cancel limit + market sell if price drops this much (was 0.10)
 FLIP_TIMEOUT = 30            # Max seconds to hold before force-selling (was 15)
-PRICE_CHECK_INTERVAL = 1.0   # How often to check price during flip
+PRICE_CHECK_INTERVAL = 0.5   # How often to check price during flip
 LIMIT_SELL_RETRIES = 3       # Retry limit sell placement this many times
 LIMIT_SELL_RETRY_DELAY = 3   # Seconds between retries
 
@@ -779,102 +779,114 @@ def run_burst():
                 positions.pop(fade_token, None)
             return
 
-        # LIVE: place GTC limit buy on the FADE token (maker = 0% fee)
-        try:
-            buy_shares = round(amount / limit_buy_price, 2)
-            if buy_shares < 5:
-                log(f"  ⚠ Shares {buy_shares:.1f} below min order size 5 — skipping")
-                return
+        # LIVE: move entire buy+flip flow into a thread so WS keeps receiving
+        # Reserve position slot immediately to prevent double-entry
+        with positions_lock:
+            positions[fade_token] = {"market": market, "side": fade_side, "entry_price": limit_buy_price,
+                                     "shares": 0, "fade_reason": fade_reason, "burst_side": burst_side,
+                                     "entry_is_maker": True, "status": "buying"}
 
-            buy_order = OrderArgs(
-                token_id=fade_token,
-                price=limit_buy_price,
-                size=buy_shares,
-                side=BUY,
-            )
-            signed = client.create_order(buy_order)
-            resp = client.post_order(signed, OrderType.GTC)
-            order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
-            log(f"  ✓ Limit buy placed: {buy_shares:.0f}sh of {fade_side} at {limit_buy_price:.2f} (GTC, 0% fee)")
-
-            # Wait for fill with timeout
-            filled = False
-            fill_start = time.time()
-            while time.time() - fill_start < LIMIT_BUY_TIMEOUT:
-                time.sleep(LIMIT_BUY_CHECK_INTERVAL)
-                actual = get_actual_share_balance(fade_token)
-                if actual is not None and actual >= buy_shares * 0.9:  # 90% filled = good enough
-                    filled = True
-                    buy_shares = math.floor(actual * 100) / 100
-                    break
-
-            if not filled:
-                # Cancel unfilled limit buy
-                try:
-                    if order_id:
-                        client.cancel(order_id)
-                    else:
-                        cancel_all_orders_for_token(fade_token)
-                except Exception:
-                    pass
-                # Check if partially filled
-                actual = get_actual_share_balance(fade_token)
-                if actual is not None and actual >= 5:  # Min order size
-                    buy_shares = math.floor(actual * 100) / 100
-                    filled = True
-                    log(f"  ⏳ Partial fill: {buy_shares:.0f}sh (continuing with partial)")
-                else:
-                    # Dump any dust shares
-                    if actual and actual > 0:
-                        try:
-                            mo = MarketOrderArgs(token_id=fade_token, amount=actual, side=SELL, order_type=OrderType.FAK)
-                            signed_dump = client.create_market_order(mo)
-                            client.post_order(signed_dump, OrderType.FAK)
-                        except Exception:
-                            pass
-                    log(f"  ⏳ Limit buy not filled in {LIMIT_BUY_TIMEOUT}s — cancelled, skipping trade")
+        def do_buy_and_flip():
+            try:
+                buy_shares = round(amount / limit_buy_price, 2)
+                if buy_shares < 5:
+                    log(f"  ⚠ Shares {buy_shares:.1f} below min order size 5 — skipping")
+                    with positions_lock:
+                        positions.pop(fade_token, None)
                     return
 
-            log(f"  ✓ Limit buy filled: {buy_shares:.0f}sh of {fade_side} at {limit_buy_price:.2f} (0% fee) [{fade_reason}]")
+                buy_order = OrderArgs(
+                    token_id=fade_token,
+                    price=limit_buy_price,
+                    size=buy_shares,
+                    side=BUY,
+                )
+                signed = client.create_order(buy_order)
+                resp = client.post_order(signed, OrderType.GTC)
+                order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
+                log(f"  ✓ Limit buy placed: {buy_shares:.0f}sh of {fade_side} at {limit_buy_price:.2f} (GTC, 0% fee)")
 
-            record = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "action": "FADE_BUY",
-                "market": market,
-                "burst_side": burst_side,
-                "fade_side": fade_side,
-                "burst_direction": direction,
-                "fade_reason": fade_reason,
-                "token": fade_token,
-                "burst_token": token_id,
-                "ask_price": price,
-                "fill_price": limit_buy_price,
-                "burst_price": burst_price,
-                "amount": amount,
-                "shares": buy_shares,
-                "burst_net": net_volume,
-                "entry_is_maker": True,
-                "response": str(resp),
-            }
-            with open(TRADE_LOG, "a") as f:
-                f.write(json.dumps(record) + "\n")
+                # Wait for fill with timeout
+                filled = False
+                fill_start = time.time()
+                while time.time() - fill_start < LIMIT_BUY_TIMEOUT:
+                    time.sleep(LIMIT_BUY_CHECK_INTERVAL)
+                    actual = get_actual_share_balance(fade_token)
+                    if actual is not None and actual >= buy_shares * 0.9:
+                        filled = True
+                        buy_shares = math.floor(actual * 100) / 100
+                        break
 
-            # Track and start flip in separate thread so WS keeps receiving
-            pos_info = {"market": market, "side": fade_side, "entry_price": limit_buy_price, "shares": buy_shares,
-                        "fade_reason": fade_reason, "burst_side": burst_side, "entry_is_maker": True}
-            with positions_lock:
-                positions[fade_token] = pos_info
+                if not filled:
+                    # Cancel unfilled limit buy
+                    try:
+                        if order_id:
+                            client.cancel(order_id)
+                        else:
+                            cancel_all_orders_for_token(fade_token)
+                    except Exception:
+                        pass
+                    # Check if partially filled
+                    actual = get_actual_share_balance(fade_token)
+                    if actual is not None and actual >= 5:
+                        buy_shares = math.floor(actual * 100) / 100
+                        filled = True
+                        log(f"  ⏳ Partial fill: {buy_shares:.0f}sh (continuing with partial)")
+                    else:
+                        # Dump any dust shares
+                        if actual and actual > 0:
+                            try:
+                                mo = MarketOrderArgs(token_id=fade_token, amount=actual, side=SELL, order_type=OrderType.FAK)
+                                signed_dump = client.create_market_order(mo)
+                                client.post_order(signed_dump, OrderType.FAK)
+                            except Exception:
+                                pass
+                        log(f"  ⏳ Limit buy not filled in {LIMIT_BUY_TIMEOUT}s — cancelled, skipping trade")
+                        with positions_lock:
+                            positions.pop(fade_token, None)
+                        return
 
-            def do_flip():
+                log(f"  ✓ Limit buy filled: {buy_shares:.0f}sh of {fade_side} at {limit_buy_price:.2f} (0% fee) [{fade_reason}]")
+
+                record = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "action": "FADE_BUY",
+                    "market": market,
+                    "burst_side": burst_side,
+                    "fade_side": fade_side,
+                    "burst_direction": direction,
+                    "fade_reason": fade_reason,
+                    "token": fade_token,
+                    "burst_token": token_id,
+                    "ask_price": price,
+                    "fill_price": limit_buy_price,
+                    "burst_price": burst_price,
+                    "amount": amount,
+                    "shares": buy_shares,
+                    "burst_net": net_volume,
+                    "entry_is_maker": True,
+                    "response": str(resp),
+                }
+                with open(TRADE_LOG, "a") as f:
+                    f.write(json.dumps(record) + "\n")
+
+                # Update position with real shares and start flip
+                pos_info = {"market": market, "side": fade_side, "entry_price": limit_buy_price, "shares": buy_shares,
+                            "fade_reason": fade_reason, "burst_side": burst_side, "entry_is_maker": True}
+                with positions_lock:
+                    positions[fade_token] = pos_info
+
                 reason, pnl = quick_flip(fade_token, limit_buy_price, buy_shares, pos_info)
                 session_pnl[0] += pnl
                 with positions_lock:
                     positions.pop(fade_token, None)
 
-            threading.Thread(target=do_flip, daemon=True).start()
+            except Exception as e:
+                log(f"  ✗ Fade buy failed: {e}")
+                with positions_lock:
+                    positions.pop(fade_token, None)
 
-        except Exception as e:
-            log(f"  ✗ Fade buy failed: {e}")
+        threading.Thread(target=do_buy_and_flip, daemon=True).start()
 
     # Create burst detector
     detector = BurstDetector(on_burst=on_burst)
