@@ -60,9 +60,9 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 BUY_AMOUNT = 10              # Base bet in $
 BURST_WINDOW = 5.0           # Seconds — detect bursts within this window
-BURST_THRESHOLD = 200        # $ net buy in the window to trigger
+BURST_THRESHOLD = 500        # $ net buy in the window to trigger (was 200, too low)
 MIN_ENTRY_PRICE = 0.30       # Ignore noise below this (too cheap = random)
-MAX_ENTRY_PRICE = 0.95       # Don't enter near ceiling (no room to profit)
+MAX_ENTRY_PRICE = 0.90       # Don't enter above this (thin book = bad slippage)
 
 # Fees — real Polymarket formula: fee = C * feeRate * (p * (1-p))^exponent
 # For 5m/15m crypto: feeRate=0.25, exponent=2. Max ~1.56% at p=0.50.
@@ -71,16 +71,19 @@ CRYPTO_FEE_RATE = 0.25       # feeRate for 5m/15m crypto markets
 CRYPTO_FEE_EXPONENT = 2      # exponent for 5m/15m crypto markets
 
 # Quick flip exit
-PROFIT_TARGET = 0.05         # Limit sell at entry + this (maker, 0% fee)
-STOP_LOSS = 0.10             # Cancel limit + market sell if price drops this much
-FLIP_TIMEOUT = 15            # Max seconds to hold before force-selling
+PROFIT_TARGET = 0.03         # Limit sell at entry + this (maker, 0% fee) (was 0.05, unreachable)
+STOP_LOSS = 0.05             # Cancel limit + market sell if price drops this much (was 0.10)
+FLIP_TIMEOUT = 30            # Max seconds to hold before force-selling (was 15)
 PRICE_CHECK_INTERVAL = 1.0   # How often to check price during flip
+LIMIT_SELL_RETRIES = 3       # Retry limit sell placement this many times
+LIMIT_SELL_RETRY_DELAY = 3   # Seconds between retries
 
 # Risk management
 MAX_CONCURRENT_POSITIONS = 2
 MIN_BALANCE_BUFFER = 5
 SESSION_STOP_LOSS_PCT = 0.30
-COOLDOWN_AFTER_ENTRY = 5.0   # Don't re-enter same market for N seconds
+COOLDOWN_AFTER_ENTRY = 30.0  # Don't re-enter same TOKEN for N seconds (was 5)
+MARKET_COOLDOWN = 60.0       # Don't re-enter same MARKET (either side) for N seconds
 
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
@@ -277,6 +280,7 @@ class BurstDetector:
 
         # Map token -> market info (set by main thread)
         self._token_info = {}              # token -> {market, tokens, condition_id, ...}
+        self._market_cooldowns = {}        # market_question -> last_entry_time
 
     def start(self):
         t = threading.Thread(target=self._run_loop, daemon=True)
@@ -409,14 +413,24 @@ class BurstDetector:
 
             net = net_buy - net_sell
 
-            # Check cooldown
+            # Check per-token cooldown
             last_burst = self._cooldowns.get(asset_id, 0)
             if now - last_burst < COOLDOWN_AFTER_ENTRY:
                 return
 
+            # Check per-market cooldown (both UP and DOWN sides)
+            info = self._token_info.get(asset_id, {})
+            market_q = info.get("market", "")
+            if market_q:
+                last_market = self._market_cooldowns.get(market_q, 0)
+                if now - last_market < MARKET_COOLDOWN:
+                    return
+
             # Check burst threshold
             if net >= BURST_THRESHOLD:
                 self._cooldowns[asset_id] = now
+                if market_q:
+                    self._market_cooldowns[market_q] = now
                 # Clear window after firing (don't re-trigger on same trades)
                 window.clear()
 
@@ -475,13 +489,22 @@ def quick_flip(token_id, entry_price, shares, pos_info):
     log(f"    Entry fee: ~${entry_fee_est:.2f} | Net P&L if target hit: ~${target_net_pnl:+.2f}")
 
     # Step 1: Place GTC limit sell at profit target (maker = 0% fee)
+    # Retry multiple times since shares take time to settle on-chain
     limit_placed = False
+    sell_shares = shares
     if not DRY_RUN:
-        try:
-            time.sleep(2)  # Brief delay for shares to settle
-            actual = get_actual_share_balance(token_id)
-            sell_shares = math.floor((actual or shares) * 100) / 100
-            if sell_shares > 0:
+        for attempt in range(LIMIT_SELL_RETRIES):
+            try:
+                time.sleep(LIMIT_SELL_RETRY_DELAY)  # Wait for shares to settle
+                # Approve allowance for this token before selling
+                actual = get_actual_share_balance(token_id)
+                if actual is None or actual < 1:
+                    log(f"  ⏳ Waiting for shares (attempt {attempt+1}/{LIMIT_SELL_RETRIES}, balance: {actual})")
+                    continue
+                sell_shares = math.floor(actual * 100) / 100
+                if sell_shares < 5:  # Polymarket min order size is 5 shares
+                    log(f"  ⚠ Shares {sell_shares:.1f} below min order size 5 — will use market sell")
+                    break
                 sell_order = OrderArgs(
                     token_id=token_id,
                     price=target_price,
@@ -492,8 +515,11 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                 resp = client.post_order(signed_sell, OrderType.GTC)
                 limit_placed = True
                 log(f"  ✓ Limit sell placed: {sell_shares:.0f}sh at {target_price:.2f} (GTC, 0% fee)")
-        except Exception as e:
-            log(f"  ⚠ Limit sell failed: {e} — will use market sell fallback")
+                break
+            except Exception as e:
+                log(f"  ⚠ Limit sell attempt {attempt+1}/{LIMIT_SELL_RETRIES} failed: {e}")
+        if not limit_placed:
+            log(f"  ⚠ All limit sell attempts failed — will use market sell on exit")
     else:
         limit_placed = True  # Pretend for dry run
         sell_shares = shares
@@ -692,14 +718,29 @@ def run_burst():
             signed = client.create_market_order(mo)
             resp = client.post_order(signed, OrderType.FAK)
 
+            # Determine actual shares received and real fill price
             actual_shares = 0
             if isinstance(resp, dict):
                 taking = resp.get("takingAmount", "0")
                 actual_shares = float(taking) if taking else 0
+            # Fallback: check on-chain balance
             if actual_shares == 0:
-                actual_shares = amount / price
+                time.sleep(1)
+                chain_bal = get_actual_share_balance(token_id)
+                if chain_bal and chain_bal > 0.5:
+                    actual_shares = chain_bal
+                else:
+                    actual_shares = amount / price  # last resort estimate
 
-            log(f"  ✓ Bought {actual_shares:.0f} shares of {side} at {price:.2f}")
+            # Compute REAL entry price from amount spent / shares received
+            # This accounts for slippage — the actual cost basis
+            real_entry_price = amount / actual_shares if actual_shares > 0 else price
+            real_entry_price = round(real_entry_price, 4)
+
+            if abs(real_entry_price - price) > 0.02:
+                log(f"  ⚠ Slippage: asked {price:.2f}, got {real_entry_price:.2f} ({actual_shares:.1f}sh for ${amount})")
+
+            log(f"  ✓ Bought {actual_shares:.0f} shares of {side} at {real_entry_price:.2f} (ask was {price:.2f})")
 
             record = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -707,7 +748,8 @@ def run_burst():
                 "market": market,
                 "side": side,
                 "token": token_id,
-                "price": price,
+                "ask_price": price,
+                "fill_price": real_entry_price,
                 "amount": amount,
                 "shares": actual_shares,
                 "burst_net": net_buy,
@@ -718,12 +760,13 @@ def run_burst():
 
             # Track and start flip in this thread (WS thread)
             # Use a separate thread so WS keeps receiving
-            pos_info = {"market": market, "side": side, "entry_price": price, "shares": actual_shares}
+            # IMPORTANT: use real_entry_price not the ask price for P&L
+            pos_info = {"market": market, "side": side, "entry_price": real_entry_price, "shares": actual_shares}
             with positions_lock:
                 positions[token_id] = pos_info
 
             def do_flip():
-                reason, pnl = quick_flip(token_id, price, actual_shares, pos_info)
+                reason, pnl = quick_flip(token_id, real_entry_price, actual_shares, pos_info)
                 session_pnl[0] += pnl
                 with positions_lock:
                     positions.pop(token_id, None)
@@ -743,7 +786,8 @@ def run_burst():
     log(f"Burst bot started (5s window, ${BURST_THRESHOLD} threshold)")
     log(f"Quick flip: +{PROFIT_TARGET} profit (limit GTC, 0% fee) / -{STOP_LOSS} stop / {FLIP_TIMEOUT}s timeout")
     log(f"Entry price: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}, Fee: formula-based (max ~1.56% at p=0.50)")
-    log(f"Fee formula: shares × {CRYPTO_FEE_RATE} × (p×(1-p))^{CRYPTO_FEE_EXPONENT}, Max positions: {MAX_CONCURRENT_POSITIONS}")
+    log(f"Cooldowns: {COOLDOWN_AFTER_ENTRY}s/token, {MARKET_COOLDOWN}s/market, Limit retries: {LIMIT_SELL_RETRIES}")
+    log(f"Max positions: {MAX_CONCURRENT_POSITIONS}")
     log(f"Buy amount: ${BUY_AMOUNT}, Cryptos: {', '.join(CRYPTOS)}")
     log(f"{'='*60}\n")
 
