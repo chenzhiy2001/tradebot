@@ -128,9 +128,11 @@ class TradeAccumulator:
     def __init__(self):
         self._lock = threading.Lock()
         self._trades = defaultdict(list)      # asset_id -> [trade_dict, ...]
+        self._seen_hashes = set()              # dedup price_change events
         self._wanted = set()                   # tokens the main thread wants
         self._active = set()                   # tokens actually subscribed on WS
         self._last_sub_time = 0.0              # epoch of last subscription send
+        self._force_reconnect = False          # set True to trigger clean reconnect
         self._ws_connected = False
         self._ws_thread = None
         self._loop = None
@@ -170,6 +172,11 @@ class TradeAccumulator:
                         # Sync subscriptions: wanted vs active
                         await self._sync_subscriptions(ws)
 
+                        # If tokens rotated, break to reconnect cleanly
+                        if self._force_reconnect:
+                            self._force_reconnect = False
+                            break
+
                         # Heartbeat every 10s
                         if time.time() - last_ping > 10:
                             try:
@@ -190,32 +197,37 @@ class TradeAccumulator:
 
                         self._msg_count += 1
 
-                        # Handle trade events
+                        # Ingest trades from price_change events (most reliable source).
+                        # Each price_change has entries for both UP+DOWN tokens — different
+                        # asset_ids so no per-token double-count.  Use hash to dedup.
                         if isinstance(data, dict):
-                            if data.get("event_type") == "last_trade_price":
-                                self._ingest_trade(data)
-                            else:
-                                # Log unknown dict messages for debugging
-                                etype = data.get("event_type", data.get("type", "?"))
-                                log(f"  🔍 WS msg: {etype} keys={list(data.keys())[:5]}")
+                            if data.get("event_type") == "price_change":
+                                for pc in data.get("price_changes", []):
+                                    h = pc.get("hash", "")
+                                    if h and h not in self._seen_hashes and pc.get("size"):
+                                        self._seen_hashes.add(h)
+                                        self._ingest_trade(pc)
                         elif isinstance(data, list):
-                            # Server may batch trade events as a list
                             for item in data:
-                                if isinstance(item, dict) and item.get("event_type") == "last_trade_price":
-                                    self._ingest_trade(item)
+                                if isinstance(item, dict) and item.get("event_type") == "price_change":
+                                    for pc in item.get("price_changes", []):
+                                        h = pc.get("hash", "")
+                                        if h and h not in self._seen_hashes and pc.get("size"):
+                                            self._seen_hashes.add(h)
+                                            self._ingest_trade(pc)
 
             except Exception as e:
                 self._ws_connected = False
-                self._ws = None
+
                 log(f"  ⚠ WebSocket disconnected: {e}, reconnecting in 2s...")
                 await asyncio.sleep(2)
 
     async def _sync_subscriptions(self, ws):
         """Ensure WS subscriptions match what the main thread wants.
-        Compares wanted vs active on every call.  Also re-sends every 30s
-        in case the server silently dropped tokens (e.g. new market tokens
-        that weren't ready when first subscribed).
-        If ws.send() fails → exception → reconnect → _active reset → retry.
+        When tokens change (rotation), force a reconnect for clean subscription
+        state — the server doesn't reliably deliver last_trade_price events
+        for tokens added via re-subscription on an existing connection.
+        For periodic refresh (same tokens), re-send on existing connection.
         """
         with self._lock:
             wanted = set(self._wanted)          # snapshot under lock
@@ -233,8 +245,19 @@ class TradeAccumulator:
             with self._lock:
                 for token in removed:
                     self._trades.pop(token, None)
+            # Prune old hashes to prevent unbounded growth
+            self._seen_hashes.clear()
 
-        # Send the FULL list (server replaces, not appends)
+        if changed and self._active:
+            # Tokens actually changed on a live connection → reconnect
+            # New tokens don't reliably receive events via re-subscription
+            added = wanted - self._active
+            log(f"  📡 Token rotation (+{len(added)}, -{len(removed)}), reconnecting WS...")
+            self._active = set()
+            self._force_reconnect = True
+            return
+
+        # Fresh connection or stale refresh: send full list
         if wanted:
             await ws.send(json.dumps({"type": "market", "assets_ids": list(wanted)}))
 
