@@ -128,7 +128,6 @@ class TradeAccumulator:
     def __init__(self):
         self._lock = threading.Lock()
         self._trades = defaultdict(list)      # asset_id -> [trade_dict, ...]
-        self._seen_hashes = set()              # dedup price_change events
         self._wanted = set()                   # tokens the main thread wants
         self._active = set()                   # tokens actually subscribed on WS
         self._last_sub_time = 0.0              # epoch of last subscription send
@@ -197,24 +196,15 @@ class TradeAccumulator:
 
                         self._msg_count += 1
 
-                        # Ingest trades from price_change events (most reliable source).
-                        # Each price_change has entries for both UP+DOWN tokens — different
-                        # asset_ids so no per-token double-count.  Use hash to dedup.
+                        # Only use last_trade_price events (actual fills).
+                        # price_change events are book changes, NOT trades.
                         if isinstance(data, dict):
-                            if data.get("event_type") == "price_change":
-                                for pc in data.get("price_changes", []):
-                                    h = pc.get("hash", "")
-                                    if h and h not in self._seen_hashes and pc.get("size"):
-                                        self._seen_hashes.add(h)
-                                        self._ingest_trade(pc)
+                            if data.get("event_type") == "last_trade_price":
+                                self._ingest_trade(data)
                         elif isinstance(data, list):
                             for item in data:
-                                if isinstance(item, dict) and item.get("event_type") == "price_change":
-                                    for pc in item.get("price_changes", []):
-                                        h = pc.get("hash", "")
-                                        if h and h not in self._seen_hashes and pc.get("size"):
-                                            self._seen_hashes.add(h)
-                                            self._ingest_trade(pc)
+                                if isinstance(item, dict) and item.get("event_type") == "last_trade_price":
+                                    self._ingest_trade(item)
 
             except Exception as e:
                 self._ws_connected = False
@@ -245,8 +235,6 @@ class TradeAccumulator:
             with self._lock:
                 for token in removed:
                     self._trades.pop(token, None)
-            # Prune old hashes to prevent unbounded growth
-            self._seen_hashes.clear()
 
         if changed and self._active:
             # Tokens actually changed on a live connection → reconnect
