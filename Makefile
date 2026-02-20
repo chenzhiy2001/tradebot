@@ -60,5 +60,11 @@ burst_logs_backup:
 	zip -j -9 archives/burst_logs_$$(date +%Y%m%d_%H%M%S).zip burst_log.txt burst_trades.json
 	rm -f burst_log.txt burst_trades.json
 
+# git add . and git commit -m "backup logs" and git push"
+git_logs_backup:
+	git add .
+	git commit -m "backup logs"
+	git push
+
 clean:
 	rm -rf .venv
