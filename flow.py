@@ -49,7 +49,7 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BUY_AMOUNT = 20             # Base bet in $ (smaller = less risk per trade)
+BUY_AMOUNT = 10             # Base bet in $ (smaller = less risk per trade)
 MIN_FLOW = 100             # Minimum net buy $ on chosen side to trigger
                            # Backtest (48h, 172 markets, time-filtered):
                            #   Low threshold is fine — MIN_RATIO does the filtering
