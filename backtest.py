@@ -233,11 +233,11 @@ def evaluate_signal(flow, min_flow, min_ratio):
     down_net = flow["down_net"]
 
     if up_net >= min_flow:
-        if down_net <= 0 or up_net / max(down_net, 1) >= min_ratio:
+        if up_net / max(abs(down_net), 1) >= min_ratio:
             return "UP"
 
     if down_net >= min_flow:
-        if up_net <= 0 or down_net / max(up_net, 1) >= min_ratio:
+        if down_net / max(abs(up_net), 1) >= min_ratio:
             return "DOWN"
 
     return None

@@ -607,12 +607,13 @@ def run_flow():
                     continue
 
                 # Check for entry signal
-                if up_net >= MIN_FLOW and (down_net <= 0 or up_net / max(down_net, 1) >= MIN_RATIO):
+                # Use abs() so large negative flow on other side still requires ratio
+                if up_net >= MIN_FLOW and up_net / max(abs(down_net), 1) >= MIN_RATIO:
                     chosen_idx = 0
                     chosen_side = "UP"
                     chosen_net = up_net
                     other_net = down_net
-                elif down_net >= MIN_FLOW and (up_net <= 0 or down_net / max(up_net, 1) >= MIN_RATIO):
+                elif down_net >= MIN_FLOW and down_net / max(abs(up_net), 1) >= MIN_RATIO:
                     chosen_idx = 1
                     chosen_side = "DOWN"
                     chosen_net = down_net
