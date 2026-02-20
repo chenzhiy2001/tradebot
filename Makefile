@@ -43,12 +43,22 @@ flow_logs_paths:
 	@echo $(CURDIR)/flow_trades.json
 	@echo $(CURDIR)/flow_positions.json
 
+burst_logs_paths:
+	@echo "Full paths:"
+	@echo $(CURDIR)/burst_log.txt
+	@echo $(CURDIR)/burst_trades.json
+
 # zip logs into archives/ folder with zip path/filename -9 filename2 filename1 ...
 # and delete original files
 flow_logs_backup:
 	mkdir -p archives
 	zip -j -9 archives/flow_logs_$$(date +%Y%m%d_%H%M%S).zip flow_log.txt flow_trades.json flow_positions.json
 	rm -f flow_log.txt flow_trades.json flow_positions.json
+
+burst_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/burst_logs_$$(date +%Y%m%d_%H%M%S).zip burst_log.txt burst_trades.json
+	rm -f burst_log.txt burst_trades.json
 
 clean:
 	rm -rf .venv
