@@ -13,9 +13,16 @@ Detection:
   - Must be one-sided (ratio check optional at this speed)
 
 Exit (quick flip):
-  - If price rises above entry + PROFIT_TARGET → market sell (profit)
-  - If price drops below entry - STOP_LOSS → market sell (cut loss)
-  - If FLIP_TIMEOUT seconds pass → market sell (take whatever)
+  - Place GTC limit sell at entry + PROFIT_TARGET immediately (maker = 0% fee)
+  - If price drops below entry - STOP_LOSS → cancel limit, market sell (cut loss)
+  - If FLIP_TIMEOUT seconds pass → cancel limit, market sell (take whatever)
+
+Fees (5m/15m crypto markets):
+  - Formula: fee = shares × feeRate × (p × (1 - p))^exponent
+  - feeRate=0.25, exponent=2 → max ~1.56% at p=0.50, near-zero at extremes
+  - Taker orders (FAK market) pay this fee; maker orders (GTC limit) pay 0%
+  - Fee rate fetched per-token from API: GET /fee-rate?token_id={id}
+  - SDK auto-includes feeRateBps in signed orders
 """
 
 import os
@@ -54,11 +61,18 @@ FUNDER_ADDRESS = founder_address
 BUY_AMOUNT = 10              # Base bet in $
 BURST_WINDOW = 5.0           # Seconds — detect bursts within this window
 BURST_THRESHOLD = 200        # $ net buy in the window to trigger
-MAX_ENTRY_PRICE = 0.60       # Don't enter if price already above this
+MIN_ENTRY_PRICE = 0.30       # Ignore noise below this (too cheap = random)
+MAX_ENTRY_PRICE = 0.95       # Don't enter near ceiling (no room to profit)
+
+# Fees — real Polymarket formula: fee = C * feeRate * (p * (1-p))^exponent
+# For 5m/15m crypto: feeRate=0.25, exponent=2. Max ~1.56% at p=0.50.
+# Maker (GTC limit) = 0% fee. Taker (FAK market) = formula-based fee.
+CRYPTO_FEE_RATE = 0.25       # feeRate for 5m/15m crypto markets
+CRYPTO_FEE_EXPONENT = 2      # exponent for 5m/15m crypto markets
 
 # Quick flip exit
-PROFIT_TARGET = 0.05         # Sell if price rises this much above entry
-STOP_LOSS = 0.10             # Sell if price drops this much below entry
+PROFIT_TARGET = 0.05         # Limit sell at entry + this (maker, 0% fee)
+STOP_LOSS = 0.10             # Cancel limit + market sell if price drops this much
 FLIP_TIMEOUT = 15            # Max seconds to hold before force-selling
 PRICE_CHECK_INTERVAL = 1.0   # How often to check price during flip
 
@@ -136,6 +150,69 @@ def get_actual_share_balance(token_id):
         return float(ba.get("balance", 0)) / 1e6
     except Exception:
         return None
+
+
+def cancel_all_orders_for_token(token_id):
+    """Cancel any open orders for a token."""
+    try:
+        orders = client.get_orders(OpenOrderParams())
+        for order in orders:
+            if order.get("asset_id") == token_id:
+                client.cancel(order.get("id"))
+    except Exception:
+        pass
+
+
+# Cache fee rates fetched from API to avoid repeated calls
+_fee_rate_cache = {}  # token_id -> fee_rate_bps (int)
+
+
+def get_fee_rate_bps(token_id):
+    """Fetch fee rate in basis points from Polymarket API for a token.
+    Returns the fee_rate_bps (e.g. 2500 for 0.25 feeRate on crypto markets).
+    Caches results per token."""
+    if token_id in _fee_rate_cache:
+        return _fee_rate_cache[token_id]
+    try:
+        resp = requests.get(
+            f"{HOST}/fee-rate", params={"token_id": token_id}, timeout=5
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # API returns fee_rate_bps as string or int
+            bps = int(data) if isinstance(data, (int, float)) else int(data.get("fee_rate_bps", 0))
+            _fee_rate_cache[token_id] = bps
+            return bps
+    except Exception as e:
+        log(f"  ⚠ Fee rate fetch failed for {token_id[:12]}...: {e}")
+    # Fallback: assume crypto fee rate
+    return 2500  # 0.25 as bps
+
+
+def compute_taker_fee(shares, price, fee_rate=CRYPTO_FEE_RATE, exponent=CRYPTO_FEE_EXPONENT):
+    """Compute taker fee in USDC using Polymarket formula:
+       fee_shares = C × feeRate × (p × (1 - p))^exponent
+       fee_usdc = fee_shares × p
+    where C = shares, p = price.
+    The formula yields fee in shares (collected on buys); multiply by price for USDC.
+    Rounded to 4 decimal places (Polymarket precision)."""
+    if price <= 0 or price >= 1:
+        return 0.0
+    fee_shares = shares * fee_rate * (price * (1 - price)) ** exponent
+    fee_usdc = fee_shares * price
+    return round(fee_usdc, 4)
+
+
+def compute_pnl_with_fees(entry_price, exit_price, shares, exit_is_maker=False):
+    """Compute P&L with real Polymarket fee formula.
+    Entry is always taker (market buy). Exit is maker (0%) or taker."""
+    entry_cost = shares * entry_price
+    exit_revenue = shares * exit_price
+    entry_fee = compute_taker_fee(shares, entry_price)
+    exit_fee = 0.0 if exit_is_maker else compute_taker_fee(shares, exit_price)
+    gross_pnl = exit_revenue - entry_cost
+    net_pnl = gross_pnl - entry_fee - exit_fee
+    return net_pnl, entry_fee, exit_fee
 
 
 # =========================================================================
@@ -378,20 +455,53 @@ class BurstDetector:
 # =========================================================================
 def quick_flip(token_id, entry_price, shares, pos_info):
     """
-    Monitor price after burst entry. Exit when:
-    - Price >= entry + PROFIT_TARGET  → take profit
-    - Price <= entry - STOP_LOSS      → cut loss
-    - Elapsed >= FLIP_TIMEOUT         → force exit
+    Exit strategy after burst entry:
+    1. Immediately place GTC limit sell at entry + PROFIT_TARGET (maker = 0% fee)
+    2. Monitor: if stop loss or timeout hit → cancel limit, market sell
+    3. If limit fills (shares go to 0) → profit taken at 0% exit fee
     """
     start = time.time()
     side_label = pos_info.get("side", "?")
     market = pos_info.get("market", "?")
+    target_price = round(entry_price + PROFIT_TARGET, 2)
+    stop_price = entry_price - STOP_LOSS
+
+    # Estimate entry fee for logging (using real fee formula)
+    entry_fee_est = compute_taker_fee(shares, entry_price)
+    target_net_pnl, _, _ = compute_pnl_with_fees(entry_price, target_price, shares, exit_is_maker=True)
 
     log(f"  ⏱ Flip monitor started: {side_label} {shares:.0f}sh @ {entry_price:.2f}")
-    log(f"    Target: {entry_price + PROFIT_TARGET:.2f} | Stop: {entry_price - STOP_LOSS:.2f} | Timeout: {FLIP_TIMEOUT}s")
+    log(f"    Limit sell: {target_price:.2f} (maker 0% fee) | Stop: {stop_price:.2f} | Timeout: {FLIP_TIMEOUT}s")
+    log(f"    Entry fee: ~${entry_fee_est:.2f} | Net P&L if target hit: ~${target_net_pnl:+.2f}")
 
+    # Step 1: Place GTC limit sell at profit target (maker = 0% fee)
+    limit_placed = False
+    if not DRY_RUN:
+        try:
+            time.sleep(2)  # Brief delay for shares to settle
+            actual = get_actual_share_balance(token_id)
+            sell_shares = math.floor((actual or shares) * 100) / 100
+            if sell_shares > 0:
+                sell_order = OrderArgs(
+                    token_id=token_id,
+                    price=target_price,
+                    size=sell_shares,
+                    side=SELL,
+                )
+                signed_sell = client.create_order(sell_order)
+                resp = client.post_order(signed_sell, OrderType.GTC)
+                limit_placed = True
+                log(f"  ✓ Limit sell placed: {sell_shares:.0f}sh at {target_price:.2f} (GTC, 0% fee)")
+        except Exception as e:
+            log(f"  ⚠ Limit sell failed: {e} — will use market sell fallback")
+    else:
+        limit_placed = True  # Pretend for dry run
+        sell_shares = shares
+
+    # Step 2: Monitor for stop loss / timeout / limit fill
     exit_reason = "timeout"
     exit_price = entry_price
+    exit_is_maker = False
 
     while True:
         elapsed = time.time() - start
@@ -401,11 +511,23 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             time.sleep(PRICE_CHECK_INTERVAL)
             continue
 
-        if current_price >= entry_price + PROFIT_TARGET:
+        # Check if limit order filled (shares dropped to ~0)
+        if limit_placed and not DRY_RUN:
+            remaining = get_actual_share_balance(token_id)
+            if remaining is not None and remaining < 0.5:
+                exit_reason = "profit"
+                exit_price = target_price  # Filled at our limit price
+                exit_is_maker = True
+                break
+
+        # Dry run: simulate limit fill when price reaches target
+        if DRY_RUN and current_price >= target_price:
             exit_reason = "profit"
-            exit_price = current_price
+            exit_price = target_price
+            exit_is_maker = True
             break
-        elif current_price <= entry_price - STOP_LOSS:
+
+        if current_price <= stop_price:
             exit_reason = "stop_loss"
             exit_price = current_price
             break
@@ -416,49 +538,66 @@ def quick_flip(token_id, entry_price, shares, pos_info):
 
         time.sleep(PRICE_CHECK_INTERVAL)
 
-    # Execute the sell
+    # Step 3: Execute exit
     pnl = 0.0
+    net_pnl, entry_fee, exit_fee = compute_pnl_with_fees(
+        entry_price, exit_price, shares, exit_is_maker=exit_is_maker
+    )
+
     if DRY_RUN:
-        pnl = (exit_price - entry_price) * shares
-        log(f"  🧪 DRY-RUN flip: {exit_reason} at {exit_price:.2f} (P&L: ${pnl:+.2f})")
+        pnl = net_pnl
+        fee_str = f"entry fee ${entry_fee:.2f}" + (f" + exit fee ${exit_fee:.2f}" if exit_fee > 0 else " + exit fee $0")
+        log(f"  🧪 DRY-RUN flip: {exit_reason} at {exit_price:.2f} | Gross ${(exit_price-entry_price)*shares:+.2f} | Fees: {fee_str} | Net: ${pnl:+.2f}")
     else:
-        try:
-            # Get actual share balance
-            actual = get_actual_share_balance(token_id)
-            sell_shares = math.floor((actual or shares) * 100) / 100
+        if exit_reason == "profit" and exit_is_maker:
+            # Limit order already filled — no action needed
+            pnl = net_pnl
+            log(f"  ✓ Limit filled (profit): {target_price:.2f} | Net P&L: ${pnl:+.2f} (0% exit fee)")
+        else:
+            # Cancel limit order, then market sell
+            if limit_placed:
+                cancel_all_orders_for_token(token_id)
+                log(f"  ↩ Cancelled limit sell (exit: {exit_reason})")
 
-            if sell_shares > 0:
-                mo = MarketOrderArgs(
-                    token_id=token_id,
-                    amount=sell_shares,
-                    side=SELL,
-                    order_type=OrderType.FAK,
-                )
-                signed = client.create_market_order(mo)
-                resp = client.post_order(signed, OrderType.FAK)
+            try:
+                actual = get_actual_share_balance(token_id)
+                sell_shares = math.floor((actual or shares) * 100) / 100
 
-                pnl = (exit_price - entry_price) * sell_shares
-                log(f"  ✓ Flip {exit_reason}: sold {sell_shares:.0f}sh at ~{exit_price:.2f} (P&L: ${pnl:+.2f})")
+                if sell_shares > 0:
+                    mo = MarketOrderArgs(
+                        token_id=token_id,
+                        amount=sell_shares,
+                        side=SELL,
+                        order_type=OrderType.FAK,
+                    )
+                    signed = client.create_market_order(mo)
+                    resp = client.post_order(signed, OrderType.FAK)
 
-                record = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "action": f"FLIP_{exit_reason.upper()}",
-                    "market": market,
-                    "side": side_label,
-                    "token": token_id,
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "shares": sell_shares,
-                    "pnl": pnl,
-                    "elapsed": round(time.time() - start, 1),
-                    "response": str(resp),
-                }
-                with open(TRADE_LOG, "a") as f:
-                    f.write(json.dumps(record) + "\n")
-            else:
-                log(f"  ⚠ No shares to sell (balance: {actual})")
-        except Exception as e:
-            log(f"  ✗ Flip sell failed: {e}")
+                    pnl = net_pnl
+                    log(f"  ✓ Market sell ({exit_reason}): {sell_shares:.0f}sh at ~{exit_price:.2f} | Net P&L: ${pnl:+.2f} (fees: ${entry_fee+exit_fee:.2f})")
+                else:
+                    log(f"  ⚠ No shares to sell (balance: {actual})")
+            except Exception as e:
+                log(f"  ✗ Flip sell failed: {e}")
+
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": f"FLIP_{exit_reason.upper()}",
+            "market": market,
+            "side": side_label,
+            "token": token_id,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "shares": shares,
+            "gross_pnl": round((exit_price - entry_price) * shares, 4),
+            "entry_fee": round(entry_fee, 4),
+            "exit_fee": round(exit_fee, 4),
+            "net_pnl": round(pnl, 4),
+            "exit_is_maker": exit_is_maker,
+            "elapsed": round(time.time() - start, 1),
+        }
+        with open(TRADE_LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
     return exit_reason, pnl
 
@@ -493,8 +632,13 @@ def run_burst():
 
         # Get current price
         price = get_price(token_id, side=BUY)
-        if price <= 0 or price >= 1 or price > MAX_ENTRY_PRICE:
-            log(f"  ⚡ Burst on {market} {side}: ${net_buy:.0f} in {BURST_WINDOW}s — price {price:.2f} too high")
+        if price <= 0 or price >= 1:
+            return
+        if price < MIN_ENTRY_PRICE:
+            log(f"  ⚡ Burst on {market} {side}: ${net_buy:.0f} in {BURST_WINDOW}s — price {price:.2f} too low (noise)")
+            return
+        if price > MAX_ENTRY_PRICE:
+            log(f"  ⚡ Burst on {market} {side}: ${net_buy:.0f} in {BURST_WINDOW}s — price {price:.2f} too close to ceiling")
             return
 
         # Check balance
@@ -505,7 +649,10 @@ def run_burst():
         amount = min(BUY_AMOUNT, bal - MIN_BALANCE_BUFFER)
 
         log(f"\n⚡ BURST DETECTED: {market} {side}")
-        log(f"  Net buy: ${net_buy:.0f} in {BURST_WINDOW}s, Price: {price:.2f}, Bet: ${amount:.0f}")
+        est_shares = amount / price
+        entry_fee = compute_taker_fee(est_shares, price)
+        eff_rate = (entry_fee / amount * 100) if amount > 0 else 0
+        log(f"  Net buy: ${net_buy:.0f} in {BURST_WINDOW}s, Price: {price:.2f}, Bet: ${amount:.0f} (fee ~${entry_fee:.2f}, {eff_rate:.2f}%)")
 
         if DRY_RUN:
             shares = amount / price
@@ -594,8 +741,9 @@ def run_burst():
     if DRY_RUN:
         log(f"🧪 DRY-RUN MODE — no orders will be placed")
     log(f"Burst bot started (5s window, ${BURST_THRESHOLD} threshold)")
-    log(f"Quick flip: +{PROFIT_TARGET} profit / -{STOP_LOSS} stop / {FLIP_TIMEOUT}s timeout")
-    log(f"Max entry: {MAX_ENTRY_PRICE}, Max positions: {MAX_CONCURRENT_POSITIONS}")
+    log(f"Quick flip: +{PROFIT_TARGET} profit (limit GTC, 0% fee) / -{STOP_LOSS} stop / {FLIP_TIMEOUT}s timeout")
+    log(f"Entry price: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}, Fee: formula-based (max ~1.56% at p=0.50)")
+    log(f"Fee formula: shares × {CRYPTO_FEE_RATE} × (p×(1-p))^{CRYPTO_FEE_EXPONENT}, Max positions: {MAX_CONCURRENT_POSITIONS}")
     log(f"Buy amount: ${BUY_AMOUNT}, Cryptos: {', '.join(CRYPTOS)}")
     log(f"{'='*60}\n")
 
