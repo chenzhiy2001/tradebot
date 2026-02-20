@@ -134,6 +134,8 @@ class TradeAccumulator:
         self._ws_connected = False
         self._ws_thread = None
         self._loop = None
+        self._event_count = 0                  # total trade events ingested
+        self._msg_count = 0                    # total WS messages received
 
     def start(self):
         """Start the background WebSocket thread."""
@@ -186,13 +188,21 @@ class TradeAccumulator:
                         except (json.JSONDecodeError, TypeError):
                             continue
 
+                        self._msg_count += 1
+
                         # Handle trade events
                         if isinstance(data, dict):
                             if data.get("event_type") == "last_trade_price":
                                 self._ingest_trade(data)
+                            else:
+                                # Log unknown dict messages for debugging
+                                etype = data.get("event_type", data.get("type", "?"))
+                                log(f"  🔍 WS msg: {etype} keys={list(data.keys())[:5]}")
                         elif isinstance(data, list):
-                            # Book snapshot — ignore, but check for embedded trade info
-                            pass
+                            # Server may batch trade events as a list
+                            for item in data:
+                                if isinstance(item, dict) and item.get("event_type") == "last_trade_price":
+                                    self._ingest_trade(item)
 
             except Exception as e:
                 self._ws_connected = False
@@ -243,6 +253,7 @@ class TradeAccumulator:
         asset_id = data.get("asset_id", "")
         if not asset_id:
             return
+        self._event_count += 1
         trade = {
             "asset": asset_id,
             "side": data.get("side", ""),
@@ -278,6 +289,14 @@ class TradeAccumulator:
     @property
     def subscribed_count(self):
         return len(self._active)
+
+    @property
+    def event_count(self):
+        return self._event_count
+
+    @property
+    def msg_count(self):
+        return self._msg_count
 
 
 # Global trade accumulator
@@ -852,8 +871,9 @@ def run_flow():
             halt_str = " 🛑 HALTED" if halted else ""
             dry_str = " 🧪 DRY-RUN" if DRY_RUN else ""
             ws_str = "🟢" if trade_ws.connected else "🔴"
+            ws_detail = f" ({trade_ws.event_count} events, {trade_ws.msg_count} msgs, {trade_ws.subscribed_count} subs)"
             session_pnl = (current_balance - STARTING_BANKROLL) if current_balance else 0
-            log(f"\n⏰ {now_str} UTC | {len(positions)} pos | bal {bal_str} | session ${session_pnl:+.2f} | WS {ws_str}{halt_str}{dry_str}")
+            log(f"\n⏰ {now_str} UTC | {len(positions)} pos | bal {bal_str} | session ${session_pnl:+.2f} | WS {ws_str}{ws_detail}{halt_str}{dry_str}")
             time.sleep(POLL_INTERVAL)
 
         except KeyboardInterrupt:
