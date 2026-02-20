@@ -67,6 +67,8 @@ MAX_BET_MULTIPLIER = 2.0   # Was 3.0 — cap risk
 MIN_ELAPSED_PCT = 0.50     # Wait for 50% of window before entering
                            # 5m → wait 2.5min, 15m → wait 7.5min
                            # Early flow is noise; signal needs data
+MIN_REVERSAL_FLOW = 50     # Post-entry counter-flow must exceed this to exit
+                           # Prevents a single random sell from triggering reversal
 
 # Risk management
 MAX_CONCURRENT_POSITIONS = 100     # Limit simultaneous exposure
@@ -521,7 +523,7 @@ def run_flow():
     # Start WebSocket trade feed
     trade_ws.start()
     log(f"Flow bot started (using real-time WebSocket trade feed)")
-    log(f"Min flow: ${MIN_FLOW}, Min ratio: {MIN_RATIO}x, Min elapsed: {MIN_ELAPSED_PCT*100:.0f}%")
+    log(f"Min flow: ${MIN_FLOW}, Min ratio: {MIN_RATIO}x, Min elapsed: {MIN_ELAPSED_PCT*100:.0f}%, Reversal: ${MIN_REVERSAL_FLOW}")
     log(f"Max entry price: {MAX_ENTRY_PRICE}, Max positions: {MAX_CONCURRENT_POSITIONS}")
     log(f"Buy amount: ${BUY_AMOUNT} (max {MAX_BET_MULTIPLIER}x), Cryptos: {', '.join(CRYPTOS)}")
     log(f"Session stop-loss: {SESSION_STOP_LOSS_PCT*100:.0f}% of ${STARTING_BANKROLL:.0f} = ${STARTING_BANKROLL * SESSION_STOP_LOSS_PCT:.0f}")
@@ -815,9 +817,9 @@ def run_flow():
                 flow = compute_trade_flow(pos["condition_id"], pos["tokens"])
                 our_net = flow["up_net"] if pos["outcome_idx"] == 0 else flow["down_net"]
 
-                # Flow reversal: post-entry flow on our side has gone negative
-                # (trades accumulated since we cleared at entry show net selling)
-                if our_net < 0:
+                # Flow reversal: post-entry flow on our side has gone significantly negative
+                # Require meaningful counter-flow, not just one random sell
+                if our_net < -MIN_REVERSAL_FLOW:
                     log(f"\n🔄 FLOW REVERSAL: {pos['market']} {pos['side']}")
                     log(f"  Entry net was ${pos['entry_net']:+,.0f}, now ${our_net:+,.0f}")
 
@@ -880,6 +882,7 @@ def run_flow():
 
                     except Exception as e:
                         log(f"  ✗ Flow reversal sell failed: {e}")
+                        log(f"  Removing position (likely already resolved/redeemed)")
 
                     tokens_to_remove.append(token_id)
 
