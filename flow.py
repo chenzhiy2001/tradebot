@@ -58,7 +58,7 @@ MIN_RATIO = 3.0            # Net buy on chosen side must be Nx the other
                            #           $100/3.0x at 60% cutoff → 92.7% WR (38W/3L)
 POLL_INTERVAL = 1          # Seconds between scans
 SELL_PRICE = 0.99          # Limit sell price (take profit)
-MAX_ENTRY_PRICE = 0.52     # Skip if price already above this (tighter — less vig)
+MAX_ENTRY_PRICE = 0.60     # Skip if price already above this
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
 # Scaling: bet more when the flow is stronger
