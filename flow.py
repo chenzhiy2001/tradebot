@@ -64,9 +64,12 @@ CRYPTOS = ["btc", "eth", "sol", "xrp"]
 # Scaling: bet more when the flow is stronger
 # bet = BUY_AMOUNT * min(net_flow / MIN_FLOW, MAX_BET_MULTIPLIER)
 MAX_BET_MULTIPLIER = 2.0   # Was 3.0 — cap risk
+MIN_ELAPSED_PCT = 0.50     # Wait for 50% of window before entering
+                           # 5m → wait 2.5min, 15m → wait 7.5min
+                           # Early flow is noise; signal needs data
 
-# Risk management (NEW)
-MAX_CONCURRENT_POSITIONS = 1000   # Don't spread too thin
+# Risk management
+MAX_CONCURRENT_POSITIONS = 100     # Limit simultaneous exposure
 STARTING_BANKROLL = 0          # Set at runtime from actual balance
 SESSION_STOP_LOSS_PCT = 0.30   # Halt if down 30% of starting bankroll
 MIN_BALANCE_BUFFER = 5         # Keep $5 in reserve, never bet last dollars
@@ -293,6 +296,13 @@ class TradeAccumulator:
                 result.extend(self._trades.get(t, []))
             return result
 
+    def clear_trades_for_market(self, tokens):
+        """Clear accumulated trades for a market's tokens.
+        Called after entry so flow reversal only sees post-entry trades."""
+        with self._lock:
+            for t in tokens:
+                self._trades.pop(t, None)
+
     @property
     def connected(self):
         return self._ws_connected
@@ -511,7 +521,7 @@ def run_flow():
     # Start WebSocket trade feed
     trade_ws.start()
     log(f"Flow bot started (using real-time WebSocket trade feed)")
-    log(f"Min flow: ${MIN_FLOW}, Min ratio: {MIN_RATIO}x")
+    log(f"Min flow: ${MIN_FLOW}, Min ratio: {MIN_RATIO}x, Min elapsed: {MIN_ELAPSED_PCT*100:.0f}%")
     log(f"Max entry price: {MAX_ENTRY_PRICE}, Max positions: {MAX_CONCURRENT_POSITIONS}")
     log(f"Buy amount: ${BUY_AMOUNT} (max {MAX_BET_MULTIPLIER}x), Cryptos: {', '.join(CRYPTOS)}")
     log(f"Session stop-loss: {SESSION_STOP_LOSS_PCT*100:.0f}% of ${STARTING_BANKROLL:.0f} = ${STARTING_BANKROLL * SESSION_STOP_LOSS_PCT:.0f}")
@@ -604,6 +614,11 @@ def run_flow():
 
                 # Don't enter if already holding, halted, or at limit
                 if already_holding or halted or at_position_limit:
+                    continue
+
+                # Wait for enough data before entering
+                min_elapsed = interval * MIN_ELAPSED_PCT
+                if elapsed < min_elapsed:
                     continue
 
                 # Check for entry signal
@@ -705,6 +720,8 @@ def run_flow():
                         "entry_net": chosen_net,
                         "tokens": tokens,
                     }
+                    # Clear accumulated trades so flow reversal only sees post-entry flow
+                    trade_ws.clear_trades_for_market(tokens)
                     continue
 
                 # Place market buy (LIVE only)
@@ -740,6 +757,9 @@ def run_flow():
                     }
 
                     log(f"  ✓ Bought {actual_shares:.0f} shares of {chosen_side} at {chosen_price:.2f}")
+
+                    # Clear accumulated trades so flow reversal only sees post-entry flow
+                    trade_ws.clear_trades_for_market(tokens)
 
                     # Place limit sell at SELL_PRICE in background
                     if actual_shares > 0:
@@ -795,9 +815,9 @@ def run_flow():
                 flow = compute_trade_flow(pos["condition_id"], pos["tokens"])
                 our_net = flow["up_net"] if pos["outcome_idx"] == 0 else flow["down_net"]
 
-                # Flow reversal: our side's net flow has gone negative
-                # (more selling than buying now) — money is leaving
-                if our_net < 0 and pos["entry_net"] > 0:
+                # Flow reversal: post-entry flow on our side has gone negative
+                # (trades accumulated since we cleared at entry show net selling)
+                if our_net < 0:
                     log(f"\n🔄 FLOW REVERSAL: {pos['market']} {pos['side']}")
                     log(f"  Entry net was ${pos['entry_net']:+,.0f}, now ${our_net:+,.0f}")
 
