@@ -87,11 +87,6 @@ MIN_BURST_PRICE = 0.45       # Burst side must be >= this to ride (ensures meani
 CRYPTO_FEE_RATE = 0.25       # feeRate for 5m/15m crypto markets
 CRYPTO_FEE_EXPONENT = 2      # exponent for 5m/15m crypto markets
 
-# Limit buy entry (maker = 0% fee)
-LIMIT_BUY_OFFSET = 0.01      # Place limit buy at ask - this (catch the reversion)
-LIMIT_BUY_TIMEOUT = 5        # Seconds to wait for limit buy fill before cancelling
-LIMIT_BUY_CHECK_INTERVAL = 0.5  # How often to check if limit buy filled
-
 # Entry confirmation
 BURST_CONFIRM_DELAY = 2.0    # Wait after burst detection before entering (let burst settle)
 
@@ -178,8 +173,9 @@ def get_price(token_id, side=BUY):
         return 0.0
 
 
-# Global reference to detector (set in run_burst) for WS price access
+# Global references (set in run_burst) for WS access from quick_flip
 _detector_ref = None
+_user_ws_ref = None
 
 
 def get_actual_share_balance(token_id):
@@ -212,32 +208,6 @@ def cancel_all_orders_for_token(token_id):
                 client.cancel(order.get("id"))
     except Exception:
         pass
-
-
-# Cache fee rates fetched from API to avoid repeated calls
-_fee_rate_cache = {}  # token_id -> fee_rate_bps (int)
-
-
-def get_fee_rate_bps(token_id):
-    """Fetch fee rate in basis points from Polymarket API for a token.
-    Returns the fee_rate_bps (e.g. 2500 for 0.25 feeRate on crypto markets).
-    Caches results per token."""
-    if token_id in _fee_rate_cache:
-        return _fee_rate_cache[token_id]
-    try:
-        resp = requests.get(
-            f"{HOST}/fee-rate", params={"token_id": token_id}, timeout=5
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            # API returns fee_rate_bps as string or int
-            bps = int(data) if isinstance(data, (int, float)) else int(data.get("fee_rate_bps", 0))
-            _fee_rate_cache[token_id] = bps
-            return bps
-    except Exception as e:
-        log(f"  ⚠ Fee rate fetch failed for {token_id[:12]}...: {e}")
-    # Fallback: assume crypto fee rate
-    return 2500  # 0.25 as bps
 
 
 def compute_taker_fee(shares, price, fee_rate=CRYPTO_FEE_RATE, exponent=CRYPTO_FEE_EXPONENT):
@@ -1077,10 +1047,19 @@ def quick_flip(token_id, entry_price, shares, pos_info):
         threading.Thread(target=_place_limit_sell, daemon=True).start()
 
     # Step 2: Monitor IMMEDIATELY for stop loss / timeout / limit fill
-    # (no more 3s blind spot waiting for limit sell placement)
+    # Use User Channel event for instant fill detection (no REST polling needed)
     exit_reason = "timeout"
     exit_price = entry_price
     exit_is_maker = False
+    limit_fill_event = threading.Event()
+
+    def _on_limit_fill(trade_info):
+        """User Channel callback: our limit sell was confirmed on-chain."""
+        if trade_info.get("side") == "SELL":
+            limit_fill_event.set()
+
+    if not DRY_RUN and _user_ws_ref:
+        _user_ws_ref.on_fill(token_id, _on_limit_fill)
 
     while True:
         elapsed = time.time() - start
@@ -1090,14 +1069,21 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             time.sleep(PRICE_CHECK_INTERVAL)
             continue
 
-        # Check if limit order filled (shares dropped to ~0)
+        # Check if limit order filled via User Channel event (instant, no REST call)
         if limit_state["placed"] and not DRY_RUN:
-            remaining = get_actual_share_balance(token_id)
-            if remaining is not None and remaining < 0.5:
+            if limit_fill_event.is_set():
                 exit_reason = "profit"
-                exit_price = target_price  # Filled at our limit price
+                exit_price = target_price
                 exit_is_maker = True
                 break
+            # Fallback: every 2s, do a REST balance check in case WS missed it
+            if elapsed > 0 and int(elapsed * 5) % 10 == 0:
+                remaining = get_actual_share_balance(token_id)
+                if remaining is not None and remaining < 0.5:
+                    exit_reason = "profit"
+                    exit_price = target_price
+                    exit_is_maker = True
+                    break
 
         # Dry run: simulate limit fill when price reaches target
         if DRY_RUN and current_price >= target_price:
@@ -1116,6 +1102,10 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             break
 
         time.sleep(PRICE_CHECK_INTERVAL)
+
+    # Clean up User Channel callback
+    if _user_ws_ref:
+        _user_ws_ref.remove_fill_callback(token_id, _on_limit_fill)
 
     # Signal background limit sell thread to stop
     limit_state["abort"] = True
@@ -1537,13 +1527,14 @@ def run_burst():
         threading.Thread(target=do_buy_and_flip, daemon=True).start()
 
     # Create burst detector
-    global _detector_ref
+    global _detector_ref, _user_ws_ref
     detector = BurstDetector(on_burst=on_burst)
     _detector_ref = detector
     detector.start()
 
     # Create user channel for real-time fill detection
     user_ws = UserChannelWS()
+    _user_ws_ref = user_ws
     if not DRY_RUN:
         user_ws.start()
 
