@@ -988,27 +988,34 @@ def quick_flip(token_id, entry_price, shares, pos_info):
     profit_target = PROFIT_TARGET
     stop_loss = STOP_LOSS
     book_info_str = "book N/A, using defaults"
+    entry_spread = 0.0
     if _detector_ref and (BOOK_TP_ENABLED or BOOK_SL_ENABLED):
         analysis = _detector_ref.analyze_book(token_id, entry_price=entry_price)
         if analysis:
             profit_target = analysis["suggested_tp"]
             stop_loss = analysis["suggested_sl"]
+            entry_spread = analysis["spread"]
             wall_ask = analysis["first_ask_wall"]
             wall_bid = analysis["first_bid_wall"]
             ask_str = f"ask wall ${wall_ask[1]:.0f}@{wall_ask[0]:.2f}" if wall_ask else "no ask wall"
             bid_str = f"bid wall ${wall_bid[1]:.0f}@{wall_bid[0]:.2f}" if wall_bid else "no bid wall"
-            book_info_str = (f"spread={analysis['spread']:.2f}, depth=${analysis['total_bid_depth']:.0f}b/${analysis['total_ask_depth']:.0f}a, "
+            book_info_str = (f"spread={entry_spread:.2f}, depth=${analysis['total_bid_depth']:.0f}b/${analysis['total_ask_depth']:.0f}a, "
                            f"{ask_str}, {bid_str}")
 
     target_price = round(entry_price + profit_target, 2)
-    stop_price = entry_price - stop_loss
+    # SL is measured from the BID at entry (not the ask we paid).
+    # We buy at ask, but monitor the bid for exit. The spread is NOT a loss —
+    # it's the natural cost of crossing. Without this, a spread of 0.04-0.07
+    # instantly triggers a SL of 0.03.
+    entry_bid = entry_price - entry_spread
+    stop_price = round(entry_bid - stop_loss, 2)
 
     # Both entry and exit are maker (0% fee)
     entry_is_maker = pos_info.get("entry_is_maker", False)
     target_gross_pnl = (target_price - entry_price) * shares
 
-    log(f"  ⏱ Flip monitor started: {side_label} {shares:.0f}sh @ {entry_price:.2f}")
-    log(f"    TP: {target_price:.2f} (+{profit_target:.2f}) | SL: {stop_price:.2f} (-{stop_loss:.2f}) | Timeout: {FLIP_TIMEOUT}s")
+    log(f"  ⏱ Flip monitor started: {side_label} {shares:.0f}sh @ {entry_price:.2f} (bid {entry_bid:.2f}, spread {entry_spread:.2f})")
+    log(f"    TP: {target_price:.2f} (+{profit_target:.2f}) | SL: {stop_price:.2f} (-{stop_loss:.2f} from bid) | Timeout: {FLIP_TIMEOUT}s")
     log(f"    Book: {book_info_str}")
     if entry_is_maker:
         log(f"    Entry: maker (0% fee) | Net P&L if target hit: ~${target_gross_pnl:+.2f}")
