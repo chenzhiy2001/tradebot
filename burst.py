@@ -109,7 +109,6 @@ LIMIT_SELL_RETRY_DELAY = 1   # Seconds between retries (reduced from 3 — runs 
 # Risk management
 MAX_CONCURRENT_POSITIONS = 3
 MIN_BALANCE_BUFFER = 5
-SESSION_STOP_LOSS_PCT = 0.30
 COOLDOWN_AFTER_ENTRY = 30.0  # Don't re-enter same TOKEN for N seconds (was 5)
 MARKET_COOLDOWN = 30.0       # Don't re-enter same MARKET (either side) for N seconds (was 60)
 LOSS_LOCKOUT = 120.0         # After stop-loss/timeout on a market, lock it out for this long
@@ -223,18 +222,6 @@ def compute_taker_fee(shares, price, fee_rate=CRYPTO_FEE_RATE, exponent=CRYPTO_F
     return round(fee_usdc, 4)
 
 
-def compute_pnl_with_fees(entry_price, exit_price, shares, exit_is_maker=False):
-    """Compute P&L with real Polymarket fee formula.
-    Entry is always taker (market buy). Exit is maker (0%) or taker."""
-    entry_cost = shares * entry_price
-    exit_revenue = shares * exit_price
-    entry_fee = compute_taker_fee(shares, entry_price)
-    exit_fee = 0.0 if exit_is_maker else compute_taker_fee(shares, exit_price)
-    gross_pnl = exit_revenue - entry_cost
-    net_pnl = gross_pnl - entry_fee - exit_fee
-    return net_pnl, entry_fee, exit_fee
-
-
 # =========================================================================
 # MARKET DISCOVERY
 # =========================================================================
@@ -309,8 +296,6 @@ class BurstDetector:
         self._prices = {}
         # WebSocket-cached order books: token -> {"bids": [(price, size), ...], "asks": [(price, size), ...], "ts": float}
         self._books = {}
-        # Track resolved markets: set of asset_ids
-        self._resolved_markets = set()
         # Price-change callbacks: token_id -> list of callables
         # Called on any price update (best_bid_ask, book, price_change)
         self._price_callbacks = defaultdict(list)
@@ -394,7 +379,7 @@ class BurstDetector:
         elif etype == "price_change":
             self._on_price_change(data)
         elif etype == "market_resolved":
-            self._on_market_resolved(data)
+            pass  # Markets auto-removed when get_current_crypto_markets() stops returning them
 
     def _on_best_bid_ask(self, data):
         """Cache real-time best bid/ask from WebSocket."""
@@ -491,11 +476,6 @@ class BurstDetector:
                     }
 
             self._fire_price_callbacks(asset_id)
-
-    def _on_market_resolved(self, data):
-        """Track resolved markets to auto-unsubscribe."""
-        for aid in data.get("assets_ids", []):
-            self._resolved_markets.add(aid)
 
     async def _sync_subscriptions(self, ws):
         with self._lock:
@@ -813,7 +793,6 @@ class UserChannelWS:
         # token_id -> latest confirmed trade info
         self._confirmed_trades = {}
         # condition_ids to subscribe to
-        self._subscribed_markets = set()
         self._wanted_markets = set()
 
     def start(self):
@@ -1483,7 +1462,6 @@ def run_burst():
 
                 # Check response — FAK orders return status='matched' with transactionsHashes on success
                 resp_status = resp.get("status", "") if isinstance(resp, dict) else ""
-                resp_success = resp.get("success", False) if isinstance(resp, dict) else False
 
                 # Wait for on-chain settlement with retries
                 # FAK fills are matched on CLOB but shares need minting on-chain
