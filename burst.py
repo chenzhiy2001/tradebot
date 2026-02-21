@@ -65,7 +65,8 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BUY_AMOUNT = 10              # Base bet in $
+BUY_AMOUNT = 10              # Base bet in $ (at threshold burst)
+MAX_BUY_AMOUNT = 30          # Cap per trade regardless of burst size
 BURST_WINDOW = 5.0           # Seconds — detect bursts within this window
 BURST_THRESHOLD = 500        # $ net volume in the window to trigger (was 200, too low)
 MIN_ENTRY_PRICE = 0.08       # Don't buy fade token below this (dead side)
@@ -91,7 +92,7 @@ PROFIT_TARGET = 0.03         # Limit sell at entry + this (maker, 0% fee) (was 0
 STOP_LOSS = 0.03             # Cancel limit + market sell if price drops this much
                              # (matched to PROFIT_TARGET for equal risk/reward — 64% WR profits at 1:1)
 FLIP_TIMEOUT = 30            # Max seconds to hold before force-selling (was 15)
-PRICE_CHECK_INTERVAL = 0.5   # How often to check price during flip
+PRICE_CHECK_INTERVAL = 0.2   # How often to check price during flip (was 0.5 — too slow, stop-loss slipped 0.09 on 5m markets)
 LIMIT_SELL_RETRIES = 3       # Retry limit sell placement this many times
 LIMIT_SELL_RETRY_DELAY = 1   # Seconds between retries (reduced from 3 — runs in background now)
 
@@ -822,11 +823,14 @@ def run_burst():
         if bal is None or bal < MIN_BALANCE_BUFFER + BUY_AMOUNT:
             return
 
-        amount = min(BUY_AMOUNT, bal - MIN_BALANCE_BUFFER)
+        # Scale bet proportional to burst size: $500 burst → $10, $1000 → $20, etc.
+        burst_multiplier = net_volume / BURST_THRESHOLD
+        scaled_amount = round(BUY_AMOUNT * burst_multiplier, 2)
+        amount = min(scaled_amount, MAX_BUY_AMOUNT, bal - MIN_BALANCE_BUFFER)
 
         log(f"\n🔄 FADE BURST: {market} — {fade_reason}")
         log(f"  Burst: ${net_volume:.0f} {direction} on {burst_side} (price {burst_price:.2f})")
-        log(f"  Will buy {fade_side} after {BURST_CONFIRM_DELAY}s confirm (ask {price:.2f}), Bet: ${amount:.0f}")
+        log(f"  Will buy {fade_side} after {BURST_CONFIRM_DELAY}s confirm (ask {price:.2f}), Bet: ${amount:.0f} ({burst_multiplier:.1f}x burst)")
 
         if DRY_RUN:
             # Simulate: assume market buy fills at ask price after confirm delay
