@@ -103,7 +103,6 @@ BOOK_SL_MIN = 0.02           # Minimum SL even if support is close
 BOOK_SL_MAX = 0.05           # Maximum SL even if no support found
 FLIP_TIMEOUT = 15            # Max seconds to hold before force-selling (was 30 — 15-31s bucket
                              # was 38% WR/-$7.19; 5-15s bucket was 92% WR/+$10.98)
-PRICE_CHECK_INTERVAL = 0.2   # How often to check price during flip (was 0.5 — too slow, stop-loss slipped 0.09 on 5m markets)
 LIMIT_SELL_RETRIES = 3       # Retry limit sell placement this many times
 LIMIT_SELL_RETRY_DELAY = 1   # Seconds between retries (reduced from 3 — runs in background now)
 
@@ -312,6 +311,9 @@ class BurstDetector:
         self._books = {}
         # Track resolved markets: set of asset_ids
         self._resolved_markets = set()
+        # Price-change callbacks: token_id -> list of callables
+        # Called on any price update (best_bid_ask, book, price_change)
+        self._price_callbacks = defaultdict(list)
 
     def start(self):
         t = threading.Thread(target=self._run_loop, daemon=True)
@@ -412,6 +414,7 @@ class BurstDetector:
                 "spread": spread,
                 "ts": time.time(),
             }
+        self._fire_price_callbacks(asset_id)
 
     def _on_book(self, data):
         """Cache full order book snapshot from WebSocket."""
@@ -443,6 +446,7 @@ class BurstDetector:
                     "spread": round(asks[0][0] - bids[0][0], 4),
                     "ts": time.time(),
                 }
+        self._fire_price_callbacks(asset_id)
 
     def _on_price_change(self, data):
         """Incrementally update order book from price_change events."""
@@ -485,6 +489,8 @@ class BurstDetector:
                         "spread": round(best_ask - best_bid, 4) if best_bid > 0 and best_ask > 0 else existing.get("spread", 0),
                         "ts": time.time(),
                     }
+
+            self._fire_price_callbacks(asset_id)
 
     def _on_market_resolved(self, data):
         """Track resolved markets to auto-unsubscribe."""
@@ -654,6 +660,33 @@ class BurstDetector:
     @property
     def subscribed_count(self):
         return len(self._active)
+
+    # --- Price callback system (event-driven flip monitor) ---
+
+    def _fire_price_callbacks(self, asset_id):
+        """Fire registered price callbacks for an asset (called from WS handlers)."""
+        with self._lock:
+            callbacks = list(self._price_callbacks.get(asset_id, []))
+        for cb in callbacks:
+            try:
+                cb(asset_id)
+            except Exception:
+                pass
+
+    def on_price_update(self, token_id, callback):
+        """Register a callback to be called on every price update for token_id.
+        callback(asset_id) is called from the WS thread."""
+        with self._lock:
+            self._price_callbacks[token_id].append(callback)
+
+    def remove_price_callback(self, token_id, callback):
+        """Unregister a previously registered price callback."""
+        with self._lock:
+            cbs = self._price_callbacks.get(token_id, [])
+            try:
+                cbs.remove(callback)
+            except ValueError:
+                pass
 
     # --- Public accessors for WS-cached data ---
 
@@ -1046,27 +1079,49 @@ def quick_flip(token_id, entry_price, shares, pos_info):
     if not DRY_RUN:
         threading.Thread(target=_place_limit_sell, daemon=True).start()
 
-    # Step 2: Monitor IMMEDIATELY for stop loss / timeout / limit fill
-    # Use User Channel event for instant fill detection (no REST polling needed)
+    # Step 2: Event-driven monitor for stop loss / timeout / limit fill
+    # Instead of polling every 0.2s, we wake on WS price updates + fill events
     exit_reason = "timeout"
     exit_price = entry_price
     exit_is_maker = False
     limit_fill_event = threading.Event()
+    monitor_cond = threading.Condition()
+
+    def _on_price_tick(asset_id):
+        """WS callback: new price available for our token — wake monitor."""
+        with monitor_cond:
+            monitor_cond.notify_all()
 
     def _on_limit_fill(trade_info):
         """User Channel callback: our limit sell was confirmed on-chain."""
         if trade_info.get("side") == "SELL":
             limit_fill_event.set()
+            with monitor_cond:
+                monitor_cond.notify_all()
 
+    # Register callbacks
+    if _detector_ref:
+        _detector_ref.on_price_update(token_id, _on_price_tick)
     if not DRY_RUN and _user_ws_ref:
         _user_ws_ref.on_fill(token_id, _on_limit_fill)
 
+    last_rest_check = start
     while True:
         elapsed = time.time() - start
+        remaining = FLIP_TIMEOUT - elapsed
+
+        if remaining <= 0:
+            exit_reason = "timeout"
+            exit_price = get_price(token_id, side=SELL) or entry_price
+            break
+
+        # Wait for next WS event or 2s safety-net timeout
+        with monitor_cond:
+            monitor_cond.wait(timeout=min(remaining, 2.0))
+
         current_price = get_price(token_id, side=SELL)
 
         if current_price <= 0:
-            time.sleep(PRICE_CHECK_INTERVAL)
             continue
 
         # Check if limit order filled via User Channel event (instant, no REST call)
@@ -1076,10 +1131,12 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                 exit_price = target_price
                 exit_is_maker = True
                 break
-            # Fallback: every 2s, do a REST balance check in case WS missed it
-            if elapsed > 0 and int(elapsed * 5) % 10 == 0:
-                remaining = get_actual_share_balance(token_id)
-                if remaining is not None and remaining < 0.5:
+            # REST fallback every 5s in case WS missed it
+            now = time.time()
+            if now - last_rest_check >= 5.0:
+                last_rest_check = now
+                remaining_shares = get_actual_share_balance(token_id)
+                if remaining_shares is not None and remaining_shares < 0.5:
                     exit_reason = "profit"
                     exit_price = target_price
                     exit_is_maker = True
@@ -1096,14 +1153,10 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             exit_reason = "stop_loss"
             exit_price = current_price
             break
-        elif elapsed >= FLIP_TIMEOUT:
-            exit_reason = "timeout"
-            exit_price = current_price
-            break
 
-        time.sleep(PRICE_CHECK_INTERVAL)
-
-    # Clean up User Channel callback
+    # Clean up callbacks
+    if _detector_ref:
+        _detector_ref.remove_price_callback(token_id, _on_price_tick)
     if _user_ws_ref:
         _user_ws_ref.remove_fill_callback(token_id, _on_limit_fill)
 
@@ -1547,7 +1600,7 @@ def run_burst():
     log(f"Entry: market buy (FAK, taker fee) after {BURST_CONFIRM_DELAY}s confirm delay")
     log(f"Exit: dynamic TP/SL from book (defaults +{PROFIT_TARGET}/-{STOP_LOSS}) | wall min ${BOOK_WALL_MIN_SIZE}")
     log(f"  Book TP: {'ON' if BOOK_TP_ENABLED else 'OFF'} (range {BOOK_TP_MIN}-{BOOK_TP_MAX}), Book SL: {'ON' if BOOK_SL_ENABLED else 'OFF'} (range {BOOK_SL_MIN}-{BOOK_SL_MAX})")
-    log(f"Timeout: {FLIP_TIMEOUT}s | Price via: WS cache → REST fallback")
+    log(f"Timeout: {FLIP_TIMEOUT}s | Monitor: event-driven (WS price callbacks), REST fallback 5s")
     log(f"Entry price: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}, Burst min: {MIN_BURST_PRICE}")
     log(f"Cooldowns: {COOLDOWN_AFTER_ENTRY}s/token, {MARKET_COOLDOWN}s/market, {LOSS_LOCKOUT}s/loss-lockout")
     log(f"Time filter: skip markets with <{MIN_TIME_REMAINING}s remaining")
