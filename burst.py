@@ -93,7 +93,8 @@ CRYPTO_FEE_EXPONENT = 2      # exponent for 5m/15m crypto markets
 BURST_CONFIRM_DELAY = 1.0    # Minimum wait before checking entry conditions
 PULLBACK_WINDOW = 5.0        # Max seconds to wait for pullback after confirm delay
 MAX_ENTRY_SPREAD = 0.05      # Skip market if bid-ask spread > this (too illiquid/volatile)
-MIN_PULLBACK = 0.01          # Price must pull back at least this from peak ask before entry
+MIN_PULLBACK = 0.02          # Price must pull back at least this from peak ask before entry
+MIN_RR_RATIO = 1.0           # Skip trade if profit_target / stop_loss < this (risk/reward gate)
 
 # Quick flip exit — defaults (overridden by book analysis when available)
 PROFIT_TARGET = 0.05         # Default limit sell at entry + this (maker, 0% fee)
@@ -1015,12 +1016,14 @@ def quick_flip(token_id, entry_price, shares, pos_info):
     entry_bid = entry_price - entry_spread
     stop_price = round(entry_bid - stop_loss, 2)
 
+    rr_ratio = profit_target / stop_loss if stop_loss > 0 else 999
+
     # Both entry and exit are maker (0% fee)
     entry_is_maker = pos_info.get("entry_is_maker", False)
     target_gross_pnl = (target_price - entry_price) * shares
 
     log(f"  ⏱ Flip monitor started: {side_label} {shares:.0f}sh @ {entry_price:.2f} (bid {entry_bid:.2f}, spread {entry_spread:.2f})")
-    log(f"    TP: {target_price:.2f} (+{profit_target:.2f}) | SL: {stop_price:.2f} (-{stop_loss:.2f} from bid) | Timeout: {FLIP_TIMEOUT}s")
+    log(f"    TP: {target_price:.2f} (+{profit_target:.2f}) | SL: {stop_price:.2f} (-{stop_loss:.2f} from bid) | R:R {rr_ratio:.1f}x | Timeout: {FLIP_TIMEOUT}s")
     log(f"    Book: {book_info_str}")
     if entry_is_maker:
         log(f"    Entry: maker (0% fee) | Net P&L if target hit: ~${target_gross_pnl:+.2f}")
@@ -1496,6 +1499,20 @@ def run_burst():
 
                 log(f"  ✓ Pullback entry: peak {peak_ask:.2f} → ask {current_ask:.2f} (pb {peak_ask-current_ask:.2f}), bid {current_bid:.2f}, spread {entry_spread:.2f}")
 
+                # Pre-buy R:R gate — check book TP/SL before committing capital
+                if _detector_ref and (BOOK_TP_ENABLED or BOOK_SL_ENABLED):
+                    pre_analysis = _detector_ref.analyze_book(fade_token, entry_price=current_ask)
+                    if pre_analysis:
+                        pre_tp = pre_analysis["suggested_tp"]
+                        pre_sl = pre_analysis["suggested_sl"]
+                        pre_rr = pre_tp / pre_sl if pre_sl > 0 else 999
+                        if pre_rr < MIN_RR_RATIO:
+                            log(f"  ⚠ Entry skipped: bad R:R — TP {pre_tp:.2f} / SL {pre_sl:.2f} = {pre_rr:.1f}x (need {MIN_RR_RATIO}x)")
+                            with positions_lock:
+                                positions.pop(fade_token, None)
+                            return
+                        log(f"    Pre-buy book: TP +{pre_tp:.2f} / SL -{pre_sl:.2f} = {pre_rr:.1f}x R:R")
+
                 # Re-check balance
                 bal_now = get_usdc_balance()
                 if bal_now is None or bal_now < MIN_BALANCE_BUFFER + BUY_AMOUNT:
@@ -1644,7 +1661,7 @@ def run_burst():
     log(f"� MOMENTUM burst bot (ride-the-burst)")
     log(f"Detection: {BURST_WINDOW}s window, proportional threshold ({BURST_MULTIPLIER}x baseline, floor ${BURST_MIN_ABSOLUTE}, {BURST_BASELINE_WINDOW}s baseline)")
     log(f"Momentum logic: buy bursts → buy same side | sell bursts → buy opposite side")
-    log(f"Entry: pullback entry ({BURST_CONFIRM_DELAY}s settle + {PULLBACK_WINDOW}s window, spread<{MAX_ENTRY_SPREAD}, pb>={MIN_PULLBACK})")
+    log(f"Entry: pullback entry ({BURST_CONFIRM_DELAY}s settle + {PULLBACK_WINDOW}s window, spread<{MAX_ENTRY_SPREAD}, pb>={MIN_PULLBACK}, R:R>={MIN_RR_RATIO})")
     log(f"Exit: dynamic TP/SL from book (defaults +{PROFIT_TARGET}/-{STOP_LOSS}) | wall min ${BOOK_WALL_MIN_SIZE}")
     log(f"  Book TP: {'ON' if BOOK_TP_ENABLED else 'OFF'} (range {BOOK_TP_MIN}-{BOOK_TP_MAX}), Book SL: {'ON' if BOOK_SL_ENABLED else 'OFF'} (range {BOOK_SL_MIN}-{BOOK_SL_MAX})")
     log(f"Timeout: {FLIP_TIMEOUT}s | Monitor: event-driven (WS price callbacks), REST fallback 5s")
