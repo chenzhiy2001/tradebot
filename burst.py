@@ -674,44 +674,68 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             fee_note = "0% both sides" if entry_is_maker else f"entry ${entry_fee:.2f}"
             log(f"  ✓ Limit filled (profit): {target_price:.2f} | Net P&L: ${pnl:+.2f} ({fee_note})")
         else:
-            # Cancel limit order, then market sell
+            # Cancel limit order, then sell via GTC limit at low price (maker = 0% fee)
             if limit_placed:
                 cancel_all_orders_for_token(token_id)
                 log(f"  ↩ Cancelled limit sell (exit: {exit_reason})")
 
             sell_succeeded = False
+            # Recalculate fees assuming maker exit (0% fee)
+            exit_fee = 0.0
+            net_pnl = gross_pnl - entry_fee - exit_fee
             try:
                 actual = get_actual_share_balance(token_id)
                 sell_shares = math.floor((actual or shares) * 100) / 100
 
                 if sell_shares > 0:
-                    # Try FAK market sell with retries (order book may be thin)
+                    # GTC limit sell at low price → fills instantly at best bid (maker = 0% fee)
+                    # This avoids taker fees on stop-loss/timeout exits
+                    sell_limit_price = round(max(exit_price - 0.05, 0.01), 2)
                     last_err = None
                     for attempt in range(3):
                         try:
-                            mo = MarketOrderArgs(
+                            sell_order = OrderArgs(
                                 token_id=token_id,
-                                amount=sell_shares,
+                                price=sell_limit_price,
+                                size=sell_shares,
                                 side=SELL,
-                                order_type=OrderType.FAK,
                             )
-                            signed = client.create_market_order(mo)
-                            resp = client.post_order(signed, OrderType.FAK)
+                            signed_sell = client.create_order(sell_order)
+                            resp = client.post_order(signed_sell, OrderType.GTC)
                             sell_succeeded = True
                             break
-                        except Exception as fak_err:
-                            last_err = fak_err
-                            if attempt < 2:
-                                time.sleep(1)  # Wait for order book to replenish
+                        except Exception as gtc_err:
+                            last_err = gtc_err
+                            # Fallback to FAK if GTC fails
+                            if attempt == 2:
+                                try:
+                                    mo = MarketOrderArgs(
+                                        token_id=token_id,
+                                        amount=sell_shares,
+                                        side=SELL,
+                                        order_type=OrderType.FAK,
+                                    )
+                                    signed = client.create_market_order(mo)
+                                    resp = client.post_order(signed, OrderType.FAK)
+                                    sell_succeeded = True
+                                    exit_fee = compute_taker_fee(sell_shares, exit_price)
+                                    net_pnl = gross_pnl - entry_fee - exit_fee
+                                    exit_is_maker = False
+                                    log(f"  ⚠ GTC sell failed, used FAK fallback (taker fee)")
+                                except Exception as fak_err:
+                                    last_err = fak_err
+                            else:
+                                time.sleep(0.5)
 
                     if sell_succeeded:
                         pnl = net_pnl
-                        fee_note = f"fees: ${entry_fee+exit_fee:.2f}" if (entry_fee + exit_fee) > 0 else "entry 0%"
-                        log(f"  ✓ Market sell ({exit_reason}): {sell_shares:.0f}sh at ~{exit_price:.2f} | Net P&L: ${pnl:+.2f} ({fee_note})")
+                        exit_is_maker = exit_fee == 0.0
+                        fee_note = f"maker 0% exit" if exit_is_maker else f"fees: ${entry_fee+exit_fee:.2f}"
+                        log(f"  ✓ {'Limit' if exit_is_maker else 'Market'} sell ({exit_reason}): {sell_shares:.0f}sh at ~{exit_price:.2f} | Net P&L: ${pnl:+.2f} ({fee_note})")
                     else:
-                        # All FAK attempts failed — log unrealized loss
+                        # All attempts failed — log unrealized loss
                         pnl = net_pnl
-                        log(f"  ✗ Market sell failed after 3 attempts: {last_err}")
+                        log(f"  ✗ Sell failed after 3 attempts: {last_err}")
                         log(f"  ⚠ {sell_shares:.0f}sh ORPHANED — unrealized P&L: ${pnl:+.2f}")
                 else:
                     log(f"  ⚠ No shares to sell (balance: {actual})")
