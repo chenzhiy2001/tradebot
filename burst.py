@@ -114,10 +114,12 @@ BOOK_TP_MIN = 0.02           # Minimum TP even if wall is close
 BOOK_TP_MAX = 0.10           # Maximum TP even if no wall found
 BOOK_SL_MIN = 0.02           # Minimum SL even if support is close
 BOOK_SL_MAX = 0.05           # Maximum SL even if no support found
-FLIP_TIMEOUT = 15            # Max seconds to hold before force-selling (was 30 — 15-31s bucket
-                             # was 38% WR/-$7.19; 5-15s bucket was 92% WR/+$10.98)
-LIMIT_SELL_RETRIES = 3       # Retry limit sell placement this many times
-LIMIT_SELL_RETRY_DELAY = 1   # Seconds between retries (reduced from 3 — runs in background now)
+FLIP_TIMEOUT = 20            # Max seconds to hold before force-selling
+                             # Session 3: 5 timeouts were net +$1.74 at 15s — strategy captures momentum
+                             # that needs more time. Extending to 20s to let winners run.
+LIMIT_SELL_RETRIES = 5       # Retry limit sell placement this many times (was 3 — too few
+                             # when cancel_all_orders_for_token locks balance temporarily)
+LIMIT_SELL_RETRY_DELAY = 2   # Seconds between retries (was 1 — need longer for on-chain settlement)
 
 # Risk management
 MAX_CONCURRENT_POSITIONS = 3
@@ -125,8 +127,8 @@ MIN_BALANCE_BUFFER = 5
 COOLDOWN_AFTER_ENTRY = 30.0  # Don't re-enter same TOKEN for N seconds (was 5)
 MARKET_COOLDOWN = 30.0       # Don't re-enter same MARKET (either side) for N seconds (was 60)
 LOSS_LOCKOUT = 120.0         # After stop-loss/timeout on a market, lock it out for this long
-MIN_TIME_REMAINING = 30      # Don't enter markets with less than this many seconds until resolution
-                             # (lowered from 60 — FLIP_TIMEOUT=15 + 2s confirm + 5s settle = ~22s needed)
+MIN_TIME_REMAINING = 35      # Don't enter markets with less than this many seconds until resolution
+                             # FLIP_TIMEOUT=20 + 2s confirm + 5s settle = ~27s needed
 
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
@@ -1254,6 +1256,11 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                 # Without this, immediate sell attempts fail with "not enough balance / allowance"
                 time.sleep(1.5)
 
+            # If limit sell was never placed (balance was 0 during placement),
+            # the shares may still be settling — add delay before attempting exit sell
+            if not limit_placed:
+                time.sleep(1.5)
+
             sell_succeeded = False
             # Recalculate fees assuming maker exit (0% fee)
             exit_fee = 0.0
@@ -1608,6 +1615,9 @@ def run_burst():
 
                 # Cancel any remaining open orders for this token (partial fills leave resting qty)
                 cancel_all_orders_for_token(token_id)
+                # Wait for on-chain settlement after cancel — without this,
+                # balance/allowance temporarily shows 0 and limit sell placement fails
+                time.sleep(1.5)
 
                 # === POST-FILL SANITY CHECK ===
                 # Our limit buy fills when someone SELLS into it — meaning price
