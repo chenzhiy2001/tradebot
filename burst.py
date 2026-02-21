@@ -35,12 +35,13 @@ import os
 import sys
 import time
 import math
+import re
 import requests
 import json
 import asyncio
 import threading
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     OrderArgs, OrderType, OpenOrderParams,
@@ -84,7 +85,7 @@ LIMIT_BUY_CHECK_INTERVAL = 0.5  # How often to check if limit buy filled
 
 # Quick flip exit
 PROFIT_TARGET = 0.03         # Limit sell at entry + this (maker, 0% fee) (was 0.05, unreachable)
-STOP_LOSS = 0.03             # Cancel limit + market sell if price drops this much (was 0.05)
+STOP_LOSS = 0.05             # Cancel limit + market sell if price drops this much (reverted from 0.03 — tighter stop caused more false triggers without reducing slippage)
 FLIP_TIMEOUT = 30            # Max seconds to hold before force-selling (was 15)
 PRICE_CHECK_INTERVAL = 0.5   # How often to check price during flip
 LIMIT_SELL_RETRIES = 3       # Retry limit sell placement this many times
@@ -97,6 +98,7 @@ SESSION_STOP_LOSS_PCT = 0.30
 COOLDOWN_AFTER_ENTRY = 30.0  # Don't re-enter same TOKEN for N seconds (was 5)
 MARKET_COOLDOWN = 30.0       # Don't re-enter same MARKET (either side) for N seconds (was 60)
 LOSS_LOCKOUT = 120.0         # After stop-loss/timeout on a market, lock it out for this long
+MIN_TIME_REMAINING = 180     # Don't enter markets with less than this many seconds until resolution
 
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
@@ -500,6 +502,34 @@ class BurstDetector:
 
 
 # =========================================================================
+# TIME REMAINING — parse market end time to avoid entering near resolution
+# =========================================================================
+def parse_market_end_time(market_name):
+    """Parse end time from market name like 'Bitcoin Up or Down - February 20, 7:30PM-7:35PM ET'.
+    Returns datetime in UTC, or None if parsing fails.
+    """
+    match = re.search(r'(\w+)\s+(\d+),\s+\d+:\d+[AP]M-(\d+:\d+[AP]M)\s+ET', market_name)
+    if not match:
+        return None
+    month_str = match.group(1)   # "February"
+    day_str = match.group(2)     # "20"
+    end_time_str = match.group(3) # "7:35PM"
+
+    year = datetime.now().year
+    dt_str = f"{month_str} {day_str} {year} {end_time_str}"
+    try:
+        dt = datetime.strptime(dt_str, "%B %d %Y %I:%M%p")
+    except ValueError:
+        return None
+
+    # ET in winter (Nov-Mar) = EST = UTC-5; in summer = EDT = UTC-4
+    # Simple approach: February is always EST
+    est = timezone(timedelta(hours=-5))
+    dt_utc = dt.replace(tzinfo=est).astimezone(timezone.utc)
+    return dt_utc
+
+
+# =========================================================================
 # QUICK FLIP — monitor price and exit
 # =========================================================================
 def quick_flip(token_id, entry_price, shares, pos_info):
@@ -736,6 +766,15 @@ def run_burst():
         market = info.get("market", "?")
         burst_side = info.get("side", "UP")  # which side this token represents
 
+        # Check time remaining — don't enter markets near resolution
+        market_end = parse_market_end_time(market)
+        if market_end:
+            now_utc = datetime.now(timezone.utc)
+            remaining = (market_end - now_utc).total_seconds()
+            if remaining < MIN_TIME_REMAINING:
+                log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — only {remaining:.0f}s left (need {MIN_TIME_REMAINING}s)")
+                return
+
         # CONTRARIAN LOGIC: determine which token to buy (the fade token)
         if direction == "BUY":
             # Heavy buying on this token → buy the OPPOSITE token
@@ -969,6 +1008,7 @@ def run_burst():
     log(f"Exit: limit sell at +{PROFIT_TARGET} (maker 0% fee) / -{STOP_LOSS} stop / {FLIP_TIMEOUT}s timeout")
     log(f"Fade price: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}, Burst min: {MIN_BURST_PRICE}")
     log(f"Cooldowns: {COOLDOWN_AFTER_ENTRY}s/token, {MARKET_COOLDOWN}s/market, {LOSS_LOCKOUT}s/loss-lockout")
+    log(f"Time filter: skip markets with <{MIN_TIME_REMAINING}s remaining")
     log(f"Max positions: {MAX_CONCURRENT_POSITIONS}")
     log(f"Buy amount: ${BUY_AMOUNT}, Cryptos: {', '.join(CRYPTOS)}")
     log(f"{'='*60}\n")
