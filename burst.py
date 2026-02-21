@@ -1463,9 +1463,9 @@ def run_burst():
                 # Check response — FAK orders return status='matched' with transactionsHashes on success
                 resp_status = resp.get("status", "") if isinstance(resp, dict) else ""
 
-                # Wait for on-chain settlement with retries
+                # Wait for on-chain settlement
                 # FAK fills are matched on CLOB but shares need minting on-chain
-                # Use User Channel for faster detection, with REST fallback
+                # Primary: User Channel WS event (instant). Fallback: REST polling.
                 settle_event = threading.Event()
                 def _on_buy_confirmed(trade_info):
                     if trade_info.get("side") == "BUY":
@@ -1473,20 +1473,18 @@ def run_burst():
                 user_ws.on_fill(fade_token, _on_buy_confirmed)
 
                 actual = None
-                for settle_attempt in range(5):  # Up to ~8s total wait
-                    # Wait with early exit if user channel confirms
-                    wait = 1.0 if settle_attempt < 2 else 2.0
-                    if settle_event.wait(timeout=wait):
-                        # User WS confirmed — check balance
+                # Wait up to 8s total: WS event usually fires in 2-4s
+                if settle_event.wait(timeout=4.0):
+                    # WS confirmed — give chain a moment, then check balance
+                    actual = get_actual_share_balance(fade_token)
+                if actual is None or actual < 5:
+                    # REST fallback: poll a few times
+                    for settle_attempt in range(3):
+                        time.sleep(1.5)
                         actual = get_actual_share_balance(fade_token)
                         if actual is not None and actual >= 5:
                             break
-
-                    actual = get_actual_share_balance(fade_token)
-                    if actual is not None and actual >= 5:
-                        break
-                    if settle_attempt < 4:
-                        log(f"  ⏳ Settlement check {settle_attempt+1}/5: balance {actual} (waiting...)")
+                        log(f"  ⏳ Settlement check {settle_attempt+1}/3: balance {actual} (waiting...)")
 
                 user_ws.remove_fill_callback(fade_token, _on_buy_confirmed)
 
