@@ -1248,18 +1248,15 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             fee_note = "0% both sides" if entry_is_maker else f"entry ${entry_fee:.2f}"
             log(f"  ✓ Limit filled (profit): {target_price:.2f} | Net P&L: ${pnl:+.2f} ({fee_note})")
         else:
-            # Cancel limit order, then sell via GTC limit at low price (maker = 0% fee)
+            # ALWAYS cancel all orders for this token before attempting exit sell.
+            # Even if limit_placed=False, the _place_limit_sell thread may have
+            # placed an order between when we read the flag and now (race condition).
+            cancel_all_orders_for_token(token_id)
             if limit_placed:
-                cancel_all_orders_for_token(token_id)
                 log(f"  ↩ Cancelled limit sell (exit: {exit_reason})")
-                # Wait for on-chain allowance release after cancel
-                # Without this, immediate sell attempts fail with "not enough balance / allowance"
-                time.sleep(1.5)
-
-            # If limit sell was never placed (balance was 0 during placement),
-            # the shares may still be settling — add delay before attempting exit sell
-            if not limit_placed:
-                time.sleep(1.5)
+            # Wait for on-chain allowance release after cancel.
+            # Without this, sell attempts fail with "not enough balance / allowance".
+            time.sleep(2.0)
 
             sell_succeeded = False
             # Recalculate fees assuming maker exit (0% fee)
@@ -1372,7 +1369,75 @@ def quick_flip(token_id, entry_price, shares, pos_info):
 # =========================================================================
 # MAIN BOT
 # =========================================================================
+def _cleanup_orphaned_positions():
+    """On startup, find and sell any shares left from previous runs.
+    Scans current crypto market tokens for non-zero balances and dumps them."""
+    log("🔍 Checking for orphaned positions from previous runs...")
+    orphans_found = 0
+    orphans_sold = 0
+    try:
+        markets = get_current_crypto_markets()
+        checked = set()
+        for market in markets:
+            tokens = json.loads(market.get("clobTokenIds", "[]"))
+            question = market.get("question", "?")
+            for idx, token_id in enumerate(tokens):
+                if token_id in checked:
+                    continue
+                checked.add(token_id)
+                balance = get_actual_share_balance(token_id)
+                if balance is None or balance < 1:
+                    continue
+                side_name = "UP" if idx == 0 else "DOWN"
+                orphans_found += 1
+                sell_shares = math.floor(balance * 100) / 100
+                log(f"  ⚠ Found orphan: {question} {side_name} — {sell_shares:.0f}sh")
+                # Cancel any resting orders first
+                cancel_all_orders_for_token(token_id)
+                time.sleep(1.0)
+                # Sell via GTC at low price (maker, 0% fee)
+                try:
+                    current_price = get_price(token_id, side=SELL)
+                    sell_limit_price = round(max(current_price - 0.05, 0.01), 2) if current_price > 0 else 0.01
+                    sell_order = OrderArgs(
+                        token_id=token_id,
+                        price=sell_limit_price,
+                        size=sell_shares,
+                        side=SELL,
+                    )
+                    signed_sell = client.create_order(sell_order)
+                    resp = client.post_order(signed_sell, OrderType.GTC)
+                    orphans_sold += 1
+                    log(f"  ✓ Sold orphan: {sell_shares:.0f}sh at ~{current_price:.2f}")
+                except Exception as e:
+                    log(f"  ✗ Failed to sell orphan: {e}")
+                    # Try FAK as fallback
+                    try:
+                        mo = MarketOrderArgs(
+                            token_id=token_id,
+                            amount=sell_shares,
+                            side=SELL,
+                            order_type=OrderType.FAK,
+                        )
+                        signed = client.create_market_order(mo)
+                        client.post_order(signed, OrderType.FAK)
+                        orphans_sold += 1
+                        log(f"  ✓ Sold orphan via FAK: {sell_shares:.0f}sh")
+                    except Exception as e2:
+                        log(f"  ✗ FAK fallback also failed: {e2}")
+    except Exception as e:
+        log(f"  ⚠ Orphan cleanup error: {e}")
+    if orphans_found == 0:
+        log("  ✓ No orphans found")
+    else:
+        log(f"  Cleanup: {orphans_sold}/{orphans_found} orphans sold")
+
+
 def run_burst():
+    # Clean up any orphaned positions from previous runs BEFORE starting
+    _cleanup_orphaned_positions()
+    time.sleep(1)  # Let balance settle after cleanup
+
     starting_balance = get_usdc_balance() or 100
     log(f"\n💵 Starting balance: ${starting_balance:.2f}")
 
