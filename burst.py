@@ -101,7 +101,9 @@ SESSION_STOP_LOSS_PCT = 0.30
 COOLDOWN_AFTER_ENTRY = 30.0  # Don't re-enter same TOKEN for N seconds (was 5)
 MARKET_COOLDOWN = 30.0       # Don't re-enter same MARKET (either side) for N seconds (was 60)
 LOSS_LOCKOUT = 120.0         # After stop-loss/timeout on a market, lock it out for this long
-MIN_TIME_REMAINING = 120     # Don't enter markets with less than this many seconds until resolution
+MIN_TIME_REMAINING = 60      # Don't enter markets with less than this many seconds until resolution
+                             # (lowered from 120 — was blocking 60% of bursts; 2s confirm delay now
+                             #  protects against cascade entries; need 30s hold + buffer)
 
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
@@ -931,15 +933,24 @@ def run_burst():
                 signed = client.create_market_order(mo)
                 resp = client.post_order(signed, OrderType.FAK)
 
-                # Wait for settlement, then check actual shares received
-                time.sleep(1.0)
-                actual = get_actual_share_balance(fade_token)
-                if actual is None or actual < 5:
-                    time.sleep(1.5)
+                # Check response — FAK orders return status='matched' with transactionsHashes on success
+                resp_status = resp.get("status", "") if isinstance(resp, dict) else ""
+                resp_success = resp.get("success", False) if isinstance(resp, dict) else False
+
+                # Wait for on-chain settlement with retries
+                # FAK fills are matched on CLOB but shares need minting on-chain
+                actual = None
+                for settle_attempt in range(5):  # Up to ~8s total wait
+                    wait = 1.0 if settle_attempt < 2 else 2.0
+                    time.sleep(wait)
                     actual = get_actual_share_balance(fade_token)
+                    if actual is not None and actual >= 5:
+                        break
+                    if settle_attempt < 4:
+                        log(f"  ⏳ Settlement check {settle_attempt+1}/5: balance {actual} (waiting...)")
 
                 if actual is None or actual < 5:
-                    log(f"  ⚠ FAK buy failed to fill (balance: {actual}) — skipping")
+                    log(f"  ⚠ FAK buy failed to fill (balance: {actual}, resp: {resp_status}) — skipping")
                     # Dump any dust shares
                     if actual and actual > 0:
                         try:
