@@ -68,8 +68,8 @@ FUNDER_ADDRESS = founder_address
 BUY_AMOUNT = 10              # Base bet in $ (at threshold burst)
 MAX_BUY_AMOUNT = 30          # Cap per trade regardless of burst size
 BURST_WINDOW = 5.0           # Seconds — detect bursts within this window
-BURST_THRESHOLD = 700        # $ net volume in the window to trigger (raised from 500 — 
-                             # $500-600 bursts had 54% WR and lost money; $800+ had 83% WR)
+BURST_THRESHOLD = 300        # $ net volume in the window to trigger (lowered from 700 —
+                             # momentum benefits from catching early signals; more trades)
 MIN_ENTRY_PRICE = 0.20       # Don't buy token below this (at low prices $10 buys
                              # 50-111 shares, so even a clean 0.03 stop = $1.50-$3.33 loss)
 MAX_ENTRY_PRICE = 0.75       # Don't buy token above this (too expensive, limited upside)
