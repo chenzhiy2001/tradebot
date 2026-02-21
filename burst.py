@@ -833,7 +833,7 @@ class UserChannelWS:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets"])
             import websockets
 
-        api_creds = client.get_api_creds()
+        api_creds = client.creds
         if not api_creds:
             log("  ⚠ No API creds for User Channel — fill detection via REST only")
             return
