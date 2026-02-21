@@ -59,7 +59,8 @@ founder_address = os.getenv("FUNDER_ADDRESS")
 # Configuration
 HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
-WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+WS_USER_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 CHAIN_ID = 137
 FUNDER_ADDRESS = founder_address
 
@@ -94,11 +95,17 @@ LIMIT_BUY_CHECK_INTERVAL = 0.5  # How often to check if limit buy filled
 # Entry confirmation
 BURST_CONFIRM_DELAY = 2.0    # Wait after burst detection before entering (let burst settle)
 
-# Quick flip exit
-PROFIT_TARGET = 0.05         # Limit sell at entry + this (maker, 0% fee)
-                             # (widened from 0.03 — at 0.03 the fee asymmetry requires 68% WR to
-                             #  break even; at 0.05 win=$0.76 vs loss=$0.85, breakeven drops to 53%)
-STOP_LOSS = 0.03             # Cancel limit + market sell if price drops this much
+# Quick flip exit — defaults (overridden by book analysis when available)
+PROFIT_TARGET = 0.05         # Default limit sell at entry + this (maker, 0% fee)
+STOP_LOSS = 0.03             # Default cancel limit + market sell if price drops this much
+BOOK_TP_ENABLED = True       # Use order book depth to set dynamic take-profit
+BOOK_SL_ENABLED = True       # Use order book depth to set dynamic stop-loss
+BOOK_WALL_MIN_SIZE = 200     # Min $ at a price level to count as a "wall"
+BOOK_TP_WALL_MARGIN = 0.01   # Place TP this much below the ask wall
+BOOK_TP_MIN = 0.02           # Minimum TP even if wall is close
+BOOK_TP_MAX = 0.10           # Maximum TP even if no wall found
+BOOK_SL_MIN = 0.02           # Minimum SL even if support is close
+BOOK_SL_MAX = 0.05           # Maximum SL even if no support found
 FLIP_TIMEOUT = 15            # Max seconds to hold before force-selling (was 30 — 15-31s bucket
                              # was 38% WR/-$7.19; 5-15s bucket was 92% WR/+$10.98)
 PRICE_CHECK_INTERVAL = 0.2   # How often to check price during flip (was 0.5 — too slow, stop-loss slipped 0.09 on 5m markets)
@@ -157,11 +164,22 @@ def get_usdc_balance():
 
 
 def get_price(token_id, side=BUY):
+    """Get price — tries WS cache first, falls back to REST API."""
+    # Try WebSocket-cached price first (0 latency, no API call)
+    if _detector_ref:
+        ws_price = _detector_ref.get_ws_price(token_id, side)
+        if ws_price > 0:
+            return ws_price
+    # Fallback to REST
     try:
         data = client.get_price(token_id, side=side)
         return float(data.get("price", 0))
     except Exception:
         return 0.0
+
+
+# Global reference to detector (set in run_burst) for WS price access
+_detector_ref = None
 
 
 def get_actual_share_balance(token_id):
@@ -318,6 +336,13 @@ class BurstDetector:
         self._market_cooldowns = {}        # market_question -> last_entry_time
         self._loss_lockouts = {}           # market_question -> lockout_until_time
 
+        # WebSocket-cached prices: token -> {"best_bid": float, "best_ask": float, "spread": float, "ts": float}
+        self._prices = {}
+        # WebSocket-cached order books: token -> {"bids": [(price, size), ...], "asks": [(price, size), ...], "ts": float}
+        self._books = {}
+        # Track resolved markets: set of asset_ids
+        self._resolved_markets = set()
+
     def start(self):
         t = threading.Thread(target=self._run_loop, daemon=True)
         t.start()
@@ -340,11 +365,11 @@ class BurstDetector:
         while True:
             try:
                 async with websockets.connect(
-                    WS_URL, close_timeout=5, open_timeout=10
+                    WS_MARKET_URL, close_timeout=5, open_timeout=10
                 ) as ws:
                     self._ws_connected = True
                     self._active = set()
-                    log("  🔌 WebSocket connected")
+                    log("  🔌 Market WebSocket connected")
 
                     last_ping = time.time()
                     while True:
@@ -371,19 +396,130 @@ class BurstDetector:
                             continue
 
                         self._msg_count += 1
-
-                        if isinstance(data, dict):
-                            if data.get("event_type") == "last_trade_price":
-                                self._on_trade(data)
-                        elif isinstance(data, list):
-                            for item in data:
-                                if isinstance(item, dict) and item.get("event_type") == "last_trade_price":
-                                    self._on_trade(item)
+                        self._dispatch_event(data)
 
             except Exception as e:
                 self._ws_connected = False
-                log(f"  ⚠ WS disconnected: {e}, reconnecting in 2s...")
+                log(f"  ⚠ Market WS disconnected: {e}, reconnecting in 2s...")
                 await asyncio.sleep(2)
+
+    def _dispatch_event(self, data):
+        """Route incoming WS events to the appropriate handler."""
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    self._dispatch_event(item)
+            return
+        if not isinstance(data, dict):
+            return
+        etype = data.get("event_type", "")
+        if etype == "last_trade_price":
+            self._on_trade(data)
+        elif etype == "best_bid_ask":
+            self._on_best_bid_ask(data)
+        elif etype == "book":
+            self._on_book(data)
+        elif etype == "price_change":
+            self._on_price_change(data)
+        elif etype == "market_resolved":
+            self._on_market_resolved(data)
+
+    def _on_best_bid_ask(self, data):
+        """Cache real-time best bid/ask from WebSocket."""
+        asset_id = data.get("asset_id", "")
+        if not asset_id:
+            return
+        try:
+            best_bid = float(data.get("best_bid", 0))
+            best_ask = float(data.get("best_ask", 0))
+            spread = float(data.get("spread", 0))
+        except (ValueError, TypeError):
+            return
+        with self._lock:
+            self._prices[asset_id] = {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread": spread,
+                "ts": time.time(),
+            }
+
+    def _on_book(self, data):
+        """Cache full order book snapshot from WebSocket."""
+        asset_id = data.get("asset_id", "")
+        if not asset_id:
+            return
+        bids = []
+        asks = []
+        for b in data.get("bids", []):
+            try:
+                bids.append((float(b["price"]), float(b["size"])))
+            except (KeyError, ValueError, TypeError):
+                pass
+        for a in data.get("asks", []):
+            try:
+                asks.append((float(a["price"]), float(a["size"])))
+            except (KeyError, ValueError, TypeError):
+                pass
+        # Sort bids descending (best bid first), asks ascending (best ask first)
+        bids.sort(key=lambda x: -x[0])
+        asks.sort(key=lambda x: x[0])
+        with self._lock:
+            self._books[asset_id] = {"bids": bids, "asks": asks, "ts": time.time()}
+            # Also update best bid/ask from the book snapshot
+            if bids and asks:
+                self._prices[asset_id] = {
+                    "best_bid": bids[0][0],
+                    "best_ask": asks[0][0],
+                    "spread": round(asks[0][0] - bids[0][0], 4),
+                    "ts": time.time(),
+                }
+
+    def _on_price_change(self, data):
+        """Incrementally update order book from price_change events."""
+        for pc in data.get("price_changes", []):
+            asset_id = pc.get("asset_id", "")
+            if not asset_id:
+                continue
+            try:
+                price = float(pc["price"])
+                size = float(pc["size"])
+                side = pc["side"]  # "BUY" or "SELL"
+                best_bid = float(pc.get("best_bid", 0))
+                best_ask = float(pc.get("best_ask", 0))
+            except (KeyError, ValueError, TypeError):
+                continue
+
+            with self._lock:
+                book = self._books.get(asset_id)
+                if book:
+                    if side == "BUY":
+                        # Update bid level
+                        book["bids"] = [(p, s) for p, s in book["bids"] if p != price]
+                        if size > 0:
+                            book["bids"].append((price, size))
+                            book["bids"].sort(key=lambda x: -x[0])
+                    else:
+                        # Update ask level
+                        book["asks"] = [(p, s) for p, s in book["asks"] if p != price]
+                        if size > 0:
+                            book["asks"].append((price, size))
+                            book["asks"].sort(key=lambda x: x[0])
+                    book["ts"] = time.time()
+
+                # Always update cached best bid/ask
+                if best_bid > 0 or best_ask > 0:
+                    existing = self._prices.get(asset_id, {})
+                    self._prices[asset_id] = {
+                        "best_bid": best_bid if best_bid > 0 else existing.get("best_bid", 0),
+                        "best_ask": best_ask if best_ask > 0 else existing.get("best_ask", 0),
+                        "spread": round(best_ask - best_bid, 4) if best_bid > 0 and best_ask > 0 else existing.get("spread", 0),
+                        "ts": time.time(),
+                    }
+
+    def _on_market_resolved(self, data):
+        """Track resolved markets to auto-unsubscribe."""
+        for aid in data.get("assets_ids", []):
+            self._resolved_markets.add(aid)
 
     async def _sync_subscriptions(self, ws):
         with self._lock:
@@ -402,6 +538,8 @@ class BurstDetector:
                 for t in removed:
                     self._windows.pop(t, None)
                     self._baselines.pop(t, None)
+                    self._prices.pop(t, None)
+                    self._books.pop(t, None)
 
         if changed and self._active:
             self._active = set()
@@ -409,7 +547,11 @@ class BurstDetector:
             return
 
         if wanted:
-            await ws.send(json.dumps({"type": "market", "assets_ids": list(wanted)}))
+            await ws.send(json.dumps({
+                "type": "market",
+                "assets_ids": list(wanted),
+                "custom_feature_enabled": True,
+            }))
         self._last_sub_time = now
 
         if changed:
@@ -543,6 +685,279 @@ class BurstDetector:
     def subscribed_count(self):
         return len(self._active)
 
+    # --- Public accessors for WS-cached data ---
+
+    def get_ws_price(self, token_id, side=BUY):
+        """Get price from WS cache. Returns best_ask for BUY, best_bid for SELL.
+        Returns 0.0 if not cached (caller should fall back to REST)."""
+        with self._lock:
+            p = self._prices.get(token_id)
+        if not p:
+            return 0.0
+        # Stale check: if older than 30s, don't trust it
+        if time.time() - p.get("ts", 0) > 30:
+            return 0.0
+        if side == BUY:
+            return p.get("best_ask", 0.0)
+        else:
+            return p.get("best_bid", 0.0)
+
+    def get_book(self, token_id):
+        """Get cached order book for a token. Returns {"bids": [...], "asks": [...]} or None."""
+        with self._lock:
+            book = self._books.get(token_id)
+        if not book:
+            return None
+        # Stale check
+        if time.time() - book.get("ts", 0) > 30:
+            return None
+        return book
+
+    def analyze_book(self, token_id, entry_price=None):
+        """Analyze order book depth to suggest dynamic TP/SL.
+        Returns dict with:
+          - spread: best ask - best bid
+          - total_bid_depth: total $ on bid side
+          - total_ask_depth: total $ on ask side
+          - first_ask_wall: (price, size_$) of first significant ask wall above entry
+          - first_bid_wall: (price, size_$) of first significant bid wall below entry
+          - suggested_tp: suggested take-profit offset
+          - suggested_sl: suggested stop-loss offset
+        Returns None if book unavailable.
+        """
+        book = self.get_book(token_id)
+        if not book:
+            return None
+
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+        if not bids or not asks:
+            return None
+
+        best_bid = bids[0][0]
+        best_ask = asks[0][0]
+        spread = round(best_ask - best_bid, 4)
+
+        # Total depth (in $, i.e. size × price)
+        total_bid_depth = sum(p * s for p, s in bids)
+        total_ask_depth = sum(p * s for p, s in asks)
+
+        ref_price = entry_price if entry_price else best_ask
+
+        # Find first significant ask wall above entry (resistance)
+        first_ask_wall = None
+        if BOOK_TP_ENABLED:
+            for price, size in asks:
+                dollar_val = price * size
+                if price > ref_price and dollar_val >= BOOK_WALL_MIN_SIZE:
+                    first_ask_wall = (price, round(dollar_val, 0))
+                    break
+
+        # Find first significant bid wall below entry (support)
+        first_bid_wall = None
+        if BOOK_SL_ENABLED:
+            for price, size in bids:
+                dollar_val = price * size
+                if price < ref_price and dollar_val >= BOOK_WALL_MIN_SIZE:
+                    first_bid_wall = (price, round(dollar_val, 0))
+                    break
+
+        # Compute suggested TP from ask wall
+        if first_ask_wall and BOOK_TP_ENABLED:
+            wall_dist = first_ask_wall[0] - ref_price - BOOK_TP_WALL_MARGIN
+            suggested_tp = max(BOOK_TP_MIN, min(BOOK_TP_MAX, round(wall_dist, 2)))
+        else:
+            suggested_tp = PROFIT_TARGET  # Default
+
+        # Compute suggested SL from bid wall / spread
+        if first_bid_wall and BOOK_SL_ENABLED:
+            support_dist = ref_price - first_bid_wall[0]
+            # Stop loss just below the support wall
+            suggested_sl = max(BOOK_SL_MIN, min(BOOK_SL_MAX, round(support_dist + 0.01, 2)))
+        else:
+            suggested_sl = STOP_LOSS  # Default
+
+        return {
+            "spread": spread,
+            "total_bid_depth": round(total_bid_depth, 0),
+            "total_ask_depth": round(total_ask_depth, 0),
+            "first_ask_wall": first_ask_wall,
+            "first_bid_wall": first_bid_wall,
+            "suggested_tp": suggested_tp,
+            "suggested_sl": suggested_sl,
+        }
+
+
+# =========================================================================
+# USER CHANNEL — real-time order/trade fill notifications
+# =========================================================================
+class UserChannelWS:
+    """
+    Subscribes to the authenticated User WebSocket channel to receive
+    real-time trade fill and order status updates. Replaces polling
+    get_actual_share_balance() for detecting limit fill.
+
+    Events:
+      - trade CONFIRMED → our buy/sell filled on-chain
+      - order CANCELLATION → our order was cancelled
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._connected = False
+        # token_id -> list of callbacks to fire on trade CONFIRMED
+        self._fill_callbacks = defaultdict(list)
+        # token_id -> latest confirmed trade info
+        self._confirmed_trades = {}
+        # condition_ids to subscribe to
+        self._subscribed_markets = set()
+        self._wanted_markets = set()
+
+    def start(self):
+        t = threading.Thread(target=self._run_loop, daemon=True)
+        t.start()
+
+    def _run_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._ws_loop())
+
+    async def _ws_loop(self):
+        try:
+            import websockets
+        except ImportError:
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets"])
+            import websockets
+
+        api_creds = client.get_api_creds()
+        if not api_creds:
+            log("  ⚠ No API creds for User Channel — fill detection via REST only")
+            return
+
+        auth = {
+            "apiKey": api_creds.api_key,
+            "secret": api_creds.api_secret,
+            "passphrase": api_creds.api_passphrase,
+        }
+
+        while True:
+            try:
+                async with websockets.connect(
+                    WS_USER_URL, close_timeout=5, open_timeout=10
+                ) as ws:
+                    self._connected = True
+                    log("  🔌 User WebSocket connected")
+
+                    last_ping = time.time()
+                    last_sub = set()
+
+                    while True:
+                        # Sync subscriptions
+                        with self._lock:
+                            wanted = set(self._wanted_markets)
+                        if wanted != last_sub:
+                            if wanted:
+                                await ws.send(json.dumps({
+                                    "auth": auth,
+                                    "markets": list(wanted),
+                                    "type": "user",
+                                }))
+                            last_sub = wanted
+
+                        # Heartbeat
+                        if time.time() - last_ping > 10:
+                            try:
+                                await ws.send("PING")
+                                last_ping = time.time()
+                            except Exception:
+                                break
+
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=0.1)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        if msg == "PONG":
+                            continue
+
+                        try:
+                            data = json.loads(msg)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+                        if isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, dict):
+                                    self._handle_event(item)
+                        elif isinstance(data, dict):
+                            self._handle_event(data)
+
+            except Exception as e:
+                self._connected = False
+                log(f"  ⚠ User WS disconnected: {e}, reconnecting in 3s...")
+                await asyncio.sleep(3)
+
+    def _handle_event(self, data):
+        etype = data.get("event_type") or data.get("type", "")
+        if etype == "trade":
+            self._on_trade_event(data)
+
+    def _on_trade_event(self, data):
+        """Handle trade lifecycle event: MATCHED → MINED → CONFIRMED."""
+        status = data.get("status", "")
+        asset_id = data.get("asset_id", "")
+        if not asset_id:
+            return
+
+        if status == "CONFIRMED":
+            trade_info = {
+                "asset_id": asset_id,
+                "side": data.get("side", ""),
+                "size": float(data.get("size", 0)),
+                "price": float(data.get("price", 0)),
+                "status": status,
+                "timestamp": data.get("timestamp", ""),
+            }
+            with self._lock:
+                self._confirmed_trades[asset_id] = trade_info
+                callbacks = list(self._fill_callbacks.get(asset_id, []))
+            # Fire callbacks outside lock
+            for cb in callbacks:
+                try:
+                    cb(trade_info)
+                except Exception:
+                    pass
+
+    def subscribe_market(self, condition_id):
+        """Add a market (by condition_id) to the user channel subscription."""
+        with self._lock:
+            self._wanted_markets.add(condition_id)
+
+    def on_fill(self, token_id, callback):
+        """Register a callback for when a trade on this token is CONFIRMED.
+        callback(trade_info) called with {"asset_id", "side", "size", "price", "status"}."""
+        with self._lock:
+            self._fill_callbacks[token_id].append(callback)
+
+    def remove_fill_callback(self, token_id, callback=None):
+        """Remove fill callback(s) for a token."""
+        with self._lock:
+            if callback:
+                cbs = self._fill_callbacks.get(token_id, [])
+                self._fill_callbacks[token_id] = [cb for cb in cbs if cb != callback]
+            else:
+                self._fill_callbacks.pop(token_id, None)
+
+    def get_last_confirmed(self, token_id):
+        """Get the last confirmed trade info for a token, or None."""
+        with self._lock:
+            return self._confirmed_trades.get(token_id)
+
+    @property
+    def connected(self):
+        return self._connected
+
 
 # =========================================================================
 # TIME REMAINING — parse market end time to avoid entering near resolution
@@ -578,22 +993,41 @@ def parse_market_end_time(market_name):
 def quick_flip(token_id, entry_price, shares, pos_info):
     """
     Exit strategy after burst entry:
-    1. Immediately place GTC limit sell at entry + PROFIT_TARGET (maker = 0% fee)
-    2. Monitor: if stop loss or timeout hit → cancel limit, market sell
-    3. If limit fills (shares go to 0) → profit taken at 0% exit fee
+    1. Analyze order book for dynamic TP/SL (or use defaults)
+    2. Place GTC limit sell at entry + TP (maker = 0% fee)
+    3. Monitor: if stop loss or timeout hit → cancel limit, market sell
+    4. If limit fills (shares go to 0) → profit taken at 0% exit fee
     """
     start = time.time()
     side_label = pos_info.get("side", "?")
     market = pos_info.get("market", "?")
-    target_price = round(entry_price + PROFIT_TARGET, 2)
-    stop_price = entry_price - STOP_LOSS
+
+    # --- Dynamic TP/SL from order book analysis ---
+    profit_target = PROFIT_TARGET
+    stop_loss = STOP_LOSS
+    book_info_str = "book N/A, using defaults"
+    if _detector_ref and (BOOK_TP_ENABLED or BOOK_SL_ENABLED):
+        analysis = _detector_ref.analyze_book(token_id, entry_price=entry_price)
+        if analysis:
+            profit_target = analysis["suggested_tp"]
+            stop_loss = analysis["suggested_sl"]
+            wall_ask = analysis["first_ask_wall"]
+            wall_bid = analysis["first_bid_wall"]
+            ask_str = f"ask wall ${wall_ask[1]:.0f}@{wall_ask[0]:.2f}" if wall_ask else "no ask wall"
+            bid_str = f"bid wall ${wall_bid[1]:.0f}@{wall_bid[0]:.2f}" if wall_bid else "no bid wall"
+            book_info_str = (f"spread={analysis['spread']:.2f}, depth=${analysis['total_bid_depth']:.0f}b/${analysis['total_ask_depth']:.0f}a, "
+                           f"{ask_str}, {bid_str}")
+
+    target_price = round(entry_price + profit_target, 2)
+    stop_price = entry_price - stop_loss
 
     # Both entry and exit are maker (0% fee)
     entry_is_maker = pos_info.get("entry_is_maker", False)
     target_gross_pnl = (target_price - entry_price) * shares
 
     log(f"  ⏱ Flip monitor started: {side_label} {shares:.0f}sh @ {entry_price:.2f}")
-    log(f"    Limit sell: {target_price:.2f} (maker 0% fee) | Stop: {stop_price:.2f} | Timeout: {FLIP_TIMEOUT}s")
+    log(f"    TP: {target_price:.2f} (+{profit_target:.2f}) | SL: {stop_price:.2f} (-{stop_loss:.2f}) | Timeout: {FLIP_TIMEOUT}s")
+    log(f"    Book: {book_info_str}")
     if entry_is_maker:
         log(f"    Entry: maker (0% fee) | Net P&L if target hit: ~${target_gross_pnl:+.2f}")
     else:
@@ -792,6 +1226,10 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             "entry_is_maker": entry_is_maker,
             "exit_is_maker": exit_is_maker,
             "elapsed": round(time.time() - start, 1),
+            "profit_target": profit_target,
+            "stop_loss": stop_loss,
+            "book_tp_enabled": BOOK_TP_ENABLED,
+            "book_sl_enabled": BOOK_SL_ENABLED,
         }
         with open(TRADE_LOG, "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -1006,16 +1444,30 @@ def run_burst():
 
                 # Wait for on-chain settlement with retries
                 # FAK fills are matched on CLOB but shares need minting on-chain
+                # Use User Channel for faster detection, with REST fallback
+                settle_event = threading.Event()
+                def _on_buy_confirmed(trade_info):
+                    if trade_info.get("side") == "BUY":
+                        settle_event.set()
+                user_ws.on_fill(fade_token, _on_buy_confirmed)
+
                 actual = None
                 for settle_attempt in range(5):  # Up to ~8s total wait
+                    # Wait with early exit if user channel confirms
                     wait = 1.0 if settle_attempt < 2 else 2.0
-                    time.sleep(wait)
+                    if settle_event.wait(timeout=wait):
+                        # User WS confirmed — check balance
+                        actual = get_actual_share_balance(fade_token)
+                        if actual is not None and actual >= 5:
+                            break
 
                     actual = get_actual_share_balance(fade_token)
                     if actual is not None and actual >= 5:
                         break
                     if settle_attempt < 4:
                         log(f"  ⏳ Settlement check {settle_attempt+1}/5: balance {actual} (waiting...)")
+
+                user_ws.remove_fill_callback(fade_token, _on_buy_confirmed)
 
                 if actual is None or actual < 5:
                     log(f"  ⚠ FAK buy failed to fill (balance: {actual}, resp: {resp_status}) — skipping")
@@ -1085,8 +1537,15 @@ def run_burst():
         threading.Thread(target=do_buy_and_flip, daemon=True).start()
 
     # Create burst detector
+    global _detector_ref
     detector = BurstDetector(on_burst=on_burst)
+    _detector_ref = detector
     detector.start()
+
+    # Create user channel for real-time fill detection
+    user_ws = UserChannelWS()
+    if not DRY_RUN:
+        user_ws.start()
 
     log(f"\n{'='*60}")
     if DRY_RUN:
@@ -1095,7 +1554,9 @@ def run_burst():
     log(f"Detection: {BURST_WINDOW}s window, proportional threshold ({BURST_MULTIPLIER}x baseline, floor ${BURST_MIN_ABSOLUTE}, {BURST_BASELINE_WINDOW}s baseline)")
     log(f"Momentum logic: buy bursts → buy same side | sell bursts → buy opposite side")
     log(f"Entry: market buy (FAK, taker fee) after {BURST_CONFIRM_DELAY}s confirm delay")
-    log(f"Exit: limit sell at +{PROFIT_TARGET} (maker 0% fee) / -{STOP_LOSS} stop / {FLIP_TIMEOUT}s timeout")
+    log(f"Exit: dynamic TP/SL from book (defaults +{PROFIT_TARGET}/-{STOP_LOSS}) | wall min ${BOOK_WALL_MIN_SIZE}")
+    log(f"  Book TP: {'ON' if BOOK_TP_ENABLED else 'OFF'} (range {BOOK_TP_MIN}-{BOOK_TP_MAX}), Book SL: {'ON' if BOOK_SL_ENABLED else 'OFF'} (range {BOOK_SL_MIN}-{BOOK_SL_MAX})")
+    log(f"Timeout: {FLIP_TIMEOUT}s | Price via: WS cache → REST fallback")
     log(f"Entry price: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}, Burst min: {MIN_BURST_PRICE}")
     log(f"Cooldowns: {COOLDOWN_AFTER_ENTRY}s/token, {MARKET_COOLDOWN}s/market, {LOSS_LOCKOUT}s/loss-lockout")
     log(f"Time filter: skip markets with <{MIN_TIME_REMAINING}s remaining")
@@ -1136,10 +1597,17 @@ def run_burst():
 
             detector.update_subscriptions(all_tokens)
 
+            # Subscribe markets to user channel for fill detection
+            for m in markets:
+                cid = m.get("conditionId", "")
+                if cid:
+                    user_ws.subscribe_market(cid)
+
             # Status
             bal = get_usdc_balance()
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            ws_str = "🟢" if detector.connected else "🔴"
+            ws_mkt = "🟢" if detector.connected else "🔴"
+            ws_usr = "🟢" if user_ws.connected else "🔴"
             bal_str = f"${bal:.2f}" if bal else "?"
             dry_str = " 🧪 DRY" if DRY_RUN else ""
 
@@ -1148,7 +1616,7 @@ def run_burst():
 
             print(f"\r⏰ {now_str} | {n_pos} pos | bal {bal_str} | "
                   f"session ${session_pnl[0]:+.2f} | "
-                  f"WS {ws_str} ({detector.event_count} events, {detector.subscribed_count} subs)"
+                  f"mkt{ws_mkt} usr{ws_usr} ({detector.event_count} events, {detector.subscribed_count} subs)"
                   f"{dry_str}    ", end="", flush=True)
 
             time.sleep(5)
