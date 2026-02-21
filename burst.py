@@ -69,8 +69,8 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BUY_AMOUNT = 10              # Base bet in $
-MAX_BUY_AMOUNT = 30          # Cap per trade
+BUY_AMOUNT = 20              # Base bet in $ (was 10 — doubled for higher $/min)
+MAX_BUY_AMOUNT = 50          # Cap per trade (was 30)
 MIN_ENTRY_PRICE = 0.20       # Don't buy token below this
 MAX_ENTRY_PRICE = 0.90       # Don't buy token above this
 MIN_RR_RATIO = 1.0           # Skip trade if profit_target / stop_loss < this (risk/reward gate)
@@ -81,7 +81,7 @@ IMBALANCE_RATIO = 3.0        # Bid/ask depth ratio to trigger entry (bid_depth /
 IMBALANCE_DEPTH_RANGE = 0.10 # Look at orders within this range of best price
 IMBALANCE_MIN_DEPTH = 500    # Min bid depth ($) in range to consider (filters thin books)
 IMBALANCE_MAX_SPREAD = 0.03  # Skip if spread > this (too illiquid)
-WS_WARMUP_SECONDS = 15       # Don't fire signals for this many seconds after WS connects
+WS_WARMUP_SECONDS = 10       # Don't fire signals for this many seconds after WS connects (was 15)
                              # (first book snapshots are unreliable — stale state, not fresh signal)
 
 # Limit buy entry — GTC maker order (0% fee, fills atomically, no settlement blind spot)
@@ -89,7 +89,7 @@ LIMIT_BUY_OFFSET = 0.01      # Place buy at best_bid + this (near top of book)
 FILL_TIMEOUT = 10             # Seconds to wait for limit buy fill before cancelling
                               # (was 15 — fills after 6s tend to be adverse selection;
                               # good fills happen in 1-3s, book monitor cancels if signal fades)
-SCAN_COOLDOWN = 10.0          # Don't re-signal same token within this many seconds
+SCAN_COOLDOWN = 5.0           # Don't re-signal same token within this many seconds (was 10)
 
 # Burst detection — still used for trade-window tracking (background, does not trigger entries)
 BURST_WINDOW = 5.0
@@ -124,9 +124,9 @@ LIMIT_SELL_RETRY_DELAY = 2   # Seconds between retries (was 1 — need longer fo
 # Risk management
 MAX_CONCURRENT_POSITIONS = 3
 MIN_BALANCE_BUFFER = 5
-COOLDOWN_AFTER_ENTRY = 30.0  # Don't re-enter same TOKEN for N seconds (was 5)
-MARKET_COOLDOWN = 30.0       # Don't re-enter same MARKET (either side) for N seconds (was 60)
-LOSS_LOCKOUT = 120.0         # After stop-loss/timeout on a market, lock it out for this long
+COOLDOWN_AFTER_ENTRY = 15.0  # Don't re-enter same TOKEN for N seconds (was 30)
+MARKET_COOLDOWN = 15.0       # Don't re-enter same MARKET (either side) for N seconds (was 30)
+LOSS_LOCKOUT = 60.0          # After stop-loss/timeout on a market, lock it out for this long (was 120)
 MIN_TIME_REMAINING = 35      # Don't enter markets with less than this many seconds until resolution
                              # FLIP_TIMEOUT=20 + 2s confirm + 5s settle = ~27s needed
 
@@ -1638,9 +1638,9 @@ def run_burst():
                                     cur_bid_depth = sum(p * s for p, s in cur_bids if p >= cur_best_bid - IMBALANCE_DEPTH_RANGE)
                                     cur_ask_depth = sum(p * s for p, s in cur_asks if p <= cur_asks[0][0] + IMBALANCE_DEPTH_RANGE)
                                     cur_ratio = cur_bid_depth / cur_ask_depth if cur_ask_depth > 0 else 0
-                                    # If ratio dropped below 1.5x, imbalance is gone — cancel
-                                    if cur_ratio < 1.5:
-                                        log(f"  📉 Book imbalance gone ({cur_ratio:.1f}x < 1.5x) after {wait_elapsed:.1f}s — cancelling buy")
+                                    # If ratio dropped below 1.2x, imbalance is gone — cancel (was 1.5x)
+                                    if cur_ratio < 1.2:
+                                        log(f"  📉 Book imbalance gone ({cur_ratio:.1f}x < 1.2x) after {wait_elapsed:.1f}s — cancelling buy")
                                         cancelled_for_book = True
                                         break
 
