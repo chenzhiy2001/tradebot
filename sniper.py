@@ -110,7 +110,7 @@ MARKET_POLL_INTERVAL = 30     # Seconds between market discovery polls
 TICK_INTERVAL = 1.0           # Main loop tick interval
 
 # Reanalysis — runs every N completed windows
-REANALYSIS_INTERVAL = 10      # Run reanalysis after every N new completed windows
+REANALYSIS_INTERVAL = 1       # Run reanalysis after every completed window
 AUTO_TUNE_EDGE = True         # Auto-adjust MIN_EDGE based on observed calibration
 
 DRY_RUN = "--dry-run" in sys.argv
@@ -250,10 +250,9 @@ class BayesianEngine:
                 f"~{self._vol_per_sec * math.sqrt(300) * 100:.3f}% per 5min)")
 
     def add_completed_window(self, ret, duration_sec):
-        """Add a completed window's return to the dataset and recalibrate."""
+        """Add a completed window's return to the dataset."""
         with self._lock:
             self._window_returns.append((ret, duration_sec))
-            self._recompute_vol()
 
     def add_signal_outcome(self, signal, outcome):
         """Record a signal and its actual outcome for reanalysis.
@@ -763,7 +762,6 @@ class Sniper:
         self._trade_count = 0
         self._win_count = 0
         self._start_balance = get_usdc_balance()
-        self._windows_since_reanalysis = 0
         self._last_report = None
 
     def update_markets(self, markets):
@@ -933,18 +931,13 @@ class Sniper:
                     outcome = "UP" if w["close_price"] > w["open_price"] else "DOWN"
                     ret = (w["close_price"] - w["open_price"]) / w["open_price"]
 
-                    # Update volatility estimate
+                    # Record data for reanalysis
                     self.engine.add_completed_window(ret, duration)
-
-                    # Feed all recorded signals + actual outcome for reanalysis
                     for sig in w["signals"]:
                         self.engine.add_signal_outcome(sig, outcome)
 
-                    # Periodic reanalysis
-                    self._windows_since_reanalysis += 1
-                    if self._windows_since_reanalysis >= REANALYSIS_INTERVAL:
-                        self._run_reanalysis()
-                        self._windows_since_reanalysis = 0
+                    # Full reanalysis (σ, edge, timing, Kelly) every window
+                    self._run_reanalysis()
 
                     # Resolve trade PnL
                     if w["traded"] and w["trade_info"]:
@@ -1126,8 +1119,12 @@ class Sniper:
                 json.dump(trades, f, indent=2)
 
     def _run_reanalysis(self):
-        """Run periodic reanalysis and optionally auto-tune parameters."""
+        """Run full reanalysis: σ, edge, timing, Kelly. Called every window."""
         global MIN_EDGE, MIN_ELAPSED_PCT, BET_AMOUNT
+
+        # Recalibrate volatility first
+        self.engine._recompute_vol()
+
         report = self.engine.reanalyze()
         if not report:
             return
@@ -1307,8 +1304,7 @@ class Sniper:
             if key in r:
                 wr_str = f"WR={r[key]['win_rate']:.0%}(n={r[key]['n']})"
             lines.append(
-                f"  🔬 Last reanalysis: optimal_edge={opt:.2f} {wr_str} | "
-                f"next in {REANALYSIS_INTERVAL - self._windows_since_reanalysis} windows"
+                f"  🔬 Last reanalysis: optimal_edge={opt:.2f} {wr_str}"
             )
 
         return "\n".join(lines)
