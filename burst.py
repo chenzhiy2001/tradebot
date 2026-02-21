@@ -88,7 +88,8 @@ BURST_CONFIRM_DELAY = 2.0    # Wait after burst detection before entering (let b
 
 # Quick flip exit
 PROFIT_TARGET = 0.03         # Limit sell at entry + this (maker, 0% fee) (was 0.05, unreachable)
-STOP_LOSS = 0.05             # Cancel limit + market sell if price drops this much (reverted from 0.03 — tighter stop caused more false triggers without reducing slippage)
+STOP_LOSS = 0.03             # Cancel limit + market sell if price drops this much
+                             # (matched to PROFIT_TARGET for equal risk/reward — 64% WR profits at 1:1)
 FLIP_TIMEOUT = 30            # Max seconds to hold before force-selling (was 15)
 PRICE_CHECK_INTERVAL = 0.5   # How often to check price during flip
 LIMIT_SELL_RETRIES = 3       # Retry limit sell placement this many times
