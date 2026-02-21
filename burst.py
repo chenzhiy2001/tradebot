@@ -88,7 +88,7 @@ STOP_LOSS = 0.03             # Cancel limit + market sell if price drops this mu
 FLIP_TIMEOUT = 30            # Max seconds to hold before force-selling (was 15)
 PRICE_CHECK_INTERVAL = 0.5   # How often to check price during flip
 LIMIT_SELL_RETRIES = 3       # Retry limit sell placement this many times
-LIMIT_SELL_RETRY_DELAY = 3   # Seconds between retries
+LIMIT_SELL_RETRY_DELAY = 1   # Seconds between retries (reduced from 3 — runs in background now)
 
 # Risk management
 MAX_CONCURRENT_POSITIONS = 3
@@ -527,23 +527,28 @@ def quick_flip(token_id, entry_price, shares, pos_info):
         entry_fee_est = compute_taker_fee(shares, entry_price)
         log(f"    Entry fee: ~${entry_fee_est:.2f} | Net P&L if target hit: ~${target_gross_pnl - entry_fee_est:+.2f}")
 
-    # Step 1: Place GTC limit sell at profit target (maker = 0% fee)
-    # Retry multiple times since shares take time to settle on-chain
-    limit_placed = False
-    sell_shares = shares
-    if not DRY_RUN:
+    # Step 1: Place GTC limit sell at profit target in BACKGROUND THREAD
+    # This way monitoring starts immediately — no 3s blind spot for stop-loss
+    limit_state = {"placed": False, "sell_shares": shares, "abort": False}
+
+    def _place_limit_sell():
         for attempt in range(LIMIT_SELL_RETRIES):
+            if limit_state["abort"]:
+                return
             try:
                 time.sleep(LIMIT_SELL_RETRY_DELAY)  # Wait for shares to settle
-                # Approve allowance for this token before selling
+                if limit_state["abort"]:
+                    return
                 actual = get_actual_share_balance(token_id)
                 if actual is None or actual < 1:
                     log(f"  ⏳ Waiting for shares (attempt {attempt+1}/{LIMIT_SELL_RETRIES}, balance: {actual})")
                     continue
                 sell_shares = math.floor(actual * 100) / 100
-                if sell_shares < 5:  # Polymarket min order size is 5 shares
+                if sell_shares < 5:
                     log(f"  ⚠ Shares {sell_shares:.1f} below min order size 5 — will use market sell")
                     break
+                if limit_state["abort"]:
+                    return
                 sell_order = OrderArgs(
                     token_id=token_id,
                     price=target_price,
@@ -552,18 +557,20 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                 )
                 signed_sell = client.create_order(sell_order)
                 resp = client.post_order(signed_sell, OrderType.GTC)
-                limit_placed = True
+                limit_state["placed"] = True
+                limit_state["sell_shares"] = sell_shares
                 log(f"  ✓ Limit sell placed: {sell_shares:.0f}sh at {target_price:.2f} (GTC, 0% fee)")
-                break
+                return
             except Exception as e:
                 log(f"  ⚠ Limit sell attempt {attempt+1}/{LIMIT_SELL_RETRIES} failed: {e}")
-        if not limit_placed:
+        if not limit_state["abort"]:
             log(f"  ⚠ All limit sell attempts failed — will use market sell on exit")
-    else:
-        limit_placed = True  # Pretend for dry run
-        sell_shares = shares
 
-    # Step 2: Monitor for stop loss / timeout / limit fill
+    if not DRY_RUN:
+        threading.Thread(target=_place_limit_sell, daemon=True).start()
+
+    # Step 2: Monitor IMMEDIATELY for stop loss / timeout / limit fill
+    # (no more 3s blind spot waiting for limit sell placement)
     exit_reason = "timeout"
     exit_price = entry_price
     exit_is_maker = False
@@ -577,7 +584,7 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             continue
 
         # Check if limit order filled (shares dropped to ~0)
-        if limit_placed and not DRY_RUN:
+        if limit_state["placed"] and not DRY_RUN:
             remaining = get_actual_share_balance(token_id)
             if remaining is not None and remaining < 0.5:
                 exit_reason = "profit"
@@ -602,6 +609,10 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             break
 
         time.sleep(PRICE_CHECK_INTERVAL)
+
+    # Signal background limit sell thread to stop
+    limit_state["abort"] = True
+    limit_placed = limit_state["placed"]
 
     # Step 3: Execute exit
     pnl = 0.0
