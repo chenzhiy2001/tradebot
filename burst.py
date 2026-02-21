@@ -1356,6 +1356,7 @@ def run_burst():
         # Check balance
         bal = get_usdc_balance()
         if bal is None or bal < MIN_BALANCE_BUFFER + BUY_AMOUNT:
+            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — insufficient balance (${bal or 0:.2f}, need ${MIN_BALANCE_BUFFER + BUY_AMOUNT:.0f})")
             return
 
         # Scale bet proportional to burst size relative to the dynamic threshold
