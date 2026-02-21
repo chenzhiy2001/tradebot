@@ -98,7 +98,7 @@ SESSION_STOP_LOSS_PCT = 0.30
 COOLDOWN_AFTER_ENTRY = 30.0  # Don't re-enter same TOKEN for N seconds (was 5)
 MARKET_COOLDOWN = 30.0       # Don't re-enter same MARKET (either side) for N seconds (was 60)
 LOSS_LOCKOUT = 120.0         # After stop-loss/timeout on a market, lock it out for this long
-MIN_TIME_REMAINING = 180     # Don't enter markets with less than this many seconds until resolution
+MIN_TIME_REMAINING = 120     # Don't enter markets with less than this many seconds until resolution
 
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
