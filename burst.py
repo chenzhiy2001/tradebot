@@ -898,7 +898,8 @@ class UserChannelWS:
         if not asset_id:
             return
 
-        if status == "CONFIRMED":
+        # Fire on MATCHED (immediate) and CONFIRMED (on-chain) — catch fills ASAP
+        if status in ("MATCHED", "CONFIRMED"):
             trade_info = {
                 "asset_id": asset_id,
                 "side": data.get("side", ""),
@@ -1105,6 +1106,16 @@ def quick_flip(token_id, entry_price, shares, pos_info):
         remaining = FLIP_TIMEOUT - elapsed
 
         if remaining <= 0:
+            # Before declaring timeout, check if limit order silently filled
+            # (WS event missed, or filled between REST checks)
+            if limit_state["placed"] and not DRY_RUN:
+                remaining_shares = get_actual_share_balance(token_id)
+                if remaining_shares is not None and remaining_shares < 0.5:
+                    exit_reason = "profit"
+                    exit_price = target_price
+                    exit_is_maker = True
+                    log(f"  ✓ Limit fill detected at timeout (shares={remaining_shares:.3f})")
+                    break
             exit_reason = "timeout"
             exit_price = get_price(token_id, side=SELL) or entry_price
             break
@@ -1241,7 +1252,18 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                         log(f"  ✗ Sell failed after 3 attempts: {last_err}")
                         log(f"  ⚠ {sell_shares:.0f}sh ORPHANED — unrealized P&L: ${pnl:+.2f}")
                 else:
-                    log(f"  ⚠ No shares to sell (balance: {actual})")
+                    # Shares already gone — if limit was placed, it filled
+                    if limit_placed:
+                        exit_reason = "profit"
+                        exit_price = target_price
+                        exit_is_maker = True
+                        exit_fee = 0.0
+                        gross_pnl = (target_price - entry_price) * shares
+                        net_pnl = gross_pnl - entry_fee
+                        pnl = net_pnl
+                        log(f"  ✓ Limit already filled (detected on exit): {target_price:.2f} | Net P&L: ${pnl:+.2f}")
+                    else:
+                        log(f"  ⚠ No shares to sell and no limit placed (balance: {actual})")
             except Exception as e:
                 pnl = net_pnl  # Record the loss even if sell fails
                 log(f"  ✗ Flip sell failed: {e}")
