@@ -87,8 +87,13 @@ MIN_BURST_PRICE = 0.45       # Burst side must be >= this to ride (ensures meani
 CRYPTO_FEE_RATE = 0.25       # feeRate for 5m/15m crypto markets
 CRYPTO_FEE_EXPONENT = 2      # exponent for 5m/15m crypto markets
 
-# Entry confirmation
-BURST_CONFIRM_DELAY = 2.0    # Wait after burst detection before entering (let burst settle)
+# Entry confirmation — pullback entry
+# Instead of buying at the burst peak, wait for a pullback.
+# The burst signals direction; we enter at a better price after the initial spike.
+BURST_CONFIRM_DELAY = 1.0    # Minimum wait before checking entry conditions
+PULLBACK_WINDOW = 5.0        # Max seconds to wait for pullback after confirm delay
+MAX_ENTRY_SPREAD = 0.05      # Skip market if bid-ask spread > this (too illiquid/volatile)
+MIN_PULLBACK = 0.01          # Price must pull back at least this from peak ask before entry
 
 # Quick flip exit — defaults (overridden by book analysis when available)
 PROFIT_TARGET = 0.05         # Default limit sell at entry + this (maker, 0% fee)
@@ -1359,7 +1364,7 @@ def run_burst():
         baseline_avg = info.get('_baseline_avg', 0)
         log(f"\n🎯 RIDE BURST: {market} — {fade_reason}")
         log(f"  Burst: ${net_volume:.0f} {direction} on {burst_side} (price {burst_price:.2f}) | thresh ${dyn_thresh:.0f} (baseline ${baseline_avg:.0f})")
-        log(f"  Will buy {fade_side} after {BURST_CONFIRM_DELAY}s confirm (ask {price:.2f}), Bet: ${amount:.0f} ({burst_ratio:.1f}x burst)")
+        log(f"  Will buy {fade_side} — waiting for pullback (ask {price:.2f}), Bet: ${amount:.0f} ({burst_ratio:.1f}x burst)")
 
         if DRY_RUN:
             # Simulate: assume market buy fills at ask price after confirm delay
@@ -1406,36 +1411,90 @@ def run_burst():
 
         def do_buy_and_flip():
             try:
-                # === CONFIRMATION DELAY ===
-                # Wait for burst to settle. Prevents buying into the middle of
-                # an active price cascade — the #1 source of instant stop-losses.
-                # With GTC limit orders, the order sat on the book and got adversely
-                # filled as the price crashed through. With this delay + FAK market
-                # buy, we enter at the CURRENT price after the burst has settled.
+                # === PULLBACK ENTRY ===
+                # Instead of buying at the burst peak, wait for the initial spike
+                # to pull back. This gives us a better entry price and confirms
+                # the move isn't just a momentary spike.
+                #
+                # Phase 1: Wait BURST_CONFIRM_DELAY (minimum settling time)
+                # Phase 2: Monitor for up to PULLBACK_WINDOW seconds for:
+                #   - Spread to narrow below MAX_ENTRY_SPREAD (market is tradeable)
+                #   - Price has pulled back from peak (better entry)
+                #   - Bid is above our planned stop (not entering a crash)
+
+                original_ask = price  # from closure: ask at burst detection time
+                peak_ask = original_ask
+                entry_start = time.time()
+
+                # Phase 1: minimum settling time
                 if BURST_CONFIRM_DELAY > 0:
                     time.sleep(BURST_CONFIRM_DELAY)
 
-                # Re-check buy token price after delay
-                current_ask = get_price(fade_token, side=BUY)
-                if current_ask <= 0:
-                    log(f"  ⚠ No price available after confirm delay — skipping")
+                # Phase 2: wait for pullback + good conditions
+                current_ask = None
+                current_bid = None
+                entry_spread = None
+                entry_ok = False
+                pullback_deadline = entry_start + BURST_CONFIRM_DELAY + PULLBACK_WINDOW
+
+                while time.time() < pullback_deadline:
+                    current_ask = get_price(fade_token, side=BUY)
+                    current_bid = get_price(fade_token, side=SELL)
+                    if current_ask <= 0 or current_bid <= 0:
+                        time.sleep(0.3)
+                        continue
+
+                    # Track peak ask (it may still be rising)
+                    if current_ask > peak_ask:
+                        peak_ask = current_ask
+
+                    entry_spread = round(current_ask - current_bid, 4)
+
+                    # Gate 1: spread must be reasonable
+                    if entry_spread > MAX_ENTRY_SPREAD:
+                        time.sleep(0.3)
+                        continue
+
+                    # Gate 2: price must have pulled back from peak
+                    pullback = peak_ask - current_ask
+                    if pullback < MIN_PULLBACK:
+                        time.sleep(0.3)
+                        continue
+
+                    # Gate 3: price still in valid range
+                    if current_ask < MIN_ENTRY_PRICE or current_ask > MAX_ENTRY_PRICE:
+                        time.sleep(0.3)
+                        continue
+
+                    # Gate 4: momentum hasn't fully reversed (price not too far below original)
+                    if current_ask < original_ask - STOP_LOSS * 2:
+                        break  # Too far gone — abort
+
+                    # Gate 5: bid is above planned stop (not entering a crash)
+                    # Rough stop estimate: bid - SL_default
+                    if current_bid < current_ask - STOP_LOSS * 2 - MAX_ENTRY_SPREAD:
+                        time.sleep(0.3)
+                        continue
+
+                    # All gates passed!
+                    entry_ok = True
+                    break
+
+                if not entry_ok:
+                    reason = "pullback timeout"
+                    if current_ask is not None and current_ask < original_ask - STOP_LOSS * 2:
+                        reason = f"reversed too far (ask {original_ask:.2f}→{current_ask:.2f})"
+                    elif entry_spread is not None and entry_spread > MAX_ENTRY_SPREAD:
+                        reason = f"spread too wide ({entry_spread:.2f})"
+                    elif current_ask is not None:
+                        pullback = peak_ask - current_ask
+                        reason = f"no pullback (peak {peak_ask:.2f}, ask {current_ask:.2f}, pb {pullback:.2f}/{MIN_PULLBACK:.2f})"
+                    log(f"  ⚠ Entry skipped: {reason} after {time.time()-entry_start:.1f}s")
                     with positions_lock:
                         positions.pop(fade_token, None)
                     return
 
-                if current_ask < MIN_ENTRY_PRICE or current_ask > MAX_ENTRY_PRICE:
-                    log(f"  ⚠ Post-delay ask {current_ask:.2f} out of range [{MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}] — skipping")
-                    with positions_lock:
-                        positions.pop(fade_token, None)
-                    return
-
-                # Check if price dropped too far during delay (momentum fizzled)
-                original_ask = price  # from closure: ask at burst detection time
-                if current_ask < original_ask - STOP_LOSS:
-                    log(f"  ⚠ Price dropped {original_ask - current_ask:.2f} during confirm (ask {original_ask:.2f}→{current_ask:.2f}) — skipping")
-                    with positions_lock:
-                        positions.pop(fade_token, None)
-                    return
+                log(f"  ✓ Pullback entry: peak {peak_ask:.2f} → ask {current_ask:.2f} (pb {peak_ask-current_ask:.2f}), bid {current_bid:.2f}, spread {entry_spread:.2f}")
 
                 # Re-check balance
                 bal_now = get_usdc_balance()
@@ -1533,8 +1592,13 @@ def run_burst():
                     "shares": buy_shares,
                     "burst_net": net_volume,
                     "entry_is_maker": False,
-                    "confirm_delay": BURST_CONFIRM_DELAY,
-                    "original_ask": price,
+                    "confirm_delay": round(time.time() - entry_start, 2),
+                    "original_ask": original_ask,
+                    "peak_ask": peak_ask,
+                    "entry_ask": current_ask,
+                    "entry_bid": current_bid,
+                    "entry_spread": entry_spread,
+                    "pullback": round(peak_ask - current_ask, 4),
                     "response": str(resp),
                 }
                 with open(TRADE_LOG, "a") as f:
@@ -1580,7 +1644,7 @@ def run_burst():
     log(f"� MOMENTUM burst bot (ride-the-burst)")
     log(f"Detection: {BURST_WINDOW}s window, proportional threshold ({BURST_MULTIPLIER}x baseline, floor ${BURST_MIN_ABSOLUTE}, {BURST_BASELINE_WINDOW}s baseline)")
     log(f"Momentum logic: buy bursts → buy same side | sell bursts → buy opposite side")
-    log(f"Entry: market buy (FAK, taker fee) after {BURST_CONFIRM_DELAY}s confirm delay")
+    log(f"Entry: pullback entry ({BURST_CONFIRM_DELAY}s settle + {PULLBACK_WINDOW}s window, spread<{MAX_ENTRY_SPREAD}, pb>={MIN_PULLBACK})")
     log(f"Exit: dynamic TP/SL from book (defaults +{PROFIT_TARGET}/-{STOP_LOSS}) | wall min ${BOOK_WALL_MIN_SIZE}")
     log(f"  Book TP: {'ON' if BOOK_TP_ENABLED else 'OFF'} (range {BOOK_TP_MIN}-{BOOK_TP_MAX}), Book SL: {'ON' if BOOK_SL_ENABLED else 'OFF'} (range {BOOK_SL_MIN}-{BOOK_SL_MAX})")
     log(f"Timeout: {FLIP_TIMEOUT}s | Monitor: event-driven (WS price callbacks), REST fallback 5s")
