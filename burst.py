@@ -76,10 +76,13 @@ MAX_ENTRY_PRICE = 0.90       # Don't buy token above this
 MIN_RR_RATIO = 1.0           # Skip trade if profit_target / stop_loss < this (risk/reward gate)
 
 # Book imbalance signal — LEADING indicator (detects pressure before the move)
-IMBALANCE_RATIO = 2.0        # Bid/ask depth ratio to trigger entry (bid_depth / ask_depth)
+IMBALANCE_RATIO = 3.0        # Bid/ask depth ratio to trigger entry (bid_depth / ask_depth)
+                             # 2.0x was noise (3/3 trades lost); 3.0x requires strong imbalance
 IMBALANCE_DEPTH_RANGE = 0.10 # Look at orders within this range of best price
-IMBALANCE_MIN_DEPTH = 300    # Min bid depth ($) in range to consider (filters thin books)
-IMBALANCE_MAX_SPREAD = 0.04  # Skip if spread > this (too illiquid)
+IMBALANCE_MIN_DEPTH = 500    # Min bid depth ($) in range to consider (filters thin books)
+IMBALANCE_MAX_SPREAD = 0.03  # Skip if spread > this (too illiquid)
+WS_WARMUP_SECONDS = 15       # Don't fire signals for this many seconds after WS connects
+                             # (first book snapshots are unreliable — stale state, not fresh signal)
 
 # Limit buy entry — GTC maker order (0% fee, fills atomically, no settlement blind spot)
 LIMIT_BUY_OFFSET = 0.01      # Place buy at best_bid + this (near top of book)
@@ -334,6 +337,7 @@ class BurstDetector:
                     WS_MARKET_URL, close_timeout=5, open_timeout=10
                 ) as ws:
                     self._ws_connected = True
+                    self._ws_connect_time = time.time()
                     self._active = set()
                     log("  🔌 Market WebSocket connected")
 
@@ -637,6 +641,11 @@ class BurstDetector:
         Called on every book/price update. Fires callback if imbalance
         exceeds threshold and cooldowns are clear."""
         now = time.time()
+
+        # Warmup guard: don't fire signals right after WS connects
+        # (initial book snapshots are stale state, not fresh signals)
+        if hasattr(self, '_ws_connect_time') and now - self._ws_connect_time < WS_WARMUP_SECONDS:
+            return
 
         with self._lock:
             book = self._books.get(asset_id)
@@ -1566,6 +1575,51 @@ def run_burst():
 
                 # Cancel any remaining open orders for this token (partial fills leave resting qty)
                 cancel_all_orders_for_token(token_id)
+
+                # === POST-FILL SANITY CHECK ===
+                # Our limit buy fills when someone SELLS into it — meaning price
+                # may already be crashing through our level. Check current bid:
+                # if it's already at or below our stop-loss level, dump immediately
+                # instead of entering a doomed position.
+                current_bid_now = get_price(token_id, side=SELL)
+                if current_bid_now > 0:
+                    # Quick SL estimate: fill_price - STOP_LOSS (or book SL)
+                    quick_sl = STOP_LOSS
+                    if _detector_ref and BOOK_SL_ENABLED:
+                        post_analysis = _detector_ref.analyze_book(token_id, entry_price=fill_price)
+                        if post_analysis:
+                            quick_sl = post_analysis["suggested_sl"]
+                    abort_price = fill_price - quick_sl
+                    if current_bid_now <= abort_price:
+                        log(f"  ⚠ Post-fill abort: bid {current_bid_now:.2f} already at/below SL {abort_price:.2f} — dumping")
+                        try:
+                            dump_mo = MarketOrderArgs(token_id=token_id, amount=buy_shares, side=SELL, order_type=OrderType.FAK)
+                            signed_dump = client.create_market_order(dump_mo)
+                            client.post_order(signed_dump, OrderType.FAK)
+                            dump_price = current_bid_now
+                            dump_pnl = (dump_price - fill_price) * buy_shares
+                            log(f"  🚫 Dumped {buy_shares:.0f}sh at ~{dump_price:.2f} | PnL: ${dump_pnl:+.2f}")
+                            session_pnl[0] += dump_pnl
+                            record = {
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "action": "IMBALANCE_BUY",
+                                "market": market, "buy_side": buy_side, "token": token_id,
+                                "limit_price": limit_price, "fill_price": fill_price,
+                                "best_bid": best_bid, "best_ask": best_ask,
+                                "bid_depth": bid_depth, "ask_depth": ask_depth,
+                                "ratio": ratio, "amount": amount, "shares": buy_shares,
+                                "entry_is_maker": True, "fill_time": round(elapsed, 2),
+                                "aborted": True, "abort_bid": current_bid_now,
+                            }
+                            with open(TRADE_LOG, "a") as f:
+                                f.write(json.dumps(record) + "\n")
+                        except Exception as e:
+                            log(f"  ⚠ Abort dump failed: {e}")
+                        with positions_lock:
+                            positions.pop(token_id, None)
+                        if True:  # always lock out after adverse fill
+                            detector.set_loss_lockout(market)
+                        return
 
                 record = {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
