@@ -69,7 +69,7 @@ BURST_WINDOW = 5.0           # Seconds — detect bursts within this window
 BURST_THRESHOLD = 500        # $ net volume in the window to trigger (was 200, too low)
 MIN_ENTRY_PRICE = 0.08       # Don't buy fade token below this (dead side)
 MAX_ENTRY_PRICE = 0.55       # Don't buy fade token above this (too expensive for contrarian)
-MIN_BURST_PRICE = 0.60       # Burst side must be >= this to fade (strong signal only)
+MIN_BURST_PRICE = 0.55       # Burst side must be >= this to fade (was 0.60, slightly relaxed)
 
 # Fees — real Polymarket formula: fee = C * feeRate * (p * (1-p))^exponent
 # For 5m/15m crypto: feeRate=0.25, exponent=2. Max ~1.56% at p=0.50.
@@ -91,11 +91,11 @@ LIMIT_SELL_RETRIES = 3       # Retry limit sell placement this many times
 LIMIT_SELL_RETRY_DELAY = 3   # Seconds between retries
 
 # Risk management
-MAX_CONCURRENT_POSITIONS = 2
+MAX_CONCURRENT_POSITIONS = 100
 MIN_BALANCE_BUFFER = 5
 SESSION_STOP_LOSS_PCT = 0.30
 COOLDOWN_AFTER_ENTRY = 30.0  # Don't re-enter same TOKEN for N seconds (was 5)
-MARKET_COOLDOWN = 60.0       # Don't re-enter same MARKET (either side) for N seconds
+MARKET_COOLDOWN = 30.0       # Don't re-enter same MARKET (either side) for N seconds (was 60)
 
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
@@ -826,22 +826,41 @@ def run_burst():
                             cancel_all_orders_for_token(fade_token)
                     except Exception:
                         pass
-                    # Check if partially filled
-                    actual = get_actual_share_balance(fade_token)
-                    if actual is not None and actual >= 5:
-                        buy_shares = math.floor(actual * 100) / 100
-                        filled = True
-                        log(f"  ⏳ Partial fill: {buy_shares:.0f}sh (continuing with partial)")
-                    else:
-                        # Dump any dust shares
-                        if actual and actual > 0:
+
+                    # CRITICAL: Wait for settlement then re-check balance.
+                    # The CLOB may have matched our order but tokens haven't
+                    # minted on-chain yet. Without this wait, we get orphan
+                    # positions — filled shares with no exit management.
+                    for settle_attempt in range(3):
+                        time.sleep(2)  # Wait for on-chain settlement
+                        actual = get_actual_share_balance(fade_token)
+                        if actual is not None and actual >= 5:
+                            buy_shares = math.floor(actual * 100) / 100
+                            filled = True
+                            log(f"  ⏳ Post-cancel fill detected (attempt {settle_attempt+1}): {buy_shares:.0f}sh (order was already matched)")
+                            break
+                        elif actual is not None and actual > 0:
+                            log(f"  ⏳ Settlement check {settle_attempt+1}/3: balance {actual:.2f} (waiting...)")
+
+                    if not filled:
+                        # Final check one more time
+                        actual = get_actual_share_balance(fade_token)
+                        if actual is not None and actual >= 5:
+                            buy_shares = math.floor(actual * 100) / 100
+                            filled = True
+                            log(f"  ⏳ Late fill detected: {buy_shares:.0f}sh")
+                        elif actual and actual > 0:
+                            # Dump dust shares
                             try:
                                 mo = MarketOrderArgs(token_id=fade_token, amount=actual, side=SELL, order_type=OrderType.FAK)
                                 signed_dump = client.create_market_order(mo)
                                 client.post_order(signed_dump, OrderType.FAK)
+                                log(f"  🧹 Dumped {actual:.1f} dust shares")
                             except Exception:
                                 pass
-                        log(f"  ⏳ Limit buy not filled in {LIMIT_BUY_TIMEOUT}s — cancelled, skipping trade")
+
+                    if not filled:
+                        log(f"  ⏳ Limit buy not filled in {LIMIT_BUY_TIMEOUT}s + settlement checks — cancelled, skipping trade")
                         with positions_lock:
                             positions.pop(fade_token, None)
                         return
