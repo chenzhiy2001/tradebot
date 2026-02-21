@@ -90,9 +90,10 @@ LIMIT_BUY_CHECK_INTERVAL = 0.5  # How often to check if limit buy filled
 BURST_CONFIRM_DELAY = 2.0    # Wait after burst detection before entering (let burst settle)
 
 # Quick flip exit
-PROFIT_TARGET = 0.03         # Limit sell at entry + this (maker, 0% fee) (was 0.05, unreachable)
+PROFIT_TARGET = 0.05         # Limit sell at entry + this (maker, 0% fee)
+                             # (widened from 0.03 — at 0.03 the fee asymmetry requires 68% WR to
+                             #  break even; at 0.05 win=$0.76 vs loss=$0.85, breakeven drops to 53%)
 STOP_LOSS = 0.03             # Cancel limit + market sell if price drops this much
-                             # (matched to PROFIT_TARGET for equal risk/reward — 64% WR profits at 1:1)
 FLIP_TIMEOUT = 15            # Max seconds to hold before force-selling (was 30 — 15-31s bucket
                              # was 38% WR/-$7.19; 5-15s bucket was 92% WR/+$10.98)
 PRICE_CHECK_INTERVAL = 0.2   # How often to check price during flip (was 0.5 — too slow, stop-loss slipped 0.09 on 5m markets)
@@ -946,70 +947,16 @@ def run_burst():
 
                 # Wait for on-chain settlement with retries
                 # FAK fills are matched on CLOB but shares need minting on-chain
-                # ALSO monitor price during wait — abort early if price already
-                # crashed below stop (prevents 0.3s instant-death trades where
-                # price moves during the settlement delay)
                 actual = None
-                early_abort = False
                 for settle_attempt in range(5):  # Up to ~8s total wait
                     wait = 1.0 if settle_attempt < 2 else 2.0
                     time.sleep(wait)
-
-                    # Check price during settlement — early abort if already below stop
-                    settle_price = get_price(fade_token, side=SELL)
-                    if settle_price > 0 and settle_price <= current_ask - STOP_LOSS:
-                        log(f"  ⚠ Price crashed to {settle_price:.2f} during settlement (stop={current_ask - STOP_LOSS:.2f}) — will abort")
-                        early_abort = True
 
                     actual = get_actual_share_balance(fade_token)
                     if actual is not None and actual >= 5:
                         break
                     if settle_attempt < 4:
                         log(f"  ⏳ Settlement check {settle_attempt+1}/5: balance {actual} (waiting...)")
-
-                # If price crashed during settlement, dump shares immediately
-                if early_abort and actual is not None and actual >= 5:
-                    buy_shares = math.floor(actual * 100) / 100
-                    log(f"  ⚠ Early abort: dumping {buy_shares:.0f}sh (price crashed during settlement)")
-                    try:
-                        dump_mo = MarketOrderArgs(token_id=fade_token, amount=buy_shares, side=SELL, order_type=OrderType.FAK)
-                        signed_dump = client.create_market_order(dump_mo)
-                        client.post_order(signed_dump, OrderType.FAK)
-                        sell_price = get_price(fade_token, side=SELL)
-                        net_pnl = (sell_price - current_ask) * buy_shares - compute_taker_fee(buy_shares, current_ask) - compute_taker_fee(buy_shares, sell_price)
-                        log(f"  ✓ Early abort sell: ~{buy_shares:.0f}sh at ~{sell_price:.2f} | Net P&L: ${net_pnl:+.2f}")
-                        session_pnl[0] += net_pnl
-                        record = {
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "action": "MOMENTUM_BUY", "market": market, "burst_side": burst_side,
-                            "fade_side": fade_side, "burst_direction": direction,
-                            "fade_reason": fade_reason, "token": fade_token,
-                            "burst_token": token_id, "ask_price": current_ask,
-                            "fill_price": current_ask, "burst_price": burst_price,
-                            "amount": buy_amount, "shares": buy_shares,
-                            "burst_net": net_volume, "entry_is_maker": False,
-                            "confirm_delay": BURST_CONFIRM_DELAY, "original_ask": price,
-                            "response": str(resp),
-                        }
-                        with open(TRADE_LOG, "a") as f:
-                            f.write(json.dumps(record) + "\n")
-                        record2 = {
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "action": "FLIP_EARLY_ABORT", "market": market,
-                            "side": fade_side, "token": fade_token,
-                            "entry_price": current_ask, "exit_price": sell_price,
-                            "shares": buy_shares, "net_pnl": round(net_pnl, 4),
-                            "entry_is_maker": False, "exit_is_maker": False,
-                            "elapsed": 0.0,
-                        }
-                        with open(TRADE_LOG, "a") as f:
-                            f.write(json.dumps(record2) + "\n")
-                    except Exception as e:
-                        log(f"  ✗ Early abort sell failed: {e}")
-                    detector.set_loss_lockout(market)
-                    with positions_lock:
-                        positions.pop(fade_token, None)
-                    return
 
                 if actual is None or actual < 5:
                     log(f"  ⚠ FAK buy failed to fill (balance: {actual}, resp: {resp_status}) — skipping")
