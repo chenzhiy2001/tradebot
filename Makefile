@@ -62,6 +62,11 @@ burst_logs_backup:
 	zip -j -9 archives/burst_logs_$$(date +%Y%m%d_%H%M%S).zip burst_log.txt burst_trades.json
 	rm -f burst_log.txt burst_trades.json
 
+sniper_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/sniper_logs_$$(date +%Y%m%d_%H%M%S).zip sniper_data.jsonl sniper_trades.json sniper_log.txt
+	rm -f sniper_data.jsonl sniper_trades.json sniper_log.txt
+
 # git add . and git commit -m "backup logs" and git push"
 git_logs_backup:
 	git add .
