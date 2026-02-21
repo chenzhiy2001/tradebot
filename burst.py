@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-Burst Bot — CONTRARIAN (fade-the-burst) strategy on Polymarket crypto markets.
+Burst Bot — MOMENTUM (ride-the-burst) strategy on Polymarket crypto markets.
 
 Strategy:
   Monitor real-time WebSocket trade feed for sudden bursts of buying or selling.
-  When a burst is detected, buy the OPPOSITE side — fading the herd.
-  Rationale: bursts are typically late retail piling in after the move;
-  the price is more likely to revert than continue.
+  When a burst is detected, buy the SAME side — riding the momentum.
+  Rationale: large bursts signal informed flow / real price discovery;
+  the move is more likely to continue than revert.
 
 Signals:
-  1. Buy burst on token X → buy the opposite token (fade the buy)
-  2. Sell burst on token X → buy token X itself (fade the sell / oversold bounce)
+  1. Buy burst on token X → buy token X itself (ride the momentum)
+  2. Sell burst on token X → buy the opposite token (that side is winning)
 
 Detection:
   - Sliding 5-second window of trades per token
-  - Buy burst = net buy $ exceeds BURST_THRESHOLD → fade it
-  - Sell burst = net sell $ exceeds BURST_THRESHOLD → fade it
-  - Only fade when burst side is elevated (>=50¢) — ensures meaningful signal
+  - Buy burst = net buy $ exceeds BURST_THRESHOLD → ride it
+  - Sell burst = net sell $ exceeds BURST_THRESHOLD → ride it
+  - Only ride when burst side is elevated (>=45¢) — ensures meaningful signal
 
 Exit (quick flip):
   - Place GTC limit sell at entry + PROFIT_TARGET immediately (maker = 0% fee)
@@ -70,10 +70,10 @@ MAX_BUY_AMOUNT = 30          # Cap per trade regardless of burst size
 BURST_WINDOW = 5.0           # Seconds — detect bursts within this window
 BURST_THRESHOLD = 700        # $ net volume in the window to trigger (raised from 500 — 
                              # $500-600 bursts had 54% WR and lost money; $800+ had 83% WR)
-MIN_ENTRY_PRICE = 0.20       # Don't buy fade token below this (was 0.08 — at low prices $10 buys
+MIN_ENTRY_PRICE = 0.20       # Don't buy token below this (at low prices $10 buys
                              # 50-111 shares, so even a clean 0.03 stop = $1.50-$3.33 loss)
-MAX_ENTRY_PRICE = 0.55       # Don't buy fade token above this (too expensive for contrarian)
-MIN_BURST_PRICE = 0.45       # Burst side must be >= this to fade (lowered from 0.55 — was blocking valid 50/50 zone trades)
+MAX_ENTRY_PRICE = 0.75       # Don't buy token above this (too expensive, limited upside)
+MIN_BURST_PRICE = 0.45       # Burst side must be >= this to ride (ensures meaningful signal)
 
 # Fees — real Polymarket formula: fee = C * feeRate * (p * (1-p))^exponent
 # For 5m/15m crypto: feeRate=0.25, exponent=2. Max ~1.56% at p=0.50.
@@ -753,9 +753,9 @@ def run_burst():
     session_pnl = [0.0]   # mutable container for thread access
 
     def on_burst(token_id, net_volume, direction, info):
-        """Called from WS thread when a burst is detected — CONTRARIAN: fade the burst.
-        direction='BUY'  → heavy buying on this token → buy OPPOSITE token
-        direction='SELL' → heavy selling on this token → buy THIS token (oversold)
+        """Called from WS thread when a burst is detected — MOMENTUM: ride the burst.
+        direction='BUY'  → heavy buying on this token → buy THIS token (ride it)
+        direction='SELL' → heavy selling on this token → buy OPPOSITE token (that side is winning)
         """
         if not info:
             return
@@ -784,40 +784,40 @@ def run_burst():
                 log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — only {remaining:.0f}s left (need {MIN_TIME_REMAINING}s)")
                 return
 
-        # CONTRARIAN LOGIC: determine which token to buy (the fade token)
+        # MOMENTUM LOGIC: determine which token to buy (ride the burst)
         if direction == "BUY":
-            # Heavy buying on this token → buy the OPPOSITE token
+            # Heavy buying on this token → buy THIS token (ride the momentum)
+            fade_token = token_id
+            fade_side = burst_side
+            fade_reason = f"ride {burst_side} buying"
+        else:
+            # Heavy selling on this token → buy the OPPOSITE token (that side is winning)
             if burst_side == "UP":
                 fade_token = tokens[1]   # buy DOWN
                 fade_side = "DOWN"
             else:
                 fade_token = tokens[0]   # buy UP
                 fade_side = "UP"
-            fade_reason = f"fade {burst_side} buying"
-        else:
-            # Heavy selling on this token → buy THIS token (oversold bounce)
-            fade_token = token_id
-            fade_side = burst_side
-            fade_reason = f"fade {burst_side} selling"
+            fade_reason = f"ride vs {burst_side} selling"
 
         # Check burst side price — must be elevated enough to be meaningful
         burst_price = get_price(token_id, side=BUY)
         if direction == "BUY" and burst_price < MIN_BURST_PRICE:
-            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — burst price {burst_price:.2f} too low to fade")
+            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — burst price {burst_price:.2f} too low to ride")
             return
         if direction == "SELL" and burst_price > (1 - MIN_BURST_PRICE):
-            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — burst price {burst_price:.2f} too high to fade")
+            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — burst price {burst_price:.2f} too high to ride")
             return
 
-        # Get the FADE token's price (the one we're buying)
+        # Get the BUY token's price (the one we're buying)
         price = get_price(fade_token, side=BUY)
         if price <= 0 or price >= 1:
             return
         if price < MIN_ENTRY_PRICE:
-            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — fade {fade_side} at {price:.2f} too cheap")
+            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — {fade_side} at {price:.2f} too cheap")
             return
         if price > MAX_ENTRY_PRICE:
-            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — fade {fade_side} at {price:.2f} too expensive")
+            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — {fade_side} at {price:.2f} too expensive")
             return
 
         # Check balance
@@ -830,7 +830,7 @@ def run_burst():
         scaled_amount = round(BUY_AMOUNT * burst_multiplier, 2)
         amount = min(scaled_amount, MAX_BUY_AMOUNT, bal - MIN_BALANCE_BUFFER)
 
-        log(f"\n🔄 FADE BURST: {market} — {fade_reason}")
+        log(f"\n� RIDE BURST: {market} — {fade_reason}")
         log(f"  Burst: ${net_volume:.0f} {direction} on {burst_side} (price {burst_price:.2f})")
         log(f"  Will buy {fade_side} after {BURST_CONFIRM_DELAY}s confirm (ask {price:.2f}), Bet: ${amount:.0f} ({burst_multiplier:.1f}x burst)")
 
@@ -840,7 +840,7 @@ def run_burst():
             log(f"  🧪 DRY-RUN: market buy {shares:.0f}sh of {fade_side} at {price:.2f} (taker fee)")
             record = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "action": "DRY_FADE_BUY",
+                "action": "DRY_MOMENTUM_BUY",
                 "market": market,
                 "burst_side": burst_side,
                 "fade_side": fade_side,
@@ -888,7 +888,7 @@ def run_burst():
                 if BURST_CONFIRM_DELAY > 0:
                     time.sleep(BURST_CONFIRM_DELAY)
 
-                # Re-check fade token price after delay
+                # Re-check buy token price after delay
                 current_ask = get_price(fade_token, side=BUY)
                 if current_ask <= 0:
                     log(f"  ⚠ No price available after confirm delay — skipping")
@@ -902,7 +902,7 @@ def run_burst():
                         positions.pop(fade_token, None)
                     return
 
-                # Check if price dropped too far during delay (burst was real, not a blip)
+                # Check if price dropped too far during delay (momentum fizzled)
                 original_ask = price  # from closure: ask at burst detection time
                 if current_ask < original_ask - STOP_LOSS:
                     log(f"  ⚠ Price dropped {original_ask - current_ask:.2f} during confirm (ask {original_ask:.2f}→{current_ask:.2f}) — skipping")
@@ -981,7 +981,7 @@ def run_burst():
                         session_pnl[0] += net_pnl
                         record = {
                             "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "action": "FADE_BUY", "market": market, "burst_side": burst_side,
+                            "action": "MOMENTUM_BUY", "market": market, "burst_side": burst_side,
                             "fade_side": fade_side, "burst_direction": direction,
                             "fade_reason": fade_reason, "token": fade_token,
                             "burst_token": token_id, "ask_price": current_ask,
@@ -1034,7 +1034,7 @@ def run_burst():
 
                 record = {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "action": "FADE_BUY",
+                    "action": "MOMENTUM_BUY",
                     "market": market,
                     "burst_side": burst_side,
                     "fade_side": fade_side,
@@ -1072,7 +1072,7 @@ def run_burst():
                     detector.set_loss_lockout(market)
 
             except Exception as e:
-                log(f"  ✗ Fade buy failed: {e}")
+                log(f"  ✗ Momentum buy failed: {e}")
                 with positions_lock:
                     positions.pop(fade_token, None)
 
@@ -1085,12 +1085,12 @@ def run_burst():
     log(f"\n{'='*60}")
     if DRY_RUN:
         log(f"🧪 DRY-RUN MODE — no orders will be placed")
-    log(f"🔄 CONTRARIAN burst bot (fade-the-burst)")
+    log(f"� MOMENTUM burst bot (ride-the-burst)")
     log(f"Detection: {BURST_WINDOW}s window, ${BURST_THRESHOLD} threshold (buy + sell bursts)")
-    log(f"Fade logic: buy bursts → buy opposite side | sell bursts → buy same side")
+    log(f"Momentum logic: buy bursts → buy same side | sell bursts → buy opposite side")
     log(f"Entry: market buy (FAK, taker fee) after {BURST_CONFIRM_DELAY}s confirm delay")
     log(f"Exit: limit sell at +{PROFIT_TARGET} (maker 0% fee) / -{STOP_LOSS} stop / {FLIP_TIMEOUT}s timeout")
-    log(f"Fade price: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}, Burst min: {MIN_BURST_PRICE}")
+    log(f"Entry price: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}, Burst min: {MIN_BURST_PRICE}")
     log(f"Cooldowns: {COOLDOWN_AFTER_ENTRY}s/token, {MARKET_COOLDOWN}s/market, {LOSS_LOCKOUT}s/loss-lockout")
     log(f"Time filter: skip markets with <{MIN_TIME_REMAINING}s remaining")
     log(f"Max positions: {MAX_CONCURRENT_POSITIONS}")
