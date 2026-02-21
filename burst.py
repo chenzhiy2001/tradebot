@@ -72,7 +72,8 @@ BURST_THRESHOLD = 300        # $ net volume in the window to trigger (lowered fr
                              # momentum benefits from catching early signals; more trades)
 MIN_ENTRY_PRICE = 0.20       # Don't buy token below this (at low prices $10 buys
                              # 50-111 shares, so even a clean 0.03 stop = $1.50-$3.33 loss)
-MAX_ENTRY_PRICE = 0.75       # Don't buy token above this (too expensive, limited upside)
+MAX_ENTRY_PRICE = 0.90       # Don't buy token above this (momentum at high prices is stronger
+                             # + fees are lower near extremes; 0.90 avoids only the thin 0.90+ zone)
 MIN_BURST_PRICE = 0.45       # Burst side must be >= this to ride (ensures meaningful signal)
 
 # Fees — real Polymarket formula: fee = C * feeRate * (p * (1-p))^exponent
