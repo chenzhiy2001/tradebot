@@ -1108,7 +1108,9 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                 if actual is None or actual < 1:
                     log(f"  ⏳ Waiting for shares (attempt {attempt+1}/{LIMIT_SELL_RETRIES}, balance: {actual})")
                     continue
-                sell_shares = math.floor(actual * 100) / 100
+                # Cap at the shares from THIS trade — don't sell leftovers from
+                # previous trades that might still be in the balance
+                sell_shares = min(math.floor(actual * 100) / 100, math.floor(shares * 100) / 100)
                 if sell_shares < 5:
                     log(f"  ⚠ Shares {sell_shares:.1f} below min order size 5 — will use market sell")
                     break
@@ -1243,10 +1245,30 @@ def quick_flip(token_id, entry_price, shares, pos_info):
         log(f"  🧪 DRY-RUN flip: {exit_reason} at {exit_price:.2f} | Gross ${gross_pnl:+.2f} | Fees: {fee_str} | Net: ${pnl:+.2f}")
     else:
         if exit_reason == "profit" and exit_is_maker:
-            # Limit order already filled — no action needed
+            # Limit order already filled — verify shares are actually gone
             pnl = net_pnl
             fee_note = "0% both sides" if entry_is_maker else f"entry ${entry_fee:.2f}"
             log(f"  ✓ Limit filled (profit): {target_price:.2f} | Net P&L: ${pnl:+.2f} ({fee_note})")
+            # Double-check no residual shares (partial fill edge case)
+            time.sleep(0.5)
+            residual = get_actual_share_balance(token_id)
+            if residual is not None and residual >= 1:
+                log(f"  ⚠ Profit exit but {residual:.0f}sh remain — cleaning up")
+                cancel_all_orders_for_token(token_id)
+                time.sleep(1.5)
+                residual = get_actual_share_balance(token_id)
+                if residual and residual >= 1:
+                    try:
+                        cleanup_amt = math.floor(residual * 100) / 100
+                        dump_mo = MarketOrderArgs(
+                            token_id=token_id, amount=cleanup_amt,
+                            side=SELL, order_type=OrderType.FAK,
+                        )
+                        signed_dump = client.create_market_order(dump_mo)
+                        client.post_order(signed_dump, OrderType.FAK)
+                        log(f"  ✓ Cleaned up {cleanup_amt:.0f}sh residual")
+                    except Exception as e:
+                        log(f"  ⚠ Residual cleanup failed: {e}")
         else:
             # ALWAYS cancel all orders for this token before attempting exit sell.
             # Even if limit_placed=False, the _place_limit_sell thread may have
@@ -1264,7 +1286,11 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             net_pnl = gross_pnl - entry_fee - exit_fee
             try:
                 actual = get_actual_share_balance(token_id)
-                sell_shares = math.floor((actual or shares) * 100) / 100
+                # Cap at shares from this trade to avoid selling other positions
+                sell_shares = min(
+                    math.floor((actual or shares) * 100) / 100,
+                    math.floor(shares * 100) / 100
+                )
 
                 if sell_shares > 0:
                     # GTC limit sell at low price → fills instantly at best bid (maker = 0% fee)
@@ -1312,6 +1338,31 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                                     last_err = fak_err
 
                     if sell_succeeded:
+                        # === VERIFY SELL ACTUALLY FILLED ===
+                        # GTC sell may sit on the book if price moved or allowance issue.
+                        # Wait and check that shares are actually gone.
+                        time.sleep(2.0)
+                        verify_balance = get_actual_share_balance(token_id)
+                        if verify_balance is not None and verify_balance >= 1:
+                            log(f"  ⚠ Exit sell posted but {verify_balance:.0f}sh remain — retrying")
+                            cancel_all_orders_for_token(token_id)
+                            time.sleep(1.5)
+                            verify_balance = get_actual_share_balance(token_id)
+                            if verify_balance and verify_balance >= 1:
+                                retry_amount = math.floor(verify_balance * 100) / 100
+                                try:
+                                    dump_mo = MarketOrderArgs(
+                                        token_id=token_id, amount=retry_amount,
+                                        side=SELL, order_type=OrderType.FAK,
+                                    )
+                                    signed_dump = client.create_market_order(dump_mo)
+                                    client.post_order(signed_dump, OrderType.FAK)
+                                    exit_fee = compute_taker_fee(retry_amount, exit_price)
+                                    net_pnl = gross_pnl - entry_fee - exit_fee
+                                    log(f"  ✓ Cleanup sold {retry_amount:.0f}sh via FAK")
+                                except Exception as cleanup_err:
+                                    log(f"  ⚠ Cleanup sell failed: {cleanup_err} — {retry_amount:.0f}sh ORPHANED")
+
                         pnl = net_pnl
                         exit_is_maker = exit_fee == 0.0
                         fee_note = f"maker 0% exit" if exit_is_maker else f"fees: ${entry_fee+exit_fee:.2f}"
@@ -1658,15 +1709,80 @@ def run_burst():
                     reason_str = "book deteriorated" if cancelled_for_book else f"not filled after {elapsed:.1f}s"
                     log(f"  ⏰ Limit buy {reason_str} — cancelling")
                     cancel_all_orders_for_token(token_id)
-                    # Dump any partial fill dust
+
+                    # === CRITICAL: Re-check balance after cancel ===
+                    # The buy order may have filled on-chain between our last REST
+                    # check and the cancel call. The cancel is a no-op if already
+                    # filled, leaving orphaned shares. Wait for settlement then check.
+                    time.sleep(2.0)
+                    actual = get_actual_share_balance(token_id)
+
+                    # Dump any shares (partial fill dust OR full fill that snuck through)
                     if actual and actual > 0:
-                        try:
-                            dump_mo = MarketOrderArgs(token_id=token_id, amount=actual, side=SELL, order_type=OrderType.FAK)
-                            signed_dump = client.create_market_order(dump_mo)
-                            client.post_order(signed_dump, OrderType.FAK)
-                            log(f"  🧹 Dumped {actual:.1f} dust shares")
-                        except Exception:
-                            pass
+                        sell_amount = math.floor(actual * 100) / 100
+                        if sell_amount >= 5:
+                            log(f"  ⚠ Buy filled despite cancel ({sell_amount:.0f}sh found) — dumping")
+                        else:
+                            log(f"  🧹 Dumping {sell_amount:.1f} dust shares")
+                        # Cancel any orders that might lock allowance
+                        cancel_all_orders_for_token(token_id)
+                        time.sleep(1.0)
+                        dump_succeeded = False
+                        for dump_attempt in range(3):
+                            try:
+                                if dump_attempt > 0:
+                                    time.sleep(1.0)
+                                    actual = get_actual_share_balance(token_id)
+                                    sell_amount = math.floor((actual or 0) * 100) / 100
+                                    if sell_amount <= 0:
+                                        dump_succeeded = True
+                                        break
+                                # GTC at low price (maker, 0% fee)
+                                cur_price = get_price(token_id, side=SELL)
+                                dump_price = round(max((cur_price or 0.10) - 0.05, 0.01), 2)
+                                dump_order = OrderArgs(
+                                    token_id=token_id, price=dump_price,
+                                    size=sell_amount, side=SELL,
+                                )
+                                signed_dump = client.create_order(dump_order)
+                                client.post_order(signed_dump, OrderType.GTC)
+                                dump_succeeded = True
+                                log(f"  ✓ Dumped {sell_amount:.0f}sh at ~{cur_price:.2f}")
+                                break
+                            except Exception as dump_err:
+                                if dump_attempt == 2:
+                                    # Final fallback: FAK
+                                    try:
+                                        dump_mo = MarketOrderArgs(
+                                            token_id=token_id, amount=sell_amount,
+                                            side=SELL, order_type=OrderType.FAK,
+                                        )
+                                        signed_dump = client.create_market_order(dump_mo)
+                                        client.post_order(signed_dump, OrderType.FAK)
+                                        dump_succeeded = True
+                                        log(f"  ✓ Dumped {sell_amount:.0f}sh via FAK")
+                                    except Exception:
+                                        pass
+                        if not dump_succeeded:
+                            log(f"  ⚠ Failed to dump {sell_amount:.0f}sh — ORPHANED")
+                        # Verify dump
+                        time.sleep(1.5)
+                        remaining_after = get_actual_share_balance(token_id)
+                        if remaining_after and remaining_after >= 1:
+                            log(f"  ⚠ Still {remaining_after:.1f}sh after dump — retrying cancel+sell")
+                            cancel_all_orders_for_token(token_id)
+                            time.sleep(1.5)
+                            try:
+                                dump_mo = MarketOrderArgs(
+                                    token_id=token_id,
+                                    amount=math.floor(remaining_after * 100) / 100,
+                                    side=SELL, order_type=OrderType.FAK,
+                                )
+                                signed_dump = client.create_market_order(dump_mo)
+                                client.post_order(signed_dump, OrderType.FAK)
+                                log(f"  ✓ Final dump of {remaining_after:.0f}sh via FAK")
+                            except Exception as e:
+                                log(f"  ⚠ Final dump failed: {e} — shares ORPHANED")
                     with positions_lock:
                         positions.pop(token_id, None)
                     return
