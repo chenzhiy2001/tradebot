@@ -77,7 +77,10 @@ CRYPTOS = {
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BET_AMOUNT = 10               # Fixed bet size in USDC per trade
+BET_AMOUNT = 10               # Bet size in USDC per trade (auto-tuned by Kelly)
+MIN_BET = 5                   # Floor — never bet less than this
+MAX_BET = 50                  # Ceiling — never bet more than this
+KELLY_FRACTION = 0.25         # Use quarter-Kelly (conservative) to size bets
 MAX_POSITIONS = 8             # Max concurrent positions (windows we're active in)
 MIN_EDGE = 0.15               # Minimum |edge| to trade (Bayesian prob - Poly implied)
 MIN_RETURN_ABS = 0.0003       # Minimum |crypto return| (0.03%) — filters noise/flat
@@ -90,6 +93,8 @@ FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
 # Bayesian model
 DEFAULT_VOL_PER_SEC = 5.8e-5  # Default σ per √second (~0.1% per 5min window)
 MIN_WINDOWS_FOR_VOL = 10      # Need this many completed windows before using empirical vol
+VOL_LOOKBACK_WINDOWS = 100    # Only use the most recent N windows for vol estimation
+                              # (~8 windows/hr → last ~12 hours of data)
 
 # Polymarket fee formula (5m/15m crypto)
 CRYPTO_FEE_RATE = 0.25
@@ -103,6 +108,10 @@ DECISION_LOG = "sniper_log.txt"
 
 MARKET_POLL_INTERVAL = 30     # Seconds between market discovery polls
 TICK_INTERVAL = 1.0           # Main loop tick interval
+
+# Reanalysis — runs every N completed windows
+REANALYSIS_INTERVAL = 10      # Run reanalysis after every N new completed windows
+AUTO_TUNE_EDGE = True         # Auto-adjust MIN_EDGE based on observed calibration
 
 DRY_RUN = "--dry-run" in sys.argv
 
@@ -182,6 +191,7 @@ class BayesianEngine:
     def __init__(self):
         self._vol_per_sec = DEFAULT_VOL_PER_SEC
         self._window_returns = []  # (return, duration_sec) from completed windows
+        self._signal_history = []  # dicts of {p_up, implied_up, edge_up, return, actual_up}
         self._lock = threading.Lock()
         self._load_historical()
 
@@ -216,13 +226,16 @@ class BayesianEngine:
             log(f"  📊 No historical data — using default σ/√s = {self._vol_per_sec:.6f}")
 
     def _recompute_vol(self):
-        """Recompute volatility per √second from all window returns."""
+        """Recompute volatility per √second from recent window returns only."""
         if len(self._window_returns) < MIN_WINDOWS_FOR_VOL:
             return
 
+        # Only use the most recent windows — vol regime changes over time
+        recent = self._window_returns[-VOL_LOOKBACK_WINDOWS:]
+
         # Normalize returns to per-√second: z_i = R_i / √D_i
         # Under the model, z_i ~ N(0, σ²), so std(z_i) = σ
-        normalized = [r / math.sqrt(d) for r, d in self._window_returns if d > 0]
+        normalized = [r / math.sqrt(d) for r, d in recent if d > 0]
         if len(normalized) < MIN_WINDOWS_FOR_VOL:
             return
 
@@ -233,13 +246,192 @@ class BayesianEngine:
         if new_vol > 0:
             self._vol_per_sec = new_vol
             log(f"  📊 Vol recalibrated: σ/√s = {self._vol_per_sec:.6f} "
-                f"(from {len(normalized)} windows, ~{self._vol_per_sec * math.sqrt(300) * 100:.3f}% per 5min)")
+                f"(from {len(normalized)}/{len(self._window_returns)} recent windows, "
+                f"~{self._vol_per_sec * math.sqrt(300) * 100:.3f}% per 5min)")
 
     def add_completed_window(self, ret, duration_sec):
         """Add a completed window's return to the dataset and recalibrate."""
         with self._lock:
             self._window_returns.append((ret, duration_sec))
             self._recompute_vol()
+
+    def add_signal_outcome(self, signal, outcome):
+        """Record a signal and its actual outcome for reanalysis.
+        signal: dict with keys p_up, implied_up, edge_up, return, pct
+        outcome: 'UP' or 'DOWN'
+        """
+        with self._lock:
+            self._signal_history.append({
+                **signal,
+                "actual_up": 1.0 if outcome == "UP" else 0.0,
+            })
+
+    def reanalyze(self):
+        """Full reanalysis of prediction accuracy and edge calibration.
+        Returns a report dict with findings and recommended adjustments."""
+        with self._lock:
+            signals = list(self._signal_history[-500:])  # Last 500 signals
+            n_windows = len(self._window_returns)
+
+        if len(signals) < 20:
+            return None  # Not enough data
+
+        report = {"n_signals": len(signals), "n_windows": n_windows}
+
+        # 1. Prediction accuracy — bin P(UP) predictions and check calibration
+        #    If we predict P(UP)=0.80, do 80% of those actually resolve UP?
+        bins = [(0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.01)]
+        calibration = []
+        for lo, hi in bins:
+            in_bin = [s for s in signals if lo <= s["p_up"] < hi]
+            if len(in_bin) >= 3:
+                predicted_avg = sum(s["p_up"] for s in in_bin) / len(in_bin)
+                actual_avg = sum(s["actual_up"] for s in in_bin) / len(in_bin)
+                calibration.append({
+                    "bin": f"{lo:.1f}-{hi:.1f}",
+                    "n": len(in_bin),
+                    "predicted": round(predicted_avg, 3),
+                    "actual": round(actual_avg, 3),
+                    "gap": round(actual_avg - predicted_avg, 3),
+                })
+        report["calibration"] = calibration
+
+        # 2. Edge analysis — for signals where we'd have traded,
+        #    what was the actual win rate vs predicted?
+        for threshold in [0.10, 0.15, 0.20, 0.25, 0.30]:
+            tradeable = [s for s in signals
+                         if abs(s["edge_up"]) >= threshold
+                         and abs(s["return"]) >= MIN_RETURN_ABS * 100]  # return is in %
+            if len(tradeable) >= 5:
+                wins = 0
+                total_edge = 0
+                for s in tradeable:
+                    if s["edge_up"] >= threshold:
+                        # Would buy UP
+                        if s["actual_up"] == 1.0:
+                            wins += 1
+                    elif s["edge_up"] <= -threshold:
+                        # Would buy DOWN
+                        if s["actual_up"] == 0.0:
+                            wins += 1
+                    total_edge += abs(s["edge_up"])
+
+                wr = wins / len(tradeable) if tradeable else 0
+                avg_edge = total_edge / len(tradeable) if tradeable else 0
+                report[f"edge_{threshold:.2f}"] = {
+                    "n": len(tradeable),
+                    "win_rate": round(wr, 3),
+                    "avg_edge": round(avg_edge, 3),
+                    "profitable": wr > 0.55,  # Need >55% to cover fees
+                }
+
+        # 3. Optimal edge threshold — find lowest threshold that's still profitable
+        optimal_edge = MIN_EDGE
+        for threshold in [0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.30]:
+            key = f"edge_{threshold:.2f}"
+            if key not in report:
+                # Compute it if not already done
+                tradeable = [s for s in signals
+                             if abs(s["edge_up"]) >= threshold
+                             and abs(s["return"]) >= MIN_RETURN_ABS * 100]
+                if len(tradeable) >= 5:
+                    wins = sum(1 for s in tradeable
+                               if (s["edge_up"] >= threshold and s["actual_up"] == 1.0)
+                               or (s["edge_up"] <= -threshold and s["actual_up"] == 0.0))
+                    wr = wins / len(tradeable)
+                    report[key] = {"n": len(tradeable), "win_rate": round(wr, 3)}
+            data = report.get(key)
+            if data and data.get("n", 0) >= 5:
+                if data["win_rate"] >= 0.60:  # 60%+ win rate is safe
+                    optimal_edge = threshold
+                    break  # Use the lowest profitable threshold
+
+        report["optimal_edge"] = optimal_edge
+        report["current_edge"] = MIN_EDGE
+
+        # 4. Timing analysis — win rate by elapsed % bucket
+        #    Determines optimal MIN_ELAPSED_PCT
+        timing_buckets = [(0.50, 0.60), (0.60, 0.70), (0.70, 0.80), (0.80, 0.90), (0.90, 1.01)]
+        timing_analysis = []
+        for lo, hi in timing_buckets:
+            # Signals in this elapsed-% range that had enough edge to trade
+            eligible = [s for s in signals
+                        if lo <= s["pct"] < hi
+                        and abs(s["edge_up"]) >= optimal_edge
+                        and abs(s["return"]) >= MIN_RETURN_ABS * 100]
+            if len(eligible) >= 3:
+                wins = sum(1 for s in eligible
+                           if (s["edge_up"] >= optimal_edge and s["actual_up"] == 1.0)
+                           or (s["edge_up"] <= -optimal_edge and s["actual_up"] == 0.0))
+                wr = wins / len(eligible)
+                timing_analysis.append({
+                    "bucket": f"{lo:.0%}-{hi:.0%}",
+                    "lo": lo,
+                    "n": len(eligible),
+                    "win_rate": round(wr, 3),
+                    "profitable": wr >= 0.60,
+                })
+        report["timing"] = timing_analysis
+
+        # 5. Optimal elapsed threshold — earliest bucket with 60%+ win rate
+        optimal_elapsed = MIN_ELAPSED_PCT
+        for t in timing_analysis:
+            if t["profitable"] and t["n"] >= 3:
+                optimal_elapsed = t["lo"]
+                break
+        report["optimal_elapsed"] = optimal_elapsed
+        report["current_elapsed"] = MIN_ELAPSED_PCT
+
+        # 6. Kelly criterion bet sizing
+        #    Kelly fraction f* = (p*b - q) / b
+        #    where p = win rate, q = 1-p, b = net odds (win_payout / loss_cost)
+        #    For Polymarket: buy at price P, win → $1/share, lose → $0
+        #      b = (1-P)/P (e.g. buy at 0.60 → b = 0.667)
+        #    Use average entry price from tradeable signals
+        tradeable_at_optimal = [s for s in signals
+                                if abs(s["edge_up"]) >= optimal_edge
+                                and abs(s["return"]) >= MIN_RETURN_ABS * 100]
+        if len(tradeable_at_optimal) >= 5:
+            wins = sum(1 for s in tradeable_at_optimal
+                       if (s["edge_up"] >= optimal_edge and s["actual_up"] == 1.0)
+                       or (s["edge_up"] <= -optimal_edge and s["actual_up"] == 0.0))
+            p = wins / len(tradeable_at_optimal)
+            q = 1 - p
+
+            # Estimate average entry price from implied probs
+            # When edge_up > 0, we buy UP at ~(1 - implied_up); vice versa
+            # Approximate: avg entry price ≈ 0.50 (midpoint assumption)
+            # More precise: use the implied of the side NOT favored
+            avg_prices = []
+            for s in tradeable_at_optimal:
+                if s["edge_up"] >= optimal_edge:
+                    avg_prices.append(s["implied_up"])  # buying UP around this price
+                elif s["edge_up"] <= -optimal_edge:
+                    avg_prices.append(1.0 - s["implied_up"])  # buying DOWN
+            avg_price = sum(avg_prices) / len(avg_prices) if avg_prices else 0.50
+            avg_price = max(0.10, min(0.90, avg_price))
+
+            b = (1.0 - avg_price) / avg_price  # net odds
+            kelly_full = (p * b - q) / b if b > 0 else 0
+            kelly_full = max(0, kelly_full)  # never negative
+
+            report["kelly"] = {
+                "win_rate": round(p, 3),
+                "avg_entry_price": round(avg_price, 3),
+                "net_odds": round(b, 3),
+                "kelly_full": round(kelly_full, 4),
+                "kelly_fraction": KELLY_FRACTION,
+                "kelly_bet_pct": round(kelly_full * KELLY_FRACTION, 4),
+            }
+        else:
+            report["kelly"] = None
+
+        return report
+
+    @property
+    def signal_count(self):
+        with self._lock:
+            return len(self._signal_history)
 
     def prob_up(self, current_return, seconds_remaining):
         """
@@ -571,6 +763,8 @@ class Sniper:
         self._trade_count = 0
         self._win_count = 0
         self._start_balance = get_usdc_balance()
+        self._windows_since_reanalysis = 0
+        self._last_report = None
 
     def update_markets(self, markets):
         """Add new market windows, subscribe tokens."""
@@ -741,6 +935,16 @@ class Sniper:
 
                     # Update volatility estimate
                     self.engine.add_completed_window(ret, duration)
+
+                    # Feed all recorded signals + actual outcome for reanalysis
+                    for sig in w["signals"]:
+                        self.engine.add_signal_outcome(sig, outcome)
+
+                    # Periodic reanalysis
+                    self._windows_since_reanalysis += 1
+                    if self._windows_since_reanalysis >= REANALYSIS_INTERVAL:
+                        self._run_reanalysis()
+                        self._windows_since_reanalysis = 0
 
                     # Resolve trade PnL
                     if w["traded"] and w["trade_info"]:
@@ -921,6 +1125,80 @@ class Sniper:
             with open(TRADE_LOG, "w") as f:
                 json.dump(trades, f, indent=2)
 
+    def _run_reanalysis(self):
+        """Run periodic reanalysis and optionally auto-tune parameters."""
+        global MIN_EDGE, MIN_ELAPSED_PCT, BET_AMOUNT
+        report = self.engine.reanalyze()
+        if not report:
+            return
+
+        self._last_report = report
+        log(f"  \n{'═' * 60}")
+        log(f"  🔬 REANALYSIS ({report['n_signals']} signals, {report['n_windows']} windows)")
+
+        # Print calibration
+        if report.get("calibration"):
+            log(f"  Calibration (predicted vs actual P(UP)):")
+            for c in report["calibration"]:
+                marker = "✅" if abs(c["gap"]) < 0.10 else "⚠️"
+                log(f"    {marker} bin {c['bin']}: pred={c['predicted']:.2f} actual={c['actual']:.2f} "
+                    f"gap={c['gap']:+.2f} (n={c['n']})")
+
+        # Print edge analysis
+        for threshold in [0.10, 0.15, 0.20, 0.25, 0.30]:
+            key = f"edge_{threshold:.2f}"
+            if key in report:
+                d = report[key]
+                marker = "✅" if d.get("profitable") or d["win_rate"] >= 0.60 else "❌"
+                log(f"    {marker} edge≥{threshold:.2f}: WR={d['win_rate']:.0%} (n={d['n']})")
+
+        # Print timing analysis
+        if report.get("timing"):
+            log(f"  Entry timing analysis:")
+            for t in report["timing"]:
+                marker = "✅" if t["profitable"] else "❌"
+                log(f"    {marker} {t['bucket']}: WR={t['win_rate']:.0%} (n={t['n']})")
+
+        # Auto-tune MIN_EDGE
+        optimal = report.get("optimal_edge", MIN_EDGE)
+        if AUTO_TUNE_EDGE and optimal != MIN_EDGE:
+            old_edge = MIN_EDGE
+            MIN_EDGE = optimal
+            log(f"  🔧 AUTO-TUNE: MIN_EDGE {old_edge:.2f} → {MIN_EDGE:.2f}")
+        else:
+            log(f"  🔧 MIN_EDGE={MIN_EDGE:.2f} (optimal={optimal:.2f}, no change)")
+
+        # Auto-tune MIN_ELAPSED_PCT
+        optimal_elapsed = report.get("optimal_elapsed", MIN_ELAPSED_PCT)
+        if AUTO_TUNE_EDGE and optimal_elapsed != MIN_ELAPSED_PCT:
+            old_elapsed = MIN_ELAPSED_PCT
+            MIN_ELAPSED_PCT = optimal_elapsed
+            log(f"  🔧 AUTO-TUNE: MIN_ELAPSED {old_elapsed:.0%} → {MIN_ELAPSED_PCT:.0%}")
+        else:
+            log(f"  🔧 MIN_ELAPSED={MIN_ELAPSED_PCT:.0%} (optimal={optimal_elapsed:.0%}, no change)")
+
+        # Auto-tune BET_AMOUNT via Kelly criterion
+        kelly = report.get("kelly")
+        if kelly and AUTO_TUNE_EDGE:
+            kelly_pct = kelly["kelly_bet_pct"]
+            if kelly_pct > 0:
+                balance = get_usdc_balance()
+                if balance and balance > 0:
+                    raw_bet = balance * kelly_pct
+                    new_bet = round(max(MIN_BET, min(MAX_BET, raw_bet)), 1)
+                    old_bet = BET_AMOUNT
+                    BET_AMOUNT = new_bet
+                    log(f"  🔧 AUTO-TUNE: BET_AMOUNT ${old_bet:.1f} → ${BET_AMOUNT:.1f} "
+                        f"(Kelly={kelly['kelly_full']:.1%} × {KELLY_FRACTION} = {kelly_pct:.1%} of ${balance:.0f})")
+                else:
+                    log(f"  🔧 BET_AMOUNT=${BET_AMOUNT:.1f} (Kelly={kelly['kelly_full']:.1%}, balance unknown)")
+            else:
+                log(f"  🔧 BET_AMOUNT=${BET_AMOUNT:.1f} (Kelly=0 — edge not profitable enough to bet)")
+        else:
+            log(f"  🔧 BET_AMOUNT=${BET_AMOUNT:.1f} (not enough data for Kelly)")
+
+        log(f"  {'═' * 60}\n")
+
     def get_dashboard(self):
         """Formatted dashboard string."""
         lines = []
@@ -1015,9 +1293,23 @@ class Sniper:
         lines.append(
             f"  🧠 Model: σ/√s={self.engine.vol_per_sec:.6f} "
             f"(~{self.engine.vol_per_sec * math.sqrt(300) * 100:.3f}%/5min) | "
-            f"Data: {self.engine.n_windows} windows | "
+            f"Data: {self.engine.n_windows} windows, {self.engine.signal_count} signals | "
             f"MIN_EDGE={MIN_EDGE} MIN_ELAPSED={MIN_ELAPSED_PCT:.0%}"
         )
+
+        # Last reanalysis summary
+        if self._last_report:
+            r = self._last_report
+            opt = r.get('optimal_edge', MIN_EDGE)
+            # Find entry for current MIN_EDGE threshold
+            key = f"edge_{MIN_EDGE:.2f}"
+            wr_str = ""
+            if key in r:
+                wr_str = f"WR={r[key]['win_rate']:.0%}(n={r[key]['n']})"
+            lines.append(
+                f"  🔬 Last reanalysis: optimal_edge={opt:.2f} {wr_str} | "
+                f"next in {REANALYSIS_INTERVAL - self._windows_since_reanalysis} windows"
+            )
 
         return "\n".join(lines)
 
