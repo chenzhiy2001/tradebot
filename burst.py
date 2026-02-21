@@ -86,7 +86,9 @@ WS_WARMUP_SECONDS = 15       # Don't fire signals for this many seconds after WS
 
 # Limit buy entry — GTC maker order (0% fee, fills atomically, no settlement blind spot)
 LIMIT_BUY_OFFSET = 0.01      # Place buy at best_bid + this (near top of book)
-FILL_TIMEOUT = 15             # Seconds to wait for limit buy fill before cancelling
+FILL_TIMEOUT = 10             # Seconds to wait for limit buy fill before cancelling
+                              # (was 15 — fills after 6s tend to be adverse selection;
+                              # good fills happen in 1-3s, book monitor cancels if signal fades)
 SCAN_COOLDOWN = 10.0          # Don't re-signal same token within this many seconds
 
 # Burst detection — still used for trade-window tracking (background, does not trigger entries)
@@ -1248,6 +1250,9 @@ def quick_flip(token_id, entry_price, shares, pos_info):
             if limit_placed:
                 cancel_all_orders_for_token(token_id)
                 log(f"  ↩ Cancelled limit sell (exit: {exit_reason})")
+                # Wait for on-chain allowance release after cancel
+                # Without this, immediate sell attempts fail with "not enough balance / allowance"
+                time.sleep(1.5)
 
             sell_succeeded = False
             # Recalculate fees assuming maker exit (0% fee)
@@ -1264,6 +1269,13 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                     last_err = None
                     for attempt in range(3):
                         try:
+                            # Refresh allowance on each retry (cancel may not have settled yet)
+                            if attempt > 0:
+                                time.sleep(1.0)
+                                actual = get_actual_share_balance(token_id)
+                                sell_shares = math.floor((actual or shares) * 100) / 100
+                                if sell_shares <= 0:
+                                    break
                             sell_order = OrderArgs(
                                 token_id=token_id,
                                 price=sell_limit_price,
@@ -1276,7 +1288,7 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                             break
                         except Exception as gtc_err:
                             last_err = gtc_err
-                            # Fallback to FAK if GTC fails
+                            # Fallback to FAK if GTC fails on final attempt
                             if attempt == 2:
                                 try:
                                     mo = MarketOrderArgs(
@@ -1294,8 +1306,6 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                                     log(f"  ⚠ GTC sell failed, used FAK fallback (taker fee)")
                                 except Exception as fak_err:
                                     last_err = fak_err
-                            else:
-                                time.sleep(0.5)
 
                     if sell_succeeded:
                         pnl = net_pnl
@@ -1511,6 +1521,7 @@ def run_burst():
                 # === WAIT FOR FILL ===
                 # Primary: User Channel WS fires MATCHED/CONFIRMED event
                 # Fallback: REST share balance check every 3s
+                # Safety: Monitor book health — cancel if imbalance disappears (adverse selection guard)
                 fill_event = threading.Event()
                 def _on_buy_fill(trade_info):
                     if trade_info.get("side") == "BUY":
@@ -1518,6 +1529,7 @@ def run_burst():
                 user_ws.on_fill(token_id, _on_buy_fill)
 
                 filled = False
+                cancelled_for_book = False
                 fill_deadline = entry_start + FILL_TIMEOUT
                 actual = None
 
@@ -1540,9 +1552,29 @@ def run_burst():
                             filled = True
                             break
 
+                        # === BOOK HEALTH CHECK ===
+                        # If imbalance has disappeared while we wait, the signal is invalid.
+                        # Cancel early to avoid adverse fill (sellers dumping through our level).
+                        wait_elapsed = time.time() - entry_start
+                        if wait_elapsed >= 3.0 and _detector_ref:
+                            cur_book = _detector_ref._books.get(token_id)
+                            if cur_book and time.time() - cur_book.get("ts", 0) < 10:
+                                cur_bids = cur_book.get("bids", [])
+                                cur_asks = cur_book.get("asks", [])
+                                if cur_bids and cur_asks:
+                                    cur_best_bid = cur_bids[0][0]
+                                    cur_bid_depth = sum(p * s for p, s in cur_bids if p >= cur_best_bid - IMBALANCE_DEPTH_RANGE)
+                                    cur_ask_depth = sum(p * s for p, s in cur_asks if p <= cur_asks[0][0] + IMBALANCE_DEPTH_RANGE)
+                                    cur_ratio = cur_bid_depth / cur_ask_depth if cur_ask_depth > 0 else 0
+                                    # If ratio dropped below 1.5x, imbalance is gone — cancel
+                                    if cur_ratio < 1.5:
+                                        log(f"  📉 Book imbalance gone ({cur_ratio:.1f}x < 1.5x) after {wait_elapsed:.1f}s — cancelling buy")
+                                        cancelled_for_book = True
+                                        break
+
                 user_ws.remove_fill_callback(token_id, _on_buy_fill)
 
-                if not filled:
+                if not filled and not cancelled_for_book:
                     # Final check before giving up
                     actual = get_actual_share_balance(token_id)
                     if actual is not None and actual >= 5:
@@ -1551,7 +1583,8 @@ def run_burst():
                 if not filled:
                     # No fill — cancel the limit order and release position
                     elapsed = time.time() - entry_start
-                    log(f"  ⏰ Limit buy not filled after {elapsed:.1f}s — cancelling")
+                    reason_str = "book deteriorated" if cancelled_for_book else f"not filled after {elapsed:.1f}s"
+                    log(f"  ⏰ Limit buy {reason_str} — cancelling")
                     cancel_all_orders_for_token(token_id)
                     # Dump any partial fill dust
                     if actual and actual > 0:
