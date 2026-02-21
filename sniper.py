@@ -102,7 +102,6 @@ CRYPTO_FEE_EXPONENT = 2
 
 # Data files
 DATA_FILE = "sniper_data.jsonl"
-PREDICT_DATA_FILE = "predict_data.jsonl"
 TRADE_LOG = "sniper_trades.json"
 DECISION_LOG = "sniper_log.txt"
 
@@ -196,28 +195,28 @@ class BayesianEngine:
         self._load_historical()
 
     def _load_historical(self):
-        """Load completed window data from existing JSONL files."""
+        """Load completed window data from sniper's own data file."""
         loaded = 0
-        for fname in [PREDICT_DATA_FILE, DATA_FILE]:
-            if not os.path.exists(fname):
-                continue
-            try:
-                with open(fname) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        rec = json.loads(line)
-                        op = rec.get("open_price")
-                        cp = rec.get("close_price")
-                        interval = rec.get("interval", 5)
-                        if op and cp and op > 0:
-                            ret = (cp - op) / op
-                            duration = interval * 60
-                            self._window_returns.append((ret, duration))
-                            loaded += 1
-            except Exception as e:
-                log(f"  ⚠ Error loading {fname}: {e}")
+        if not os.path.exists(DATA_FILE):
+            log(f"  📊 No historical data — using default σ/√s = {self._vol_per_sec:.6f}")
+            return
+        try:
+            with open(DATA_FILE) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    op = rec.get("open_price")
+                    cp = rec.get("close_price")
+                    interval = rec.get("interval", 5)
+                    if op and cp and op > 0:
+                        ret = (cp - op) / op
+                        duration = interval * 60
+                        self._window_returns.append((ret, duration))
+                        loaded += 1
+        except Exception as e:
+            log(f"  ⚠ Error loading {DATA_FILE}: {e}")
 
         if loaded > 0:
             self._recompute_vol()
