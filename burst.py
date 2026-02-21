@@ -84,18 +84,19 @@ LIMIT_BUY_CHECK_INTERVAL = 0.5  # How often to check if limit buy filled
 
 # Quick flip exit
 PROFIT_TARGET = 0.03         # Limit sell at entry + this (maker, 0% fee) (was 0.05, unreachable)
-STOP_LOSS = 0.05             # Cancel limit + market sell if price drops this much (was 0.10)
+STOP_LOSS = 0.03             # Cancel limit + market sell if price drops this much (was 0.05)
 FLIP_TIMEOUT = 30            # Max seconds to hold before force-selling (was 15)
 PRICE_CHECK_INTERVAL = 0.5   # How often to check price during flip
 LIMIT_SELL_RETRIES = 3       # Retry limit sell placement this many times
 LIMIT_SELL_RETRY_DELAY = 3   # Seconds between retries
 
 # Risk management
-MAX_CONCURRENT_POSITIONS = 100
+MAX_CONCURRENT_POSITIONS = 3
 MIN_BALANCE_BUFFER = 5
 SESSION_STOP_LOSS_PCT = 0.30
 COOLDOWN_AFTER_ENTRY = 30.0  # Don't re-enter same TOKEN for N seconds (was 5)
 MARKET_COOLDOWN = 30.0       # Don't re-enter same MARKET (either side) for N seconds (was 60)
+LOSS_LOCKOUT = 120.0         # After stop-loss/timeout on a market, lock it out for this long
 
 CRYPTOS = ["btc", "eth", "sol", "xrp"]
 
@@ -293,6 +294,7 @@ class BurstDetector:
         # Map token -> market info (set by main thread)
         self._token_info = {}              # token -> {market, tokens, condition_id, ...}
         self._market_cooldowns = {}        # market_question -> last_entry_time
+        self._loss_lockouts = {}           # market_question -> lockout_until_time
 
     def start(self):
         t = threading.Thread(target=self._run_loop, daemon=True)
@@ -434,6 +436,10 @@ class BurstDetector:
             info = self._token_info.get(asset_id, {})
             market_q = info.get("market", "")
             if market_q:
+                # Check loss lockout first (longer lockout after stop-loss)
+                lockout_until = self._loss_lockouts.get(market_q, 0)
+                if now < lockout_until:
+                    return
                 last_market = self._market_cooldowns.get(market_q, 0)
                 if now - last_market < MARKET_COOLDOWN:
                     return
@@ -459,6 +465,14 @@ class BurstDetector:
         if burst_direction:
             info = self._token_info.get(asset_id, {})
             self._on_burst(asset_id, burst_amount, burst_direction, info)
+
+    def set_loss_lockout(self, market_question, duration=None):
+        """Lock out a market for LOSS_LOCKOUT seconds after a stop-loss/timeout."""
+        if not market_question:
+            return
+        lockout = duration or LOSS_LOCKOUT
+        with self._lock:
+            self._loss_lockouts[market_question] = time.time() + lockout
 
     def update_subscriptions(self, wanted_tokens):
         with self._lock:
@@ -613,27 +627,46 @@ def quick_flip(token_id, entry_price, shares, pos_info):
                 cancel_all_orders_for_token(token_id)
                 log(f"  ↩ Cancelled limit sell (exit: {exit_reason})")
 
+            sell_succeeded = False
             try:
                 actual = get_actual_share_balance(token_id)
                 sell_shares = math.floor((actual or shares) * 100) / 100
 
                 if sell_shares > 0:
-                    mo = MarketOrderArgs(
-                        token_id=token_id,
-                        amount=sell_shares,
-                        side=SELL,
-                        order_type=OrderType.FAK,
-                    )
-                    signed = client.create_market_order(mo)
-                    resp = client.post_order(signed, OrderType.FAK)
+                    # Try FAK market sell with retries (order book may be thin)
+                    last_err = None
+                    for attempt in range(3):
+                        try:
+                            mo = MarketOrderArgs(
+                                token_id=token_id,
+                                amount=sell_shares,
+                                side=SELL,
+                                order_type=OrderType.FAK,
+                            )
+                            signed = client.create_market_order(mo)
+                            resp = client.post_order(signed, OrderType.FAK)
+                            sell_succeeded = True
+                            break
+                        except Exception as fak_err:
+                            last_err = fak_err
+                            if attempt < 2:
+                                time.sleep(1)  # Wait for order book to replenish
 
-                    pnl = net_pnl
-                    fee_note = f"fees: ${entry_fee+exit_fee:.2f}" if (entry_fee + exit_fee) > 0 else "entry 0%"
-                    log(f"  ✓ Market sell ({exit_reason}): {sell_shares:.0f}sh at ~{exit_price:.2f} | Net P&L: ${pnl:+.2f} ({fee_note})")
+                    if sell_succeeded:
+                        pnl = net_pnl
+                        fee_note = f"fees: ${entry_fee+exit_fee:.2f}" if (entry_fee + exit_fee) > 0 else "entry 0%"
+                        log(f"  ✓ Market sell ({exit_reason}): {sell_shares:.0f}sh at ~{exit_price:.2f} | Net P&L: ${pnl:+.2f} ({fee_note})")
+                    else:
+                        # All FAK attempts failed — log unrealized loss
+                        pnl = net_pnl
+                        log(f"  ✗ Market sell failed after 3 attempts: {last_err}")
+                        log(f"  ⚠ {sell_shares:.0f}sh ORPHANED — unrealized P&L: ${pnl:+.2f}")
                 else:
                     log(f"  ⚠ No shares to sell (balance: {actual})")
             except Exception as e:
+                pnl = net_pnl  # Record the loss even if sell fails
                 log(f"  ✗ Flip sell failed: {e}")
+                log(f"  ⚠ Shares may be orphaned — unrealized P&L: ${pnl:+.2f}")
 
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -900,6 +933,10 @@ def run_burst():
                 with positions_lock:
                     positions.pop(fade_token, None)
 
+                # After a losing exit, lock out this market to avoid piling into a loser
+                if reason in ("stop_loss", "timeout"):
+                    detector.set_loss_lockout(market)
+
             except Exception as e:
                 log(f"  ✗ Fade buy failed: {e}")
                 with positions_lock:
@@ -920,7 +957,7 @@ def run_burst():
     log(f"Entry: limit buy at ask-{LIMIT_BUY_OFFSET} (maker 0% fee), {LIMIT_BUY_TIMEOUT}s fill timeout")
     log(f"Exit: limit sell at +{PROFIT_TARGET} (maker 0% fee) / -{STOP_LOSS} stop / {FLIP_TIMEOUT}s timeout")
     log(f"Fade price: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}, Burst min: {MIN_BURST_PRICE}")
-    log(f"Cooldowns: {COOLDOWN_AFTER_ENTRY}s/token, {MARKET_COOLDOWN}s/market, Limit retries: {LIMIT_SELL_RETRIES}")
+    log(f"Cooldowns: {COOLDOWN_AFTER_ENTRY}s/token, {MARKET_COOLDOWN}s/market, {LOSS_LOCKOUT}s/loss-lockout")
     log(f"Max positions: {MAX_CONCURRENT_POSITIONS}")
     log(f"Buy amount: ${BUY_AMOUNT}, Cryptos: {', '.join(CRYPTOS)}")
     log(f"{'='*60}\n")
