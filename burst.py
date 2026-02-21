@@ -1,35 +1,37 @@
 #!/usr/bin/env python3
 """
-Burst Bot — MOMENTUM (ride-the-burst) strategy on Polymarket crypto markets.
+Book Imbalance Bot — order-book-based strategy on Polymarket crypto markets.
 
 Strategy:
-  Monitor real-time WebSocket trade feed for sudden bursts of buying or selling.
-  When a burst is detected, buy the SAME side — riding the momentum.
-  Rationale: large bursts signal informed flow / real price discovery;
-  the move is more likely to continue than revert.
+  Monitor real-time WebSocket order book for depth imbalances.
+  When bid-side depth significantly exceeds ask-side depth, buy that token
+  using a GTC limit order at the bid (maker, 0% fee).
 
-Signals:
-  1. Buy burst on token X → buy token X itself (ride the momentum)
-  2. Sell burst on token X → buy the opposite token (that side is winning)
+  Rationale: heavy bids signal accumulation / informed positioning;
+  the price is likely to move up toward the stacked bids.
+  This is a LEADING indicator — the imbalance appears before the move.
 
-Detection:
-  - Sliding 5-second window of trades per token
-  - Buy burst = net buy $ exceeds dynamic threshold → ride it
-  - Sell burst = net sell $ exceeds dynamic threshold → ride it
-  - Threshold = max(BURST_MIN_ABSOLUTE, baseline_avg × BURST_MULTIPLIER)
-  - Only ride when burst side is elevated (>=45¢) — ensures meaningful signal
+Signal:
+  - Compute near-money bid/ask depth (within IMBALANCE_DEPTH_RANGE of best price)
+  - If bid_depth / ask_depth > IMBALANCE_RATIO → buy this token
+  - Min bid depth filter prevents false signals on thin books
+  - Max spread filter ensures the market is liquid
+
+Entry:
+  - GTC limit buy at best_bid + LIMIT_BUY_OFFSET (maker = 0% fee)
+  - Wait up to FILL_TIMEOUT seconds for fill (WS User Channel + REST fallback)
+  - No settlement blind spot — limit fills are atomic on-book
+  - Better entry price (buying near bid, not crossing to ask)
 
 Exit (quick flip):
   - Place GTC limit sell at entry + PROFIT_TARGET immediately (maker = 0% fee)
   - If price drops below entry - STOP_LOSS → cancel limit, market sell (cut loss)
   - If FLIP_TIMEOUT seconds pass → cancel limit, market sell (take whatever)
+  - TP/SL dynamically adjusted from order book depth analysis
 
 Fees (5m/15m crypto markets):
-  - Formula: fee = shares × feeRate × (p × (1 - p))^exponent
-  - feeRate=0.25, exponent=2 → max ~1.56% at p=0.50, near-zero at extremes
-  - Taker orders (FAK market) pay this fee; maker orders (GTC limit) pay 0%
-  - Fee rate fetched per-token from API: GET /fee-rate?token_id={id}
-  - SDK auto-includes feeRateBps in signed orders
+  - BOTH entry and exit are maker (GTC limit) = 0% fee
+  - Only SL/timeout exits use taker (FAK market) = formula-based fee
 """
 
 import os
@@ -67,34 +69,34 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BUY_AMOUNT = 10              # Base bet in $ (at threshold burst)
-MAX_BUY_AMOUNT = 30          # Cap per trade regardless of burst size
-BURST_WINDOW = 5.0           # Seconds — detect bursts within this window
-BURST_MULTIPLIER = 3.0       # Trigger when 5s net volume > baseline_avg × this
-                             # (proportional to market activity — $300 in a quiet SOL market
-                             #  is huge, but noise in a busy BTC market)
-BURST_MIN_ABSOLUTE = 100     # Minimum absolute $ burst regardless of ratio (avoid noise)
-BURST_BASELINE_WINDOW = 60   # Seconds of history for computing volume baseline
-MIN_ENTRY_PRICE = 0.20       # Don't buy token below this (at low prices $10 buys
-                             # 50-111 shares, so even a clean 0.03 stop = $1.50-$3.33 loss)
-MAX_ENTRY_PRICE = 0.90       # Don't buy token above this (momentum at high prices is stronger
-                             # + fees are lower near extremes; 0.90 avoids only the thin 0.90+ zone)
-MIN_BURST_PRICE = 0.45       # Burst side must be >= this to ride (ensures meaningful signal)
+BUY_AMOUNT = 10              # Base bet in $
+MAX_BUY_AMOUNT = 30          # Cap per trade
+MIN_ENTRY_PRICE = 0.20       # Don't buy token below this
+MAX_ENTRY_PRICE = 0.90       # Don't buy token above this
+MIN_RR_RATIO = 1.0           # Skip trade if profit_target / stop_loss < this (risk/reward gate)
+
+# Book imbalance signal — LEADING indicator (detects pressure before the move)
+IMBALANCE_RATIO = 2.0        # Bid/ask depth ratio to trigger entry (bid_depth / ask_depth)
+IMBALANCE_DEPTH_RANGE = 0.10 # Look at orders within this range of best price
+IMBALANCE_MIN_DEPTH = 300    # Min bid depth ($) in range to consider (filters thin books)
+IMBALANCE_MAX_SPREAD = 0.04  # Skip if spread > this (too illiquid)
+
+# Limit buy entry — GTC maker order (0% fee, fills atomically, no settlement blind spot)
+LIMIT_BUY_OFFSET = 0.01      # Place buy at best_bid + this (near top of book)
+FILL_TIMEOUT = 15             # Seconds to wait for limit buy fill before cancelling
+SCAN_COOLDOWN = 10.0          # Don't re-signal same token within this many seconds
+
+# Burst detection — still used for trade-window tracking (background, does not trigger entries)
+BURST_WINDOW = 5.0
+BURST_MULTIPLIER = 3.0
+BURST_MIN_ABSOLUTE = 100
+BURST_BASELINE_WINDOW = 60
 
 # Fees — real Polymarket formula: fee = C * feeRate * (p * (1-p))^exponent
 # For 5m/15m crypto: feeRate=0.25, exponent=2. Max ~1.56% at p=0.50.
 # Maker (GTC limit) = 0% fee. Taker (FAK market) = formula-based fee.
 CRYPTO_FEE_RATE = 0.25       # feeRate for 5m/15m crypto markets
 CRYPTO_FEE_EXPONENT = 2      # exponent for 5m/15m crypto markets
-
-# Entry confirmation — pullback entry
-# Instead of buying at the burst peak, wait for a pullback.
-# The burst signals direction; we enter at a better price after the initial spike.
-BURST_CONFIRM_DELAY = 1.0    # Minimum wait before checking entry conditions
-PULLBACK_WINDOW = 5.0        # Max seconds to wait for pullback after confirm delay
-MAX_ENTRY_SPREAD = 0.05      # Skip market if bid-ask spread > this (too illiquid/volatile)
-MIN_PULLBACK = 0.02          # Price must pull back at least this from peak ask before entry
-MIN_RR_RATIO = 1.0           # Skip trade if profit_target / stop_loss < this (risk/reward gate)
 
 # Quick flip exit — defaults (overridden by book analysis when available)
 PROFIT_TARGET = 0.05         # Default limit sell at entry + this (maker, 0% fee)
@@ -283,8 +285,9 @@ class BurstDetector:
         self._windows = defaultdict(deque)
         # token -> deque of (timestamp, cost) — longer baseline window for avg volume
         self._baselines = defaultdict(deque)
-        self._on_burst = on_burst          # callback(token, net_buy, direction)
+        self._on_burst = on_burst          # callback(token, ratio, direction, info)
         self._cooldowns = {}               # token -> last_burst_time
+        self._imbalance_cooldowns = {}     # token -> last_imbalance_signal_time
         self._ws_connected = False
         self._event_count = 0
         self._msg_count = 0
@@ -438,6 +441,7 @@ class BurstDetector:
                     "ts": time.time(),
                 }
         self._fire_price_callbacks(asset_id)
+        self._check_imbalance(asset_id)
 
     def _on_price_change(self, data):
         """Incrementally update order book from price_change events."""
@@ -482,6 +486,7 @@ class BurstDetector:
                     }
 
             self._fire_price_callbacks(asset_id)
+            self._check_imbalance(asset_id)
 
     async def _sync_subscriptions(self, ws):
         with self._lock:
@@ -578,42 +583,8 @@ class BurstDetector:
             if now - last_burst < COOLDOWN_AFTER_ENTRY:
                 return
 
-            # Check per-market cooldown (both UP and DOWN sides)
-            info = self._token_info.get(asset_id, {})
-            market_q = info.get("market", "")
-            if market_q:
-                # Check loss lockout first (longer lockout after stop-loss)
-                lockout_until = self._loss_lockouts.get(market_q, 0)
-                if now < lockout_until:
-                    return
-                last_market = self._market_cooldowns.get(market_q, 0)
-                if now - last_market < MARKET_COOLDOWN:
-                    return
-
-            # Check burst threshold — BOTH buying and selling bursts
-            # Dynamic: proportional to this token's recent volume
-            burst_direction = None
-            burst_amount = 0
-            if net >= dynamic_threshold:
-                burst_direction = "BUY"
-                burst_amount = net
-            elif (-net) >= dynamic_threshold:
-                burst_direction = "SELL"
-                burst_amount = -net
-
-            if burst_direction:
-                self._cooldowns[asset_id] = now
-                if market_q:
-                    self._market_cooldowns[market_q] = now
-                # Clear window after firing (don't re-trigger on same trades)
-                window.clear()
-
-        # Fire callback outside lock — pass threshold for logging
-        if burst_direction:
-            info = self._token_info.get(asset_id, {})
-            info['_dynamic_threshold'] = round(dynamic_threshold, 0)
-            info['_baseline_avg'] = round(avg_vol_per_window, 0)
-            self._on_burst(asset_id, burst_amount, burst_direction, info)
+            # Burst detection disabled — entry signals come from book imbalance scanner.
+            # Window/baseline tracking kept for potential future use.
 
     def set_loss_lockout(self, market_question, duration=None):
         """Lock out a market for LOSS_LOCKOUT seconds after a stop-loss/timeout."""
@@ -658,6 +629,82 @@ class BurstDetector:
                 cb(asset_id)
             except Exception:
                 pass
+
+    # --- Book imbalance scanner ---
+
+    def _check_imbalance(self, asset_id):
+        """Check if order book shows significant buy-side imbalance.
+        Called on every book/price update. Fires callback if imbalance
+        exceeds threshold and cooldowns are clear."""
+        now = time.time()
+
+        with self._lock:
+            book = self._books.get(asset_id)
+            if not book or now - book.get("ts", 0) > 30:
+                return
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            if not bids or not asks:
+                return
+
+            best_bid = bids[0][0]
+            best_ask = asks[0][0]
+            spread = best_ask - best_bid
+            if spread <= 0 or spread > IMBALANCE_MAX_SPREAD:
+                return
+
+            # Compute near-money depth (orders within IMBALANCE_DEPTH_RANGE of best price)
+            bid_depth = sum(p * s for p, s in bids if p >= best_bid - IMBALANCE_DEPTH_RANGE)
+            ask_depth = sum(p * s for p, s in asks if p <= best_ask + IMBALANCE_DEPTH_RANGE)
+
+            if bid_depth < IMBALANCE_MIN_DEPTH:
+                return
+            if ask_depth <= 0:
+                return
+
+            ratio = bid_depth / ask_depth
+            if ratio < IMBALANCE_RATIO:
+                return
+
+            # --- Cooldown checks (under lock) ---
+            # Per-token scan cooldown
+            last_scan = self._imbalance_cooldowns.get(asset_id, 0)
+            if now - last_scan < SCAN_COOLDOWN:
+                return
+
+            # Per-token entry cooldown
+            last_entry = self._cooldowns.get(asset_id, 0)
+            if now - last_entry < COOLDOWN_AFTER_ENTRY:
+                return
+
+            # Per-market cooldown + loss lockout
+            info = self._token_info.get(asset_id, {})
+            market_q = info.get("market", "")
+            if market_q:
+                lockout_until = self._loss_lockouts.get(market_q, 0)
+                if now < lockout_until:
+                    return
+                last_market = self._market_cooldowns.get(market_q, 0)
+                if now - last_market < MARKET_COOLDOWN:
+                    return
+
+            # All checks passed — set cooldowns
+            self._imbalance_cooldowns[asset_id] = now
+            self._cooldowns[asset_id] = now
+            if market_q:
+                self._market_cooldowns[market_q] = now
+
+            # Copy info for callback (outside lock)
+            info = dict(self._token_info.get(asset_id, {}))
+            info['_bid_depth'] = round(bid_depth, 0)
+            info['_ask_depth'] = round(ask_depth, 0)
+            info['_ratio'] = round(ratio, 2)
+            info['_spread'] = round(spread, 4)
+            info['_best_bid'] = best_bid
+            info['_best_ask'] = best_ask
+
+        # Fire callback outside lock
+        self._on_burst(asset_id, ratio, "BUY_IMBALANCE", info)
 
     def on_price_update(self, token_id, callback):
         """Register a callback to be called on every price update for token_id.
@@ -1307,10 +1354,10 @@ def run_burst():
     positions_lock = threading.Lock()
     session_pnl = [0.0]   # mutable container for thread access
 
-    def on_burst(token_id, net_volume, direction, info):
-        """Called from WS thread when a burst is detected — MOMENTUM: ride the burst.
-        direction='BUY'  → heavy buying on this token → buy THIS token (ride it)
-        direction='SELL' → heavy selling on this token → buy OPPOSITE token (that side is winning)
+    def on_imbalance(token_id, ratio, direction, info):
+        """Called from WS thread when order book imbalance is detected.
+        direction='BUY_IMBALANCE' → bid depth >> ask depth on this token → buy it.
+        Limit buy at best_bid + offset (maker, 0% fee).
         """
         if not info:
             return
@@ -1328,7 +1375,12 @@ def run_burst():
                     return
 
         market = info.get("market", "?")
-        burst_side = info.get("side", "UP")  # which side this token represents
+        buy_side = info.get("side", "UP")  # which side this token represents
+        best_bid = info.get('_best_bid', 0)
+        best_ask = info.get('_best_ask', 0)
+        bid_depth = info.get('_bid_depth', 0)
+        ask_depth = info.get('_ask_depth', 0)
+        spread = info.get('_spread', 0)
 
         # Check time remaining — don't enter markets near resolution
         market_end = parse_market_end_time(market)
@@ -1336,339 +1388,233 @@ def run_burst():
             now_utc = datetime.now(timezone.utc)
             remaining = (market_end - now_utc).total_seconds()
             if remaining < MIN_TIME_REMAINING:
-                log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — only {remaining:.0f}s left (need {MIN_TIME_REMAINING}s)")
+                log(f"  📊 Imbalance on {market} {buy_side}: ratio {ratio:.1f}x — only {remaining:.0f}s left")
                 return
 
-        # MOMENTUM LOGIC: determine which token to buy (ride the burst)
-        if direction == "BUY":
-            # Heavy buying on this token → buy THIS token (ride the momentum)
-            fade_token = token_id
-            fade_side = burst_side
-            fade_reason = f"ride {burst_side} buying"
-        else:
-            # Heavy selling on this token → buy the OPPOSITE token (that side is winning)
-            if burst_side == "UP":
-                fade_token = tokens[1]   # buy DOWN
-                fade_side = "DOWN"
-            else:
-                fade_token = tokens[0]   # buy UP
-                fade_side = "UP"
-            fade_reason = f"ride vs {burst_side} selling"
-
-        # Check burst side price — must be elevated enough to be meaningful
-        burst_price = get_price(token_id, side=BUY)
-        if direction == "BUY" and burst_price < MIN_BURST_PRICE:
-            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — burst price {burst_price:.2f} too low to ride")
+        # Price range check
+        if best_ask <= 0 or best_ask >= 1:
             return
-        if direction == "SELL" and burst_price > (1 - MIN_BURST_PRICE):
-            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — burst price {burst_price:.2f} too high to ride")
+        if best_ask < MIN_ENTRY_PRICE:
+            log(f"  📊 Imbalance on {market} {buy_side}: ratio {ratio:.1f}x — price {best_ask:.2f} too cheap")
+            return
+        if best_ask > MAX_ENTRY_PRICE:
+            log(f"  📊 Imbalance on {market} {buy_side}: ratio {ratio:.1f}x — price {best_ask:.2f} too expensive")
             return
 
-        # Get the BUY token's price (the one we're buying)
-        price = get_price(fade_token, side=BUY)
-        if price <= 0 or price >= 1:
-            return
-        if price < MIN_ENTRY_PRICE:
-            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — {fade_side} at {price:.2f} too cheap")
-            return
-        if price > MAX_ENTRY_PRICE:
-            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — {fade_side} at {price:.2f} too expensive")
-            return
+        # Compute limit buy price: best_bid + offset (sits near top of book)
+        limit_price = round(best_bid + LIMIT_BUY_OFFSET, 2)
+        if limit_price >= best_ask:
+            # Our limit is at or above the ask — would cross the spread.
+            # Place at best_bid instead (pure maker, slightly lower fill chance).
+            limit_price = best_bid
+
+        # Pre-buy R:R gate — check book TP/SL before committing
+        if _detector_ref and (BOOK_TP_ENABLED or BOOK_SL_ENABLED):
+            pre_analysis = _detector_ref.analyze_book(token_id, entry_price=limit_price)
+            if pre_analysis:
+                pre_tp = pre_analysis["suggested_tp"]
+                pre_sl = pre_analysis["suggested_sl"]
+                pre_rr = pre_tp / pre_sl if pre_sl > 0 else 999
+                if pre_rr < MIN_RR_RATIO:
+                    log(f"  📊 Imbalance on {market} {buy_side}: ratio {ratio:.1f}x — bad R:R ({pre_rr:.1f}x < {MIN_RR_RATIO}x)")
+                    return
 
         # Check balance
         bal = get_usdc_balance()
         if bal is None or bal < MIN_BALANCE_BUFFER + BUY_AMOUNT:
-            log(f"  ⚡ Burst on {market} {burst_side}: ${net_volume:.0f} {direction} — insufficient balance (${bal or 0:.2f}, need ${MIN_BALANCE_BUFFER + BUY_AMOUNT:.0f})")
+            log(f"  📊 Imbalance on {market} {buy_side}: ratio {ratio:.1f}x — insufficient balance (${bal or 0:.2f})")
             return
 
-        # Scale bet proportional to burst size relative to the dynamic threshold
-        dyn_thresh = info.get('_dynamic_threshold', BURST_MIN_ABSOLUTE)
-        burst_ratio = net_volume / dyn_thresh
-        scaled_amount = round(BUY_AMOUNT * burst_ratio, 2)
-        amount = min(scaled_amount, MAX_BUY_AMOUNT, bal - MIN_BALANCE_BUFFER)
+        amount = min(BUY_AMOUNT, MAX_BUY_AMOUNT, bal - MIN_BALANCE_BUFFER)
+        est_shares = math.floor(amount / limit_price * 100) / 100
+        if est_shares < 5:
+            log(f"  📊 Imbalance on {market} {buy_side}: shares {est_shares:.1f} below min 5")
+            return
 
-        baseline_avg = info.get('_baseline_avg', 0)
-        log(f"\n🎯 RIDE BURST: {market} — {fade_reason}")
-        log(f"  Burst: ${net_volume:.0f} {direction} on {burst_side} (price {burst_price:.2f}) | thresh ${dyn_thresh:.0f} (baseline ${baseline_avg:.0f})")
-        log(f"  Will buy {fade_side} — waiting for pullback (ask {price:.2f}), Bet: ${amount:.0f} ({burst_ratio:.1f}x burst)")
+        log(f"\n📊 BOOK IMBALANCE: {market} — buy {buy_side}")
+        log(f"  Bid ${bid_depth:.0f} / Ask ${ask_depth:.0f} = {ratio:.1f}x ratio | spread {spread:.2f}")
+        log(f"  Limit buy {est_shares:.0f}sh at {limit_price:.2f} (best_bid {best_bid:.2f}, ask {best_ask:.2f}), ${amount:.0f}")
 
         if DRY_RUN:
-            # Simulate: assume market buy fills at ask price after confirm delay
-            shares = amount / price
-            log(f"  🧪 DRY-RUN: market buy {shares:.0f}sh of {fade_side} at {price:.2f} (taker fee)")
+            shares = amount / limit_price
+            log(f"  🧪 DRY-RUN: limit buy {shares:.0f}sh of {buy_side} at {limit_price:.2f} (maker, 0% fee)")
             record = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "action": "DRY_MOMENTUM_BUY",
+                "action": "DRY_IMBALANCE_BUY",
                 "market": market,
-                "burst_side": burst_side,
-                "fade_side": fade_side,
-                "burst_direction": direction,
-                "fade_reason": fade_reason,
-                "token": fade_token,
-                "burst_token": token_id,
-                "price": price,
-                "ask_price": price,
-                "burst_price": burst_price,
+                "buy_side": buy_side,
+                "token": token_id,
+                "limit_price": limit_price,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "bid_depth": bid_depth,
+                "ask_depth": ask_depth,
+                "ratio": ratio,
                 "amount": amount,
-                "burst_net": net_volume,
-                "entry_is_maker": False,
+                "entry_is_maker": True,
             }
             with open(TRADE_LOG, "a") as f:
                 f.write(json.dumps(record) + "\n")
 
-            # Track position and start flip monitor
-            pos_info = {"market": market, "side": fade_side, "entry_price": price, "shares": shares,
-                        "fade_reason": fade_reason, "burst_side": burst_side, "entry_is_maker": False}
+            pos_info = {"market": market, "side": buy_side, "entry_price": limit_price, "shares": shares,
+                        "fade_reason": f"imbalance {ratio:.1f}x", "burst_side": buy_side, "entry_is_maker": True}
             with positions_lock:
-                positions[fade_token] = pos_info
+                positions[token_id] = pos_info
 
-            reason, pnl = quick_flip(fade_token, price, shares, pos_info)
+            reason, pnl = quick_flip(token_id, limit_price, shares, pos_info)
             session_pnl[0] += pnl
             with positions_lock:
-                positions.pop(fade_token, None)
+                positions.pop(token_id, None)
             return
 
-        # LIVE: move entire buy+flip flow into a thread so WS keeps receiving
-        # Reserve position slot immediately to prevent double-entry
+        # LIVE: reserve position slot and spawn buy thread
         with positions_lock:
-            positions[fade_token] = {"market": market, "side": fade_side, "entry_price": price,
-                                     "shares": 0, "fade_reason": fade_reason, "burst_side": burst_side,
-                                     "entry_is_maker": False, "status": "buying"}
+            positions[token_id] = {"market": market, "side": buy_side, "entry_price": limit_price,
+                                   "shares": 0, "fade_reason": f"imbalance {ratio:.1f}x",
+                                   "burst_side": buy_side, "entry_is_maker": True, "status": "buying"}
 
-        def do_buy_and_flip():
+        def do_limit_buy_and_flip():
             try:
-                # === PULLBACK ENTRY ===
-                # Instead of buying at the burst peak, wait for the initial spike
-                # to pull back. This gives us a better entry price and confirms
-                # the move isn't just a momentary spike.
-                #
-                # Phase 1: Wait BURST_CONFIRM_DELAY (minimum settling time)
-                # Phase 2: Monitor for up to PULLBACK_WINDOW seconds for:
-                #   - Spread to narrow below MAX_ENTRY_SPREAD (market is tradeable)
-                #   - Price has pulled back from peak (better entry)
-                #   - Bid is above our planned stop (not entering a crash)
-
-                original_ask = price  # from closure: ask at burst detection time
-                peak_ask = original_ask
                 entry_start = time.time()
 
-                # Phase 1: minimum settling time
-                if BURST_CONFIRM_DELAY > 0:
-                    time.sleep(BURST_CONFIRM_DELAY)
-
-                # Phase 2: wait for pullback + good conditions
-                current_ask = None
-                current_bid = None
-                entry_spread = None
-                entry_ok = False
-                pullback_deadline = entry_start + BURST_CONFIRM_DELAY + PULLBACK_WINDOW
-
-                while time.time() < pullback_deadline:
-                    current_ask = get_price(fade_token, side=BUY)
-                    current_bid = get_price(fade_token, side=SELL)
-                    if current_ask <= 0 or current_bid <= 0:
-                        time.sleep(0.3)
-                        continue
-
-                    # Track peak ask (it may still be rising)
-                    if current_ask > peak_ask:
-                        peak_ask = current_ask
-
-                    entry_spread = round(current_ask - current_bid, 4)
-
-                    # Gate 1: spread must be reasonable
-                    if entry_spread > MAX_ENTRY_SPREAD:
-                        time.sleep(0.3)
-                        continue
-
-                    # Gate 2: price must have pulled back from peak
-                    pullback = peak_ask - current_ask
-                    if pullback < MIN_PULLBACK:
-                        time.sleep(0.3)
-                        continue
-
-                    # Gate 3: price still in valid range
-                    if current_ask < MIN_ENTRY_PRICE or current_ask > MAX_ENTRY_PRICE:
-                        time.sleep(0.3)
-                        continue
-
-                    # Gate 4: momentum hasn't fully reversed (price not too far below original)
-                    if current_ask < original_ask - STOP_LOSS * 2:
-                        break  # Too far gone — abort
-
-                    # Gate 5: bid is above planned stop (not entering a crash)
-                    # Rough stop estimate: bid - SL_default
-                    if current_bid < current_ask - STOP_LOSS * 2 - MAX_ENTRY_SPREAD:
-                        time.sleep(0.3)
-                        continue
-
-                    # All gates passed!
-                    entry_ok = True
-                    break
-
-                if not entry_ok:
-                    reason = "pullback timeout"
-                    if current_ask is not None and current_ask < original_ask - STOP_LOSS * 2:
-                        reason = f"reversed too far (ask {original_ask:.2f}→{current_ask:.2f})"
-                    elif entry_spread is not None and entry_spread > MAX_ENTRY_SPREAD:
-                        reason = f"spread too wide ({entry_spread:.2f})"
-                    elif current_ask is not None:
-                        pullback = peak_ask - current_ask
-                        reason = f"no pullback (peak {peak_ask:.2f}, ask {current_ask:.2f}, pb {pullback:.2f}/{MIN_PULLBACK:.2f})"
-                    log(f"  ⚠ Entry skipped: {reason} after {time.time()-entry_start:.1f}s")
-                    with positions_lock:
-                        positions.pop(fade_token, None)
-                    return
-
-                log(f"  ✓ Pullback entry: peak {peak_ask:.2f} → ask {current_ask:.2f} (pb {peak_ask-current_ask:.2f}), bid {current_bid:.2f}, spread {entry_spread:.2f}")
-
-                # Pre-buy R:R gate — check book TP/SL before committing capital
-                if _detector_ref and (BOOK_TP_ENABLED or BOOK_SL_ENABLED):
-                    pre_analysis = _detector_ref.analyze_book(fade_token, entry_price=current_ask)
-                    if pre_analysis:
-                        pre_tp = pre_analysis["suggested_tp"]
-                        pre_sl = pre_analysis["suggested_sl"]
-                        pre_rr = pre_tp / pre_sl if pre_sl > 0 else 999
-                        if pre_rr < MIN_RR_RATIO:
-                            log(f"  ⚠ Entry skipped: bad R:R — TP {pre_tp:.2f} / SL {pre_sl:.2f} = {pre_rr:.1f}x (need {MIN_RR_RATIO}x)")
-                            with positions_lock:
-                                positions.pop(fade_token, None)
-                            return
-                        log(f"    Pre-buy book: TP +{pre_tp:.2f} / SL -{pre_sl:.2f} = {pre_rr:.1f}x R:R")
-
-                # Re-check balance
-                bal_now = get_usdc_balance()
-                if bal_now is None or bal_now < MIN_BALANCE_BUFFER + BUY_AMOUNT:
-                    log(f"  ⚠ Insufficient balance after delay — skipping")
-                    with positions_lock:
-                        positions.pop(fade_token, None)
-                    return
-
-                buy_amount = min(BUY_AMOUNT, bal_now - MIN_BALANCE_BUFFER)
-                est_shares = round(buy_amount / current_ask, 2)
-                if est_shares < 5:
-                    log(f"  ⚠ Shares {est_shares:.1f} below min order size 5 — skipping")
-                    with positions_lock:
-                        positions.pop(fade_token, None)
-                    return
-
-                # === FAK MARKET BUY (taker, ~1% fee, immediate fill) ===
-                # Fills at current price — no stale limit order sitting on the book
-                # getting adversely filled as the price cascades through it.
-                log(f"  Market buy {fade_side} ~${buy_amount:.0f} at ask {current_ask:.2f} (FAK, taker fee)")
-
-                mo = MarketOrderArgs(
-                    token_id=fade_token,
-                    amount=buy_amount,
+                # === GTC LIMIT BUY (maker, 0% fee) ===
+                # Sits on the order book at our price. Fills atomically when someone
+                # sells into it — no settlement blind spot, no taker fee.
+                buy_order = OrderArgs(
+                    token_id=token_id,
+                    price=limit_price,
+                    size=est_shares,
                     side=BUY,
-                    order_type=OrderType.FAK,
                 )
-                signed = client.create_market_order(mo)
-                resp = client.post_order(signed, OrderType.FAK)
+                signed_buy = client.create_order(buy_order)
+                resp = client.post_order(signed_buy, OrderType.GTC)
 
-                # Check response — FAK orders return status='matched' with transactionsHashes on success
+                order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
                 resp_status = resp.get("status", "") if isinstance(resp, dict) else ""
+                log(f"  📝 Limit buy placed: {est_shares:.0f}sh at {limit_price:.2f} (order {order_id[:8] if order_id else '?'})")
 
-                # Wait for on-chain settlement
-                # FAK fills are matched on CLOB but shares need minting on-chain
-                # Primary: User Channel WS event (instant). Fallback: REST polling.
-                settle_event = threading.Event()
-                def _on_buy_confirmed(trade_info):
+                if not resp_status or resp_status == "error":
+                    log(f"  ⚠ Limit buy rejected: {resp}")
+                    with positions_lock:
+                        positions.pop(token_id, None)
+                    return
+
+                # === WAIT FOR FILL ===
+                # Primary: User Channel WS fires MATCHED/CONFIRMED event
+                # Fallback: REST share balance check every 3s
+                fill_event = threading.Event()
+                def _on_buy_fill(trade_info):
                     if trade_info.get("side") == "BUY":
-                        settle_event.set()
-                user_ws.on_fill(fade_token, _on_buy_confirmed)
+                        fill_event.set()
+                user_ws.on_fill(token_id, _on_buy_fill)
 
+                filled = False
+                fill_deadline = entry_start + FILL_TIMEOUT
                 actual = None
-                # Wait up to 8s total: WS event usually fires in 2-4s
-                if settle_event.wait(timeout=4.0):
-                    # WS confirmed — give chain a moment, then check balance
-                    actual = get_actual_share_balance(fade_token)
-                if actual is None or actual < 5:
-                    # REST fallback: poll a few times
-                    for settle_attempt in range(3):
-                        time.sleep(1.5)
-                        actual = get_actual_share_balance(fade_token)
+
+                while time.time() < fill_deadline:
+                    remaining = fill_deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    # Wait for WS event or poll interval (whichever comes first)
+                    if fill_event.wait(timeout=min(3.0, remaining)):
+                        # WS confirmed fill — check share balance
+                        time.sleep(0.3)  # brief pause for chain
+                        actual = get_actual_share_balance(token_id)
                         if actual is not None and actual >= 5:
+                            filled = True
                             break
-                        log(f"  ⏳ Settlement check {settle_attempt+1}/3: balance {actual} (waiting...)")
+                    else:
+                        # REST fallback check
+                        actual = get_actual_share_balance(token_id)
+                        if actual is not None and actual >= 5:
+                            filled = True
+                            break
 
-                user_ws.remove_fill_callback(fade_token, _on_buy_confirmed)
+                user_ws.remove_fill_callback(token_id, _on_buy_fill)
 
-                if actual is None or actual < 5:
-                    log(f"  ⚠ FAK buy failed to fill (balance: {actual}, resp: {resp_status}) — skipping")
-                    # Dump any dust shares
+                if not filled:
+                    # Final check before giving up
+                    actual = get_actual_share_balance(token_id)
+                    if actual is not None and actual >= 5:
+                        filled = True
+
+                if not filled:
+                    # No fill — cancel the limit order and release position
+                    elapsed = time.time() - entry_start
+                    log(f"  ⏰ Limit buy not filled after {elapsed:.1f}s — cancelling")
+                    cancel_all_orders_for_token(token_id)
+                    # Dump any partial fill dust
                     if actual and actual > 0:
                         try:
-                            dump_mo = MarketOrderArgs(token_id=fade_token, amount=actual, side=SELL, order_type=OrderType.FAK)
+                            dump_mo = MarketOrderArgs(token_id=token_id, amount=actual, side=SELL, order_type=OrderType.FAK)
                             signed_dump = client.create_market_order(dump_mo)
                             client.post_order(signed_dump, OrderType.FAK)
                             log(f"  🧹 Dumped {actual:.1f} dust shares")
                         except Exception:
                             pass
                     with positions_lock:
-                        positions.pop(fade_token, None)
+                        positions.pop(token_id, None)
                     return
 
+                # === FILLED — start exit ===
                 buy_shares = math.floor(actual * 100) / 100
-                fill_price = current_ask  # Approximate (FAK fills at or near ask)
-                entry_fee = compute_taker_fee(buy_shares, fill_price)
+                fill_price = limit_price  # Maker fills at limit price or better
+                elapsed = time.time() - entry_start
 
-                log(f"  ✓ Market buy filled: ~{buy_shares:.0f}sh of {fade_side} at ~{fill_price:.2f} (taker fee ~${entry_fee:.2f}) [{fade_reason}]")
+                log(f"  ✓ Limit buy filled: {buy_shares:.0f}sh of {buy_side} at {fill_price:.2f} (maker, 0% fee) in {elapsed:.1f}s")
+
+                # Cancel any remaining open orders for this token (partial fills leave resting qty)
+                cancel_all_orders_for_token(token_id)
 
                 record = {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "action": "MOMENTUM_BUY",
+                    "action": "IMBALANCE_BUY",
                     "market": market,
-                    "burst_side": burst_side,
-                    "fade_side": fade_side,
-                    "burst_direction": direction,
-                    "fade_reason": fade_reason,
-                    "token": fade_token,
-                    "burst_token": token_id,
-                    "ask_price": current_ask,
+                    "buy_side": buy_side,
+                    "token": token_id,
+                    "limit_price": limit_price,
                     "fill_price": fill_price,
-                    "burst_price": burst_price,
-                    "amount": buy_amount,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "bid_depth": bid_depth,
+                    "ask_depth": ask_depth,
+                    "ratio": ratio,
+                    "amount": amount,
                     "shares": buy_shares,
-                    "burst_net": net_volume,
-                    "entry_is_maker": False,
-                    "confirm_delay": round(time.time() - entry_start, 2),
-                    "original_ask": original_ask,
-                    "peak_ask": peak_ask,
-                    "entry_ask": current_ask,
-                    "entry_bid": current_bid,
-                    "entry_spread": entry_spread,
-                    "pullback": round(peak_ask - current_ask, 4),
+                    "entry_is_maker": True,
+                    "fill_time": round(elapsed, 2),
                     "response": str(resp),
                 }
                 with open(TRADE_LOG, "a") as f:
                     f.write(json.dumps(record) + "\n")
 
                 # Update position with real shares and start flip
-                pos_info = {"market": market, "side": fade_side, "entry_price": fill_price, "shares": buy_shares,
-                            "fade_reason": fade_reason, "burst_side": burst_side, "entry_is_maker": False}
+                pos_info = {"market": market, "side": buy_side, "entry_price": fill_price, "shares": buy_shares,
+                            "fade_reason": f"imbalance {ratio:.1f}x", "burst_side": buy_side, "entry_is_maker": True}
                 with positions_lock:
-                    positions[fade_token] = pos_info
+                    positions[token_id] = pos_info
 
-                reason, pnl = quick_flip(fade_token, fill_price, buy_shares, pos_info)
+                reason, pnl = quick_flip(token_id, fill_price, buy_shares, pos_info)
                 session_pnl[0] += pnl
                 with positions_lock:
-                    positions.pop(fade_token, None)
+                    positions.pop(token_id, None)
 
-                # After a losing exit, lock out this market to avoid piling into a loser
+                # After a losing exit, lock out this market
                 if reason in ("stop_loss", "timeout"):
                     detector.set_loss_lockout(market)
 
             except Exception as e:
-                log(f"  ✗ Momentum buy failed: {e}")
+                log(f"  ✗ Imbalance buy failed: {e}")
+                cancel_all_orders_for_token(token_id)
                 with positions_lock:
-                    positions.pop(fade_token, None)
+                    positions.pop(token_id, None)
 
-        threading.Thread(target=do_buy_and_flip, daemon=True).start()
+        threading.Thread(target=do_limit_buy_and_flip, daemon=True).start()
 
-    # Create burst detector
+    # Create burst detector (now used for book imbalance scanning)
     global _detector_ref, _user_ws_ref
-    detector = BurstDetector(on_burst=on_burst)
+    detector = BurstDetector(on_burst=on_imbalance)
     _detector_ref = detector
     detector.start()
 
@@ -1681,14 +1627,13 @@ def run_burst():
     log(f"\n{'='*60}")
     if DRY_RUN:
         log(f"🧪 DRY-RUN MODE — no orders will be placed")
-    log(f"� MOMENTUM burst bot (ride-the-burst)")
-    log(f"Detection: {BURST_WINDOW}s window, proportional threshold ({BURST_MULTIPLIER}x baseline, floor ${BURST_MIN_ABSOLUTE}, {BURST_BASELINE_WINDOW}s baseline)")
-    log(f"Momentum logic: buy bursts → buy same side | sell bursts → buy opposite side")
-    log(f"Entry: pullback entry ({BURST_CONFIRM_DELAY}s settle + {PULLBACK_WINDOW}s window, spread<{MAX_ENTRY_SPREAD}, pb>={MIN_PULLBACK}, R:R>={MIN_RR_RATIO})")
+    log(f"📊 BOOK IMBALANCE bot — order book depth strategy")
+    log(f"Signal: bid/ask depth ratio > {IMBALANCE_RATIO}x (range ±{IMBALANCE_DEPTH_RANGE}, min bid ${IMBALANCE_MIN_DEPTH}, max spread {IMBALANCE_MAX_SPREAD})")
+    log(f"Entry: GTC limit buy at best_bid + {LIMIT_BUY_OFFSET} (maker 0%) | fill timeout {FILL_TIMEOUT}s | scan cooldown {SCAN_COOLDOWN}s")
     log(f"Exit: dynamic TP/SL from book (defaults +{PROFIT_TARGET}/-{STOP_LOSS}) | wall min ${BOOK_WALL_MIN_SIZE}")
     log(f"  Book TP: {'ON' if BOOK_TP_ENABLED else 'OFF'} (range {BOOK_TP_MIN}-{BOOK_TP_MAX}), Book SL: {'ON' if BOOK_SL_ENABLED else 'OFF'} (range {BOOK_SL_MIN}-{BOOK_SL_MAX})")
     log(f"Timeout: {FLIP_TIMEOUT}s | Monitor: event-driven (WS price callbacks), REST fallback 5s")
-    log(f"Entry price: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}, Burst min: {MIN_BURST_PRICE}")
+    log(f"Entry price: {MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}, R:R gate >= {MIN_RR_RATIO}x")
     log(f"Cooldowns: {COOLDOWN_AFTER_ENTRY}s/token, {MARKET_COOLDOWN}s/market, {LOSS_LOCKOUT}s/loss-lockout")
     log(f"Time filter: skip markets with <{MIN_TIME_REMAINING}s remaining")
     log(f"Max positions: {MAX_CONCURRENT_POSITIONS}")
