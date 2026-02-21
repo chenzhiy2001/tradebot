@@ -14,8 +14,9 @@ Signals:
 
 Detection:
   - Sliding 5-second window of trades per token
-  - Buy burst = net buy $ exceeds BURST_THRESHOLD → ride it
-  - Sell burst = net sell $ exceeds BURST_THRESHOLD → ride it
+  - Buy burst = net buy $ exceeds dynamic threshold → ride it
+  - Sell burst = net sell $ exceeds dynamic threshold → ride it
+  - Threshold = max(BURST_MIN_ABSOLUTE, baseline_avg × BURST_MULTIPLIER)
   - Only ride when burst side is elevated (>=45¢) — ensures meaningful signal
 
 Exit (quick flip):
@@ -68,8 +69,11 @@ FUNDER_ADDRESS = founder_address
 BUY_AMOUNT = 10              # Base bet in $ (at threshold burst)
 MAX_BUY_AMOUNT = 30          # Cap per trade regardless of burst size
 BURST_WINDOW = 5.0           # Seconds — detect bursts within this window
-BURST_THRESHOLD = 300        # $ net volume in the window to trigger (lowered from 700 —
-                             # momentum benefits from catching early signals; more trades)
+BURST_MULTIPLIER = 3.0       # Trigger when 5s net volume > baseline_avg × this
+                             # (proportional to market activity — $300 in a quiet SOL market
+                             #  is huge, but noise in a busy BTC market)
+BURST_MIN_ABSOLUTE = 100     # Minimum absolute $ burst regardless of ratio (avoid noise)
+BURST_BASELINE_WINDOW = 60   # Seconds of history for computing volume baseline
 MIN_ENTRY_PRICE = 0.20       # Don't buy token below this (at low prices $10 buys
                              # 50-111 shares, so even a clean 0.03 stop = $1.50-$3.33 loss)
 MAX_ENTRY_PRICE = 0.90       # Don't buy token above this (momentum at high prices is stronger
@@ -286,14 +290,19 @@ class BurstDetector:
     """
     Maintains a per-token sliding window of trades.
     On each new trade, checks if a burst has occurred:
-      net buy $ in last BURST_WINDOW seconds >= BURST_THRESHOLD
-    If so, fires a callback.
+      net $ in last BURST_WINDOW seconds >= dynamic threshold
+    Threshold is proportional to recent market activity:
+      threshold = max(BURST_MIN_ABSOLUTE, baseline_avg_per_window * BURST_MULTIPLIER)
+    This adapts to each token's volume — quiet markets trigger on smaller absolute
+    bursts, busy markets require proportionally larger ones.
     """
 
     def __init__(self, on_burst):
         self._lock = threading.Lock()
-        # token -> deque of (timestamp, side, cost)
+        # token -> deque of (timestamp, side, cost) — short 5s burst window
         self._windows = defaultdict(deque)
+        # token -> deque of (timestamp, cost) — longer baseline window for avg volume
+        self._baselines = defaultdict(deque)
         self._on_burst = on_burst          # callback(token, net_buy, direction)
         self._cooldowns = {}               # token -> last_burst_time
         self._ws_connected = False
@@ -392,6 +401,7 @@ class BurstDetector:
             with self._lock:
                 for t in removed:
                     self._windows.pop(t, None)
+                    self._baselines.pop(t, None)
 
         if changed and self._active:
             self._active = set()
@@ -421,13 +431,32 @@ class BurstDetector:
         cost = size * price
 
         with self._lock:
+            # Update burst window (short, 5s)
             window = self._windows[asset_id]
             window.append((now, side, cost))
+
+            # Update baseline window (longer, 60s)
+            baseline = self._baselines[asset_id]
+            baseline.append((now, cost))
 
             # Prune old trades outside the burst window
             cutoff = now - BURST_WINDOW
             while window and window[0][0] < cutoff:
                 window.popleft()
+
+            # Prune old trades outside the baseline window
+            baseline_cutoff = now - BURST_BASELINE_WINDOW
+            while baseline and baseline[0][0] < baseline_cutoff:
+                baseline.popleft()
+
+            # Compute baseline: average $ volume per BURST_WINDOW-sized chunk
+            total_baseline_vol = sum(c for _, c in baseline)
+            baseline_duration = max(now - baseline[0][0], BURST_WINDOW) if baseline else BURST_WINDOW
+            num_windows = baseline_duration / BURST_WINDOW
+            avg_vol_per_window = total_baseline_vol / num_windows if num_windows > 0 else 0
+
+            # Dynamic threshold: proportional to recent activity
+            dynamic_threshold = max(BURST_MIN_ABSOLUTE, avg_vol_per_window * BURST_MULTIPLIER)
 
             # Compute net buy in window
             net_buy = 0.0
@@ -458,13 +487,14 @@ class BurstDetector:
                     return
 
             # Check burst threshold — BOTH buying and selling bursts
+            # Dynamic: proportional to this token's recent volume
             burst_direction = None
             burst_amount = 0
-            if net >= BURST_THRESHOLD:
-                burst_direction = "BUY"   # heavy buying → fade by buying opposite
+            if net >= dynamic_threshold:
+                burst_direction = "BUY"
                 burst_amount = net
-            elif (-net) >= BURST_THRESHOLD:
-                burst_direction = "SELL"  # heavy selling → fade by buying this token
+            elif (-net) >= dynamic_threshold:
+                burst_direction = "SELL"
                 burst_amount = -net
 
             if burst_direction:
@@ -474,9 +504,11 @@ class BurstDetector:
                 # Clear window after firing (don't re-trigger on same trades)
                 window.clear()
 
-        # Fire callback outside lock
+        # Fire callback outside lock — pass threshold for logging
         if burst_direction:
             info = self._token_info.get(asset_id, {})
+            info['_dynamic_threshold'] = round(dynamic_threshold, 0)
+            info['_baseline_avg'] = round(avg_vol_per_window, 0)
             self._on_burst(asset_id, burst_amount, burst_direction, info)
 
     def set_loss_lockout(self, market_question, duration=None):
@@ -851,14 +883,16 @@ def run_burst():
         if bal is None or bal < MIN_BALANCE_BUFFER + BUY_AMOUNT:
             return
 
-        # Scale bet proportional to burst size: $500 burst → $10, $1000 → $20, etc.
-        burst_multiplier = net_volume / BURST_THRESHOLD
-        scaled_amount = round(BUY_AMOUNT * burst_multiplier, 2)
+        # Scale bet proportional to burst size relative to the dynamic threshold
+        dyn_thresh = info.get('_dynamic_threshold', BURST_MIN_ABSOLUTE)
+        burst_ratio = net_volume / dyn_thresh
+        scaled_amount = round(BUY_AMOUNT * burst_ratio, 2)
         amount = min(scaled_amount, MAX_BUY_AMOUNT, bal - MIN_BALANCE_BUFFER)
 
-        log(f"\n� RIDE BURST: {market} — {fade_reason}")
-        log(f"  Burst: ${net_volume:.0f} {direction} on {burst_side} (price {burst_price:.2f})")
-        log(f"  Will buy {fade_side} after {BURST_CONFIRM_DELAY}s confirm (ask {price:.2f}), Bet: ${amount:.0f} ({burst_multiplier:.1f}x burst)")
+        baseline_avg = info.get('_baseline_avg', 0)
+        log(f"\n🎯 RIDE BURST: {market} — {fade_reason}")
+        log(f"  Burst: ${net_volume:.0f} {direction} on {burst_side} (price {burst_price:.2f}) | thresh ${dyn_thresh:.0f} (baseline ${baseline_avg:.0f})")
+        log(f"  Will buy {fade_side} after {BURST_CONFIRM_DELAY}s confirm (ask {price:.2f}), Bet: ${amount:.0f} ({burst_ratio:.1f}x burst)")
 
         if DRY_RUN:
             # Simulate: assume market buy fills at ask price after confirm delay
@@ -1058,7 +1092,7 @@ def run_burst():
     if DRY_RUN:
         log(f"🧪 DRY-RUN MODE — no orders will be placed")
     log(f"� MOMENTUM burst bot (ride-the-burst)")
-    log(f"Detection: {BURST_WINDOW}s window, ${BURST_THRESHOLD} threshold (buy + sell bursts)")
+    log(f"Detection: {BURST_WINDOW}s window, proportional threshold ({BURST_MULTIPLIER}x baseline, floor ${BURST_MIN_ABSOLUTE}, {BURST_BASELINE_WINDOW}s baseline)")
     log(f"Momentum logic: buy bursts → buy same side | sell bursts → buy opposite side")
     log(f"Entry: market buy (FAK, taker fee) after {BURST_CONFIRM_DELAY}s confirm delay")
     log(f"Exit: limit sell at +{PROFIT_TARGET} (maker 0% fee) / -{STOP_LOSS} stop / {FLIP_TIMEOUT}s timeout")
