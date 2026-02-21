@@ -70,7 +70,7 @@ BURST_WINDOW = 5.0           # Seconds — detect bursts within this window
 BURST_THRESHOLD = 500        # $ net volume in the window to trigger (was 200, too low)
 MIN_ENTRY_PRICE = 0.08       # Don't buy fade token below this (dead side)
 MAX_ENTRY_PRICE = 0.55       # Don't buy fade token above this (too expensive for contrarian)
-MIN_BURST_PRICE = 0.55       # Burst side must be >= this to fade (was 0.60, slightly relaxed)
+MIN_BURST_PRICE = 0.45       # Burst side must be >= this to fade (lowered from 0.55 — was blocking valid 50/50 zone trades)
 
 # Fees — real Polymarket formula: fee = C * feeRate * (p * (1-p))^exponent
 # For 5m/15m crypto: feeRate=0.25, exponent=2. Max ~1.56% at p=0.50.
