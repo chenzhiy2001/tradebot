@@ -112,8 +112,8 @@ REANALYSIS_INTERVAL = 300     # Reanalyze every 5 minutes (not per-window)
 # Bayesian model
 DEFAULT_VOL_PER_SEC = 5.8e-5  # Default σ per √second (~0.1% per 5min window)
 MIN_WINDOWS_FOR_VOL = 10      # Need this many completed windows before using empirical vol
-VOL_LOOKBACK_WINDOWS = 100    # Only use the most recent N windows for vol estimation
-                              # (~8 windows/hr → last ~12 hours of data)
+DATA_LOOKBACK_SECS = 7200     # Use data from the last 2 hours for both σ and signal reanalysis
+                              # (vol regimes and market microstructure both shift hourly)
 
 # Polymarket fee formula (5m/15m crypto)
 CRYPTO_FEE_RATE = 0.25
@@ -230,7 +230,14 @@ class BayesianEngine:
                     if op and cp and op > 0:
                         ret = math.log(cp / op)  # log return for consistency with P(UP) model
                         duration = interval * 60
-                        self._window_returns.append((ret, duration))
+                        # Use window_end timestamp if available, else 0 (will be filtered by recency)
+                        ts_str = rec.get("window_end") or rec.get("timestamp", "")
+                        try:
+                            from datetime import datetime as _dt
+                            ts = _dt.fromisoformat(ts_str).timestamp() if ts_str else 0
+                        except Exception:
+                            ts = 0
+                        self._window_returns.append((ret, duration, ts))
                         loaded += 1
         except Exception as e:
             log(f"  ⚠ Error loading {DATA_FILE}: {e}")
@@ -246,8 +253,9 @@ class BayesianEngine:
         if len(self._window_returns) < MIN_WINDOWS_FOR_VOL:
             return
 
-        # Only use the most recent windows — vol regime changes over time
-        recent = self._window_returns[-VOL_LOOKBACK_WINDOWS:]
+        # Only use recent windows — vol regime changes with market conditions
+        cutoff = time.time() - DATA_LOOKBACK_SECS
+        recent = [(r, d) for r, d, ts in self._window_returns if ts >= cutoff]
 
         # Normalize log returns to per-√second: z_i = log_ret_i / √D_i
         # Under GBM (zero drift), log_ret ~ N(0, σ²t), so z_i ~ N(0, σ²)
@@ -270,7 +278,7 @@ class BayesianEngine:
         ret: simple return (close-open)/open — converted to log return internally."""
         with self._lock:
             log_ret = math.log(1 + ret) if ret > -1 else -10  # log return
-            self._window_returns.append((log_ret, duration_sec))
+            self._window_returns.append((log_ret, duration_sec, time.time()))
 
     def add_signal_outcome(self, signal, outcome):
         """Record a signal and its actual outcome for reanalysis.
@@ -281,13 +289,18 @@ class BayesianEngine:
             self._signal_history.append({
                 **signal,
                 "actual_up": 1.0 if outcome == "UP" else 0.0,
+                "_ts": time.time(),
             })
 
     def reanalyze(self):
         """Full reanalysis of prediction accuracy and edge calibration.
         Returns a report dict with findings and recommended adjustments."""
+        cutoff = time.time() - DATA_LOOKBACK_SECS
         with self._lock:
-            signals = list(self._signal_history[-500:])  # Last 500 signals
+            # Only use recent signals — market microstructure changes hourly
+            signals = [s for s in self._signal_history if s.get("_ts", 0) >= cutoff]
+            # Keep cap at 500 in case of very busy periods
+            signals = signals[-500:]
             n_windows = len(self._window_returns)
 
         if len(signals) < 20:
