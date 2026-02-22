@@ -15,13 +15,18 @@ Strategy:
   Compare this to Polymarket's implied probability (token mid-price).
   When the edge exceeds MIN_EDGE, buy the underpriced token.
 
-  Markets resolve automatically — buy-and-hold to resolution.
-  If our token wins, shares → $1.00.  If it loses, shares → $0.00.
+  Exit via GTC limit sell at EXIT_PRICE (e.g. 0.95) — no waiting for
+  slow on-chain resolution.  Falls back to resolution if sell doesn't fill.
 
 Entry:
   - GTC limit buy at best_ask (crosses spread, fills immediately as taker)
   - Taker fee ~0.5-1.5% (negligible vs 15-25% edge)
   - Only one trade per window, only when elapsed > MIN_ELAPSED_PCT
+
+Exit:
+  - After buy fills, immediately place GTC limit sell at EXIT_PRICE
+  - If sell fills before window ends → instant profit, USDC returned
+  - If sell doesn't fill → fall back to market resolution ($1 or $0)
 
 Data:
   - Records every window (predictions, trades, outcomes) to sniper_data.jsonl
@@ -31,7 +36,7 @@ Data:
 
 Fees (5m/15m crypto markets):
   - Entry at ask → taker: fee = C × 0.25 × (p(1-p))^2 ≈ 0.5-1.5%
-  - No exit needed — market resolves automatically
+  - Exit via limit sell → maker/taker fee on sell side
 """
 
 import os
@@ -89,6 +94,9 @@ MAX_ELAPSED_PCT = 0.95        # Don't trade after 95% (might not fill before res
 ENTRY_PRICE_MIN = 0.10        # Don't buy tokens cheaper than this
 ENTRY_PRICE_MAX = 0.90        # Don't buy tokens more expensive than this
 FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
+EXIT_PRICE = 0.95             # Limit sell exit price (sell shares here instead of waiting for resolution)
+MIN_EXIT_PROFIT = 0.05        # Minimum per-share profit when setting exit price
+SELL_CHECK_INTERVAL = 5       # Seconds between checking if sell filled
 
 # Bayesian model
 DEFAULT_VOL_PER_SEC = 5.8e-5  # Default σ per √second (~0.1% per 5min window)
@@ -804,6 +812,11 @@ class Sniper:
                         "close_price": None,
                         "traded": False,
                         "trade_info": None,   # filled in if we trade
+                        "sell_order_id": None,
+                        "sell_placed": False,
+                        "sell_filled": False,
+                        "exit_price": None,
+                        "_last_sell_check": 0,
                         "completed": False,
                         "signals": [],        # log of signals seen
                     }
@@ -835,6 +848,14 @@ class Sniper:
                     w["open_price"] = binance_price
                 elif pct <= 0.15:
                     w["open_price"] = binance_price  # Late join, best we can do
+
+            # ─── Check exit sell fills ───
+            if (w["traded"] and w.get("sell_placed")
+                    and not w.get("sell_filled")
+                    and not w["completed"]):
+                if self._check_sell_fills(w, key):
+                    # Sell filled — position closed, but still track window for data
+                    pass
 
             # ─── Compute Bayesian signal ───
             if (w["open_price"] is not None
@@ -941,22 +962,39 @@ class Sniper:
                     # Resolve trade PnL
                     if w["traded"] and w["trade_info"]:
                         ti = w["trade_info"]
-                        won = (ti["side"] == outcome)
-                        pnl = ti["shares"] * (1.0 - ti["entry_price"]) if won else -ti["cost"]
                         ti["outcome"] = outcome
-                        ti["won"] = won
-                        ti["pnl"] = round(pnl, 4)
 
-                        self._trade_count += 1
-                        if won:
-                            self._win_count += 1
-                            self._session_won += ti["shares"]  # get $1 per share
-                        self._session_cost += ti["cost"]
+                        if w.get("sell_filled"):
+                            # Already exited via sell — PnL already computed
+                            emoji = "✅" if ti["pnl"] > 0 else "❌"
+                            log(f"  {emoji} {key}: {outcome} | SOLD @ {w['exit_price']:.2f} "
+                                f"| PnL ${ti['pnl']:+.2f} | "
+                                f"session {self._win_count}/{self._trade_count} wins")
+                        else:
+                            # Sell didn't fill — cancel sell, fall back to resolution
+                            if w.get("sell_placed") and w.get("sell_order_id"):
+                                try:
+                                    client.cancel(w["sell_order_id"])
+                                    log(f"  🚫 Cancelled unfilled sell for {key}")
+                                except Exception:
+                                    pass
 
-                        emoji = "✅" if won else "❌"
-                        log(f"  {emoji} {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
-                            f"| {'WON' if won else 'LOST'} ${abs(pnl):.2f} | "
-                            f"session {self._win_count}/{self._trade_count} wins")
+                            won = (ti["side"] == outcome)
+                            pnl = ti["shares"] * (1.0 - ti["entry_price"]) if won else -ti["cost"]
+                            ti["exit_type"] = "resolution"
+                            ti["won"] = won
+                            ti["pnl"] = round(pnl, 4)
+
+                            self._trade_count += 1
+                            if won:
+                                self._win_count += 1
+                                self._session_won += ti["shares"]  # get $1 per share
+                            self._session_cost += ti["cost"]
+
+                            emoji = "✅" if won else "❌"
+                            log(f"  {emoji} {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
+                                f"| {'WON' if won else 'LOST'} ${abs(pnl):.2f} (resolution) | "
+                                f"session {self._win_count}/{self._trade_count} wins")
                     else:
                         log(f"  📊 {key}: {outcome} (no trade) | ret={ret*100:+.3f}%")
 
@@ -994,6 +1032,7 @@ class Sniper:
                 "our_prob": our_prob,
                 "return_at_entry": current_return,
                 "dry_run": True,
+                "exit_type": None,
                 "outcome": None,
                 "won": None,
                 "pnl": None,
@@ -1045,10 +1084,15 @@ class Sniper:
                     "our_prob": our_prob,
                     "return_at_entry": current_return,
                     "dry_run": False,
+                    "exit_type": None,   # 'sell' or 'resolution'
                     "outcome": None,
                     "won": None,
                     "pnl": None,
                 }
+
+                # Place exit sell immediately
+                self._place_exit_sell(w)
+
                 return True
             else:
                 # Not filled — cancel and move on
@@ -1063,6 +1107,82 @@ class Sniper:
         except Exception as e:
             log(f"  ⚠ Buy error: {e}")
             return False
+
+    def _place_exit_sell(self, w):
+        """Place a GTC limit sell to exit position instead of waiting for resolution."""
+        ti = w["trade_info"]
+        if not ti or ti.get("dry_run"):
+            return
+
+        token_id = ti["token_id"]
+        shares = ti["shares"]
+
+        # Exit price: max of EXIT_PRICE or entry + minimum profit
+        sell_price = max(EXIT_PRICE, round(ti["entry_price"] + MIN_EXIT_PROFIT, 2))
+        sell_price = min(sell_price, 0.99)
+        sell_price = round(sell_price, 2)
+
+        try:
+            sell_order = OrderArgs(
+                token_id=token_id,
+                price=sell_price,
+                size=shares,
+                side=SELL,
+            )
+            signed = client.create_order(sell_order)
+            resp = client.post_order(signed, OrderType.GTC)
+
+            order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
+            status = resp.get("status", "") if isinstance(resp, dict) else ""
+
+            if status and status != "error":
+                w["sell_order_id"] = order_id
+                w["sell_placed"] = True
+                w["exit_price"] = sell_price
+                log(f"  📤 EXIT SELL: {shares:.1f}sh @ {sell_price:.2f} "
+                    f"(entry={ti['entry_price']:.2f}, profit=${shares*(sell_price-ti['entry_price']):.2f}) "
+                    f"order={order_id[:8] if order_id else '?'}")
+            else:
+                log(f"  ⚠ Exit sell rejected: {resp}")
+        except Exception as e:
+            log(f"  ⚠ Exit sell error: {e}")
+
+    def _check_sell_fills(self, w, key):
+        """Check if exit sell has filled by looking at share balance. Returns True if filled."""
+        ti = w["trade_info"]
+        if not ti:
+            return False
+
+        now_ts = time.time()
+        last_check = w.get("_last_sell_check", 0)
+        if now_ts - last_check < SELL_CHECK_INTERVAL:
+            return False
+        w["_last_sell_check"] = now_ts
+
+        shares = get_share_balance(ti["token_id"])
+        if shares is not None and shares < 1:
+            # Sell filled!
+            w["sell_filled"] = True
+            sell_price = w["exit_price"]
+            sell_revenue = ti["shares"] * sell_price
+            sell_fee = compute_taker_fee(ti["shares"], sell_price)
+            pnl = sell_revenue - sell_fee - ti["cost"]
+
+            ti["exit_type"] = "sell"
+            ti["exit_price"] = sell_price
+            ti["pnl"] = round(pnl, 4)
+            ti["won"] = pnl > 0
+
+            self._trade_count += 1
+            if pnl > 0:
+                self._win_count += 1
+            self._session_won += sell_revenue - sell_fee
+            self._session_cost += ti["cost"]
+
+            log(f"  💰 SELL FILLED {key}: {ti['shares']:.1f}sh @ {sell_price:.2f} "
+                f"→ PnL ${pnl:+.2f} (bought @ {ti['entry_price']:.2f})")
+            return True
+        return False
 
     def _save_window(self, w, outcome, ret):
         """Write completed window data to JSONL."""
@@ -1242,7 +1362,13 @@ class Sniper:
                         edge = p_up - implied
                         edge_str = f"edge={edge:+.2f}"
 
-                traded_str = " 🎯TRADED" if w["traded"] else ""
+                traded_str = ""
+                if w.get("sell_filled"):
+                    traded_str = " 💰SOLD"
+                elif w.get("sell_placed"):
+                    traded_str = f" 📤SELL@{w['exit_price']:.2f}"
+                elif w["traded"]:
+                    traded_str = " 🎯TRADED"
 
                 bar_len = 20
                 filled = int(pct * bar_len)
@@ -1315,8 +1441,8 @@ class Sniper:
 def main():
     mode = "DRY RUN" if DRY_RUN else "LIVE"
     log(f"═══ Sniper Bot ═══ [{mode}]")
-    log(f"Strategy: Bayesian prediction → buy underpriced token → hold to resolution")
-    log(f"Params: BET=${BET_AMOUNT} MIN_EDGE={MIN_EDGE} ELAPSED=[{MIN_ELAPSED_PCT:.0%},{MAX_ELAPSED_PCT:.0%}]")
+    log(f"Strategy: Bayesian prediction → buy underpriced token → limit sell exit @ {EXIT_PRICE}")
+    log(f"Params: BET=${BET_AMOUNT} MIN_EDGE={MIN_EDGE} EXIT={EXIT_PRICE} ELAPSED=[{MIN_ELAPSED_PCT:.0%},{MAX_ELAPSED_PCT:.0%}]")
     log(f"Tracking: {', '.join(c.upper() for c in CRYPTOS)}")
     log("")
 
