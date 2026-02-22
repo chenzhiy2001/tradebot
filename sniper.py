@@ -1252,7 +1252,7 @@ class Sniper:
         if report.get("timing"):
             log(f"  Entry timing analysis:")
             for t in report["timing"]:
-                marker = "✅" if t["profitable"] else "❌"
+                marker = "✅" if t["win_rate"] >= 0.60 else "❌"
                 log(f"    {marker} {t['bucket']}: WR={t['win_rate']:.0%} (n={t['n']})")
 
         # Auto-tune MIN_EDGE
