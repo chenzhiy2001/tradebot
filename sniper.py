@@ -15,8 +15,9 @@ Strategy:
   Compare this to Polymarket's implied probability (token mid-price).
   When the edge exceeds MIN_EDGE, buy the underpriced token.
 
-  Exit via GTC limit sell at EXIT_PRICE (e.g. 0.95) — no waiting for
-  slow on-chain resolution.  Falls back to resolution if sell doesn't fill.
+  Exit via dynamic limit sell at best_bid — instant USDC, no claiming.
+  Sell price updates every tick as the bid improves.
+  Aggressive exit in last 30s to guarantee fill.
 
 Entry:
   - GTC limit buy at best_ask (crosses spread, fills immediately as taker)
@@ -24,9 +25,10 @@ Entry:
   - Only one trade per window, only when elapsed > MIN_ELAPSED_PCT
 
 Exit:
-  - After buy fills, immediately place GTC limit sell at EXIT_PRICE
-  - If sell fills before window ends → instant profit, USDC returned
-  - If sell doesn't fill → fall back to market resolution ($1 or $0)
+  - After buy fills, place GTC limit sell at current best_bid
+  - Every tick: update sell price to track rising bid as window nears end
+  - Last 30s: sell at bid - 0.01 (aggressive) to guarantee fill before resolution
+  - USDC returned immediately on fill — no claiming needed
 
 Data:
   - Records every window (predictions, trades, outcomes) to sniper_data.jsonl
@@ -94,9 +96,9 @@ MAX_ELAPSED_PCT = 0.95        # Don't trade after 95% (might not fill before res
 ENTRY_PRICE_MIN = 0.50        # Only buy tokens priced ≥50¢ (cheap tokens 0/13 wins = -$78)
 ENTRY_PRICE_MAX = 0.90        # Don't buy tokens more expensive than this
 FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
-EXIT_PRICE = 0.99             # Limit sell exit price (sell shares here instead of waiting for resolution)
-MIN_EXIT_PROFIT = 0.05        # Minimum per-share profit when setting exit price
-SELL_CHECK_INTERVAL = 5       # Seconds between checking if sell filled
+MIN_EXIT_PROFIT = 0.03        # Minimum per-share profit to place sell (entry + 3¢)
+SELL_UPDATE_INTERVAL = 3      # Seconds between sell order updates
+AGGRESSIVE_EXIT_SECS = 30     # With this many seconds left, sell aggressively at bid
 
 # Bayesian model
 DEFAULT_VOL_PER_SEC = 5.8e-5  # Default σ per √second (~0.1% per 5min window)
@@ -817,7 +819,7 @@ class Sniper:
                         "sell_placed": False,
                         "sell_filled": False,
                         "exit_price": None,
-                        "_last_sell_check": 0,
+                        "_last_sell_update": 0,
                         "completed": False,
                         "signals": [],        # log of signals seen
                     }
@@ -850,13 +852,18 @@ class Sniper:
                 elif pct <= 0.15:
                     w["open_price"] = binance_price  # Late join, best we can do
 
-            # ─── Check exit sell fills ───
-            if (w["traded"] and w.get("sell_placed")
-                    and not w.get("sell_filled")
+            # ─── Check exit sell fills & update sell price ───
+            if (w["traded"] and not w.get("sell_filled")
                     and not w["completed"]):
-                if self._check_sell_fills(w, key):
-                    # Sell filled — position closed, but still track window for data
-                    pass
+                if w.get("sell_placed"):
+                    if self._check_sell_fills(w, key):
+                        pass  # Sell filled — position closed
+                    else:
+                        # Update sell price to track bid
+                        self._update_exit_sell(w, key, remaining)
+                elif not w["trade_info"].get("dry_run"):
+                    # Sell not yet placed (bid was too low earlier) — try again
+                    self._place_exit_sell(w)
 
             # ─── Compute Bayesian signal ───
             if (w["open_price"] is not None
@@ -1110,7 +1117,7 @@ class Sniper:
             return False
 
     def _place_exit_sell(self, w):
-        """Place a GTC limit sell to exit position instead of waiting for resolution."""
+        """Place a GTC limit sell at the current best_bid of our token."""
         ti = w["trade_info"]
         if not ti or ti.get("dry_run"):
             return
@@ -1118,10 +1125,21 @@ class Sniper:
         token_id = ti["token_id"]
         shares = ti["shares"]
 
-        # Exit price: max of EXIT_PRICE or entry + minimum profit
-        sell_price = max(EXIT_PRICE, round(ti["entry_price"] + MIN_EXIT_PROFIT, 2))
+        # Get current bid for our token
+        bid, ask, _ = self.poly.get_price(token_id)
+        if not bid or bid <= 0:
+            log(f"  ⚠ No bid for token — skipping exit sell")
+            return
+
+        # Sell at the bid (or entry + MIN_EXIT_PROFIT, whichever is higher)
+        min_sell = round(ti["entry_price"] + MIN_EXIT_PROFIT, 2)
+        sell_price = max(bid, min_sell)
         sell_price = min(sell_price, 0.99)
         sell_price = round(sell_price, 2)
+
+        if sell_price <= ti["entry_price"]:
+            # Not profitable yet — wait for bid to rise
+            return
 
         try:
             sell_order = OrderArgs(
@@ -1140,6 +1158,7 @@ class Sniper:
                 w["sell_order_id"] = order_id
                 w["sell_placed"] = True
                 w["exit_price"] = sell_price
+                w["_last_sell_update"] = time.time()
                 log(f"  📤 EXIT SELL: {shares:.1f}sh @ {sell_price:.2f} "
                     f"(entry={ti['entry_price']:.2f}, profit=${shares*(sell_price-ti['entry_price']):.2f}) "
                     f"order={order_id[:8] if order_id else '?'}")
@@ -1148,23 +1167,93 @@ class Sniper:
         except Exception as e:
             log(f"  ⚠ Exit sell error: {e}")
 
+    def _update_exit_sell(self, w, key, remaining):
+        """Update sell price to track the rising bid. Cancel old, place new."""
+        ti = w["trade_info"]
+        if not ti:
+            return
+
+        now_ts = time.time()
+        last_update = w.get("_last_sell_update", 0)
+        if now_ts - last_update < SELL_UPDATE_INTERVAL:
+            return
+
+        token_id = ti["token_id"]
+        bid, ask, _ = self.poly.get_price(token_id)
+        if not bid or bid <= 0:
+            return
+
+        # In last AGGRESSIVE_EXIT_SECS, sell at bid - 1¢ to guarantee fill
+        if remaining <= AGGRESSIVE_EXIT_SECS:
+            new_price = round(bid - 0.01, 2)
+        else:
+            new_price = round(bid, 2)
+
+        new_price = min(new_price, 0.99)
+        min_sell = round(ti["entry_price"] + MIN_EXIT_PROFIT, 2)
+
+        # Aggressive mode: accept smaller profit if time is very low
+        if remaining <= AGGRESSIVE_EXIT_SECS:
+            min_sell = round(ti["entry_price"] + 0.01, 2)  # Just 1¢ profit
+
+        new_price = max(new_price, min_sell)
+
+        if new_price <= ti["entry_price"]:
+            return  # Still not profitable
+
+        current_price = w.get("exit_price", 0)
+        # Only update if price changed meaningfully (≥ 1¢)
+        if abs(new_price - current_price) < 0.01 and remaining > AGGRESSIVE_EXIT_SECS:
+            w["_last_sell_update"] = now_ts
+            return
+
+        # Cancel old order, place new one
+        old_id = w.get("sell_order_id")
+        if old_id:
+            try:
+                client.cancel(old_id)
+            except Exception:
+                pass
+
+        try:
+            sell_order = OrderArgs(
+                token_id=token_id,
+                price=new_price,
+                size=ti["shares"],
+                side=SELL,
+            )
+            signed = client.create_order(sell_order)
+            resp = client.post_order(signed, OrderType.GTC)
+
+            order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
+            status = resp.get("status", "") if isinstance(resp, dict) else ""
+
+            if status and status != "error":
+                w["sell_order_id"] = order_id
+                w["exit_price"] = new_price
+                w["_last_sell_update"] = now_ts
+                if remaining <= AGGRESSIVE_EXIT_SECS:
+                    log(f"  ⚡ AGGRESSIVE SELL {key}: {ti['shares']:.1f}sh @ {new_price:.2f} "
+                        f"(bid={bid:.2f}, {remaining:.0f}s left)")
+                else:
+                    log(f"  🔄 SELL UPDATE {key}: {ti['shares']:.1f}sh @ {new_price:.2f} "
+                        f"(bid={bid:.2f})")
+            else:
+                w["_last_sell_update"] = now_ts
+        except Exception as e:
+            w["_last_sell_update"] = now_ts
+
     def _check_sell_fills(self, w, key):
         """Check if exit sell has filled by looking at share balance. Returns True if filled."""
         ti = w["trade_info"]
         if not ti:
             return False
 
-        now_ts = time.time()
-        last_check = w.get("_last_sell_check", 0)
-        if now_ts - last_check < SELL_CHECK_INTERVAL:
-            return False
-        w["_last_sell_check"] = now_ts
-
         shares = get_share_balance(ti["token_id"])
         if shares is not None and shares < 1:
             # Sell filled!
             w["sell_filled"] = True
-            sell_price = w["exit_price"]
+            sell_price = w.get("exit_price", ti["entry_price"])
             sell_revenue = ti["shares"] * sell_price
             sell_fee = compute_taker_fee(ti["shares"], sell_price)
             pnl = sell_revenue - sell_fee - ti["cost"]
@@ -1368,9 +1457,9 @@ class Sniper:
                 if w.get("sell_filled"):
                     traded_str = " 💰SOLD"
                 elif w.get("sell_placed"):
-                    traded_str = f" 📤SELL@{w['exit_price']:.2f}"
+                    traded_str = f" 📤SELL@{w.get('exit_price', 0):.2f}"
                 elif w["traded"]:
-                    traded_str = " 🎯TRADED"
+                    traded_str = " 🎯TRADED(no bid)"
 
                 bar_len = 20
                 filled = int(pct * bar_len)
@@ -1443,8 +1532,8 @@ class Sniper:
 def main():
     mode = "DRY RUN" if DRY_RUN else "LIVE"
     log(f"═══ Sniper Bot ═══ [{mode}]")
-    log(f"Strategy: Bayesian prediction → buy underpriced token → limit sell exit @ {EXIT_PRICE}")
-    log(f"Params: BET=${BET_AMOUNT} MIN_EDGE={MIN_EDGE} EXIT={EXIT_PRICE} ELAPSED=[{MIN_ELAPSED_PCT:.0%},{MAX_ELAPSED_PCT:.0%}]")
+    log(f"Strategy: Bayesian prediction → buy underpriced token → dynamic sell at bid")
+    log(f"Params: BET=${BET_AMOUNT} MIN_EDGE={MIN_EDGE} ELAPSED=[{MIN_ELAPSED_PCT:.0%},{MAX_ELAPSED_PCT:.0%}]")
     log(f"Tracking: {', '.join(c.upper() for c in CRYPTOS)}")
     log("")
 
