@@ -94,7 +94,7 @@ MAX_ELAPSED_PCT = 0.95        # Don't trade after 95% (might not fill before res
 ENTRY_PRICE_MIN = 0.10        # Don't buy tokens cheaper than this
 ENTRY_PRICE_MAX = 0.90        # Don't buy tokens more expensive than this
 FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
-EXIT_PRICE = 0.95             # Limit sell exit price (sell shares here instead of waiting for resolution)
+EXIT_PRICE = 0.99             # Limit sell exit price (sell shares here instead of waiting for resolution)
 MIN_EXIT_PROFIT = 0.05        # Minimum per-share profit when setting exit price
 SELL_CHECK_INTERVAL = 5       # Seconds between checking if sell filled
 
