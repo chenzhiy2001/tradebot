@@ -988,7 +988,7 @@ class Sniper:
                                     pass
 
                             won = (ti["side"] == outcome)
-                            pnl = ti["shares"] * (1.0 - ti["entry_price"]) if won else -ti["cost"]
+                            pnl = (ti["shares"] - ti["cost"]) if won else -ti["cost"]
                             ti["exit_type"] = "resolution"
                             ti["won"] = won
                             ti["pnl"] = round(pnl, 4)
