@@ -89,10 +89,10 @@ MIN_BET = 5                   # Floor — never bet less than this
 MAX_BET = 50                  # Ceiling — never bet more than this
 KELLY_FRACTION = 0.25         # Use quarter-Kelly (conservative) to size bets
 MAX_POSITIONS = 8             # Max concurrent positions (windows we're active in)
-MIN_EDGE = 0.20               # Minimum |edge| to trade (was 0.15 → 32% WR; 0.20+ → 86%)
-MIN_RETURN_ABS = 0.0003       # Minimum |crypto return| (0.03%) — filters noise/flat
-MIN_ELAPSED_PCT = 0.70        # Don't trade before 70% of window elapsed
-MAX_ELAPSED_PCT = 0.95        # Don't trade after 95% (might not fill before resolution)
+MIN_EDGE = 0.10               # Minimum |edge| to trade (data: 0.10+ = 89% WR, profitable)
+MIN_RETURN_ABS = 0.0001       # Minimum |crypto return| (0.01%) — data: profitable at this level
+MIN_ELAPSED_PCT = 0.60        # Don't trade before 60% of window elapsed (data: 84.6% WR)
+MAX_ELAPSED_PCT = 0.99        # Late entries OK (data: 90% WR at 97%+, dynamic sells handle exit)
 ENTRY_PRICE_MIN = 0.50        # Only buy tokens priced ≥50¢ (cheap tokens 0/13 wins = -$78)
 ENTRY_PRICE_MAX = 0.90        # Don't buy tokens more expensive than this
 FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
@@ -334,9 +334,8 @@ class BayesianEngine:
                 }
 
         # 3. Optimal edge threshold — find lowest threshold that's still profitable
-        #    Never go below 0.20 — data shows 0.10-0.15 edge = 32% WR (unprofitable)
         optimal_edge = MIN_EDGE
-        for threshold in [0.20, 0.25, 0.30]:
+        for threshold in [0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.30]:
             key = f"edge_{threshold:.2f}"
             if key not in report:
                 # Compute it if not already done
