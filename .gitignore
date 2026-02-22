@@ -13,3 +13,6 @@ strategy_log.txt
 strategy_trades.json
 burst_log.txt
 burst_trades.json
+sniper_log.txt
+sniper_data.jsonl
+sniper_trades.json
