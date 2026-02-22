@@ -92,13 +92,12 @@ MAX_POSITIONS = 8             # Max concurrent positions (windows we're active i
 MIN_EDGE = 0.10               # Minimum |edge| to trade (data: 0.10+ = 89% WR, profitable)
 MIN_RETURN_ABS = 0.0001       # Minimum |crypto return| (0.01%) — data: profitable at this level
 MIN_ELAPSED_PCT = 0.60        # Don't trade before 60% of window elapsed (data: 84.6% WR)
-MAX_ELAPSED_PCT = 0.99        # Late entries OK (data: 90% WR at 97%+, dynamic sells handle exit)
+MAX_ELAPSED_PCT = 0.99        # Late entries OK (data: 90% WR at 97%+, $0.99 sell fills on resolution)
 ENTRY_PRICE_MIN = 0.50        # Only buy tokens priced ≥50¢ (cheap tokens 0/13 wins = -$78)
 ENTRY_PRICE_MAX = 0.90        # Don't buy tokens more expensive than this
 FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
-MIN_EXIT_PROFIT = 0.03        # Minimum per-share profit to place sell (entry + 3¢)
-SELL_UPDATE_INTERVAL = 3      # Seconds between sell order updates
-AGGRESSIVE_EXIT_SECS = 30     # With this many seconds left, sell aggressively at bid
+EXIT_PRICE = 0.99             # GTC sell price — fills when winning token → $1.00
+SELL_RETRY_INTERVAL = 10      # Seconds between sell placement retries if first attempt fails
 
 # Bayesian model
 DEFAULT_VOL_PER_SEC = 5.8e-5  # Default σ per √second (~0.1% per 5min window)
@@ -818,7 +817,7 @@ class Sniper:
                         "sell_placed": False,
                         "sell_filled": False,
                         "exit_price": None,
-                        "_last_sell_update": 0,
+                        "_last_sell_attempt": 0,
                         "completed": False,
                         "signals": [],        # log of signals seen
                     }
@@ -851,18 +850,15 @@ class Sniper:
                 elif pct <= 0.15:
                     w["open_price"] = binance_price  # Late join, best we can do
 
-            # ─── Check exit sell fills & update sell price ───
+            # ─── Check exit sell fills / retry placement ───
             if (w["traded"] and not w.get("sell_filled")
                     and not w["completed"]):
                 if w.get("sell_placed"):
-                    if self._check_sell_fills(w, key):
-                        pass  # Sell filled — position closed
-                    else:
-                        # Update sell price to track bid
-                        self._update_exit_sell(w, key, remaining)
+                    self._check_sell_fills(w, key)
                 elif not w["trade_info"].get("dry_run"):
-                    # Sell not yet placed (bid was too low earlier) — try again
-                    self._place_exit_sell(w)
+                    # Sell not yet placed — retry periodically
+                    if time.time() - w.get("_last_sell_attempt", 0) >= SELL_RETRY_INTERVAL:
+                        self._place_exit_sell(w)
 
             # ─── Compute Bayesian signal ───
             if (w["open_price"] is not None
@@ -1116,34 +1112,19 @@ class Sniper:
             return False
 
     def _place_exit_sell(self, w):
-        """Place a GTC limit sell at the current best_bid of our token."""
+        """Place a GTC limit sell at EXIT_PRICE ($0.99). Fills when winning token → $1.00."""
         ti = w["trade_info"]
         if not ti or ti.get("dry_run"):
             return
 
         token_id = ti["token_id"]
         shares = ti["shares"]
-
-        # Get current bid for our token
-        bid, ask, _ = self.poly.get_price(token_id)
-        if not bid or bid <= 0:
-            log(f"  ⚠ No bid for token — skipping exit sell")
-            return
-
-        # Sell at the bid (or entry + MIN_EXIT_PROFIT, whichever is higher)
-        min_sell = round(ti["entry_price"] + MIN_EXIT_PROFIT, 2)
-        sell_price = max(bid, min_sell)
-        sell_price = min(sell_price, 0.99)
-        sell_price = round(sell_price, 2)
-
-        if sell_price <= ti["entry_price"]:
-            # Not profitable yet — wait for bid to rise
-            return
+        w["_last_sell_attempt"] = time.time()
 
         try:
             sell_order = OrderArgs(
                 token_id=token_id,
-                price=sell_price,
+                price=EXIT_PRICE,
                 size=shares,
                 side=SELL,
             )
@@ -1153,94 +1134,17 @@ class Sniper:
             order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
             status = resp.get("status", "") if isinstance(resp, dict) else ""
 
-            if status and status != "error":
+            if order_id and status != "error":
                 w["sell_order_id"] = order_id
                 w["sell_placed"] = True
-                w["exit_price"] = sell_price
-                w["_last_sell_update"] = time.time()
-                log(f"  📤 EXIT SELL: {shares:.1f}sh @ {sell_price:.2f} "
-                    f"(entry={ti['entry_price']:.2f}, profit=${shares*(sell_price-ti['entry_price']):.2f}) "
-                    f"order={order_id[:8] if order_id else '?'}")
+                w["exit_price"] = EXIT_PRICE
+                log(f"  📤 EXIT SELL: {shares:.1f}sh @ {EXIT_PRICE} "
+                    f"(entry={ti['entry_price']:.2f}) "
+                    f"order={order_id[:8]}")
             else:
-                log(f"  ⚠ Exit sell rejected: {resp}")
+                log(f"  ⚠ Exit sell failed (will retry): {resp}")
         except Exception as e:
-            log(f"  ⚠ Exit sell error: {e}")
-
-    def _update_exit_sell(self, w, key, remaining):
-        """Update sell price to track the rising bid. Cancel old, place new."""
-        ti = w["trade_info"]
-        if not ti:
-            return
-
-        now_ts = time.time()
-        last_update = w.get("_last_sell_update", 0)
-        if now_ts - last_update < SELL_UPDATE_INTERVAL:
-            return
-
-        token_id = ti["token_id"]
-        bid, ask, _ = self.poly.get_price(token_id)
-        if not bid or bid <= 0:
-            return
-
-        # In last AGGRESSIVE_EXIT_SECS, sell at bid - 1¢ to guarantee fill
-        if remaining <= AGGRESSIVE_EXIT_SECS:
-            new_price = round(bid - 0.01, 2)
-        else:
-            new_price = round(bid, 2)
-
-        new_price = min(new_price, 0.99)
-        min_sell = round(ti["entry_price"] + MIN_EXIT_PROFIT, 2)
-
-        # Aggressive mode: accept smaller profit if time is very low
-        if remaining <= AGGRESSIVE_EXIT_SECS:
-            min_sell = round(ti["entry_price"] + 0.01, 2)  # Just 1¢ profit
-
-        new_price = max(new_price, min_sell)
-
-        if new_price <= ti["entry_price"]:
-            return  # Still not profitable
-
-        current_price = w.get("exit_price", 0)
-        # Only update if price changed meaningfully (≥ 1¢)
-        if abs(new_price - current_price) < 0.01 and remaining > AGGRESSIVE_EXIT_SECS:
-            w["_last_sell_update"] = now_ts
-            return
-
-        # Cancel old order, place new one
-        old_id = w.get("sell_order_id")
-        if old_id:
-            try:
-                client.cancel(old_id)
-            except Exception:
-                pass
-
-        try:
-            sell_order = OrderArgs(
-                token_id=token_id,
-                price=new_price,
-                size=ti["shares"],
-                side=SELL,
-            )
-            signed = client.create_order(sell_order)
-            resp = client.post_order(signed, OrderType.GTC)
-
-            order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
-            status = resp.get("status", "") if isinstance(resp, dict) else ""
-
-            if status and status != "error":
-                w["sell_order_id"] = order_id
-                w["exit_price"] = new_price
-                w["_last_sell_update"] = now_ts
-                if remaining <= AGGRESSIVE_EXIT_SECS:
-                    log(f"  ⚡ AGGRESSIVE SELL {key}: {ti['shares']:.1f}sh @ {new_price:.2f} "
-                        f"(bid={bid:.2f}, {remaining:.0f}s left)")
-                else:
-                    log(f"  🔄 SELL UPDATE {key}: {ti['shares']:.1f}sh @ {new_price:.2f} "
-                        f"(bid={bid:.2f})")
-            else:
-                w["_last_sell_update"] = now_ts
-        except Exception as e:
-            w["_last_sell_update"] = now_ts
+            log(f"  ⚠ Exit sell error (will retry): {e}")
 
     def _check_sell_fills(self, w, key):
         """Check if exit sell has filled by looking at share balance. Returns True if filled."""
