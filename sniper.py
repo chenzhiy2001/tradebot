@@ -107,6 +107,7 @@ FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
 EXIT_PRICE = 0.99             # GTC sell price — fills when winning token → $1.00
 SELL_RETRY_INTERVAL = 10      # Seconds between sell placement retries if first attempt fails
 SELL_WAIT_AFTER_END = 120     # Seconds to wait after window ends for sell to fill (resolution time)
+REANALYSIS_INTERVAL = 300     # Reanalyze every 5 minutes (not per-window)
 
 # Bayesian model
 DEFAULT_VOL_PER_SEC = 5.8e-5  # Default σ per √second (~0.1% per 5min window)
@@ -864,6 +865,7 @@ class Sniper:
         self._win_count = 0
         self._start_balance = get_usdc_balance()
         self._last_report = None
+        self._last_reanalysis = 0  # epoch time of last reanalysis
 
     def update_markets(self, markets):
         """Add new market windows, subscribe tokens."""
@@ -1054,11 +1056,14 @@ class Sniper:
                     w["_outcome"] = outcome
                     w["_return"] = ret
 
-                    # Record data for reanalysis (once per window)
+                    # Vol data (σ) — pure price, always safe at window end
                     self.engine.add_completed_window(ret, duration)
+
+                    # Signal outcomes = price direction (UP/DOWN), always known
+                    # at window end regardless of whether our sell has filled.
+                    # Trade PnL is a separate question resolved later.
                     for sig in w["signals"]:
                         self.engine.add_signal_outcome(sig, outcome)
-                    self._run_reanalysis()
 
                     if not w["traded"]:
                         # No trade — finalize immediately
@@ -1140,6 +1145,12 @@ class Sniper:
                 self._save_window(w, outcome, ret)
                 w["completed"] = True
                 to_remove.append(key)
+
+        # Periodic reanalysis — run every REANALYSIS_INTERVAL seconds
+        # instead of per-window, so we see a complete batch of signal data
+        if time.time() - self._last_reanalysis >= REANALYSIS_INTERVAL:
+            self._run_reanalysis()
+            self._last_reanalysis = time.time()
 
         # Clean up
         with self._lock:
