@@ -1240,7 +1240,15 @@ class Sniper:
 
             # Check if we got shares
             actual = get_share_balance(token_id)
-            if actual is not None and actual >= 1:
+
+            # Always cancel the buy order to prevent additional partial fills
+            try:
+                if order_id:
+                    client.cancel(order_id)
+            except Exception:
+                pass
+
+            if actual is not None and actual >= MIN_ORDER_SIZE:
                 # Compute cost analytically (balance diff is unreliable with concurrent positions)
                 fee = compute_taker_fee(actual, buy_price)
                 actual_cost = round(actual * buy_price + fee, 4)
@@ -1263,21 +1271,15 @@ class Sniper:
                     "pnl": None,
                 }
 
-                # Place exit sell — but only if we have enough shares
-                if actual < MIN_ORDER_SIZE:
-                    log(f"  ⚠ Partial fill {actual:.1f}sh < {MIN_ORDER_SIZE} min — cannot sell, will resolve")
-                else:
-                    self._place_exit_sell(w)
-
+                self._place_exit_sell(w)
                 return True
+            elif actual is not None and actual >= 1:
+                # Partial fill too small to sell — log and skip (shares will resolve with market)
+                log(f"  ⚠ Partial fill {actual:.1f}sh < {MIN_ORDER_SIZE} min — cannot trade, skipping")
+                return False
             else:
-                # Not filled — cancel and move on
-                log(f"  ⏳ Not filled after {FILL_WAIT}s — cancelling")
-                try:
-                    if order_id:
-                        client.cancel(order_id)
-                except Exception:
-                    pass
+                # Not filled at all
+                log(f"  ⏳ Not filled after {FILL_WAIT}s — cancelled")
                 return False
 
         except Exception as e:
@@ -1673,7 +1675,22 @@ def main():
             time.sleep(TICK_INTERVAL)
 
         except KeyboardInterrupt:
-            log(f"\nStopped.")
+            log(f"\nStopping — cancelling all open orders...")
+            # Cancel all open sell orders so shares can resolve naturally
+            with sniper._lock:
+                for key, w in sniper._windows.items():
+                    if w.get("sell_placed") and w.get("sell_order_id") and not w.get("sell_filled"):
+                        try:
+                            client.cancel(w["sell_order_id"])
+                            log(f"  🚫 Cancelled sell for {key}")
+                        except Exception:
+                            pass
+            # Also cancel any other open orders on the book
+            try:
+                client.cancel_all()
+                log(f"  🚫 Cancelled all remaining open orders")
+            except Exception:
+                pass
             bal = get_usdc_balance()
             if bal and sniper._start_balance:
                 log(f"Final balance: ${bal:.2f} (Δ{bal - sniper._start_balance:+.2f})")
