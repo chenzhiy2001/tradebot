@@ -106,6 +106,7 @@ ENTRY_PRICE_MAX = 0.90        # Don't buy tokens more expensive than this
 FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
 EXIT_PRICE = 0.99             # GTC sell price — fills when winning token → $1.00
 SELL_RETRY_INTERVAL = 10      # Seconds between sell placement retries if first attempt fails
+SELL_WAIT_AFTER_END = 120     # Seconds to wait after window ends for sell to fill (resolution time)
 
 # Bayesian model
 DEFAULT_VOL_PER_SEC = 5.8e-5  # Default σ per √second (~0.1% per 5min window)
@@ -910,6 +911,8 @@ class Sniper:
                         "sell_filled": False,
                         "exit_price": None,
                         "_last_sell_attempt": 0,
+                        "window_ended": False,
+                        "window_ended_at": None,
                         "completed": False,
                         "signals": [],        # log of signals seen
                     }
@@ -946,6 +949,7 @@ class Sniper:
                     w["open_price"] = price  # Late join, best we can do
 
             # ─── Check exit sell fills / retry placement ───
+            # Keep checking even after window ends — sell fills at resolution
             if (w["traded"] and not w.get("sell_filled")
                     and not w["completed"]):
                 if w.get("sell_placed"):
@@ -1039,67 +1043,101 @@ class Sniper:
                         if success:
                             w["traded"] = True
 
-            # ─── Finalize completed windows ───
-            if now >= end and not w["completed"]:
+            # ─── Window ended: record data once ───
+            if now >= end and not w["window_ended"]:
                 if price is not None:
                     w["close_price"] = price
 
                 if w["open_price"] and w["close_price"]:
                     outcome = "UP" if w["close_price"] > w["open_price"] else "DOWN"
                     ret = (w["close_price"] - w["open_price"]) / w["open_price"]
+                    w["_outcome"] = outcome
+                    w["_return"] = ret
 
-                    # Record data for reanalysis
+                    # Record data for reanalysis (once per window)
                     self.engine.add_completed_window(ret, duration)
                     for sig in w["signals"]:
                         self.engine.add_signal_outcome(sig, outcome)
-
-                    # Full reanalysis (σ, edge, timing, Kelly) every window
                     self._run_reanalysis()
 
-                    # Resolve trade PnL
-                    if w["traded"] and w["trade_info"]:
+                    if not w["traded"]:
+                        # No trade — finalize immediately
+                        log(f"  📊 {key}: {outcome} (no trade) | ret={ret*100:+.3f}%")
+                        self._save_window(w, outcome, ret)
+                        w["completed"] = True
+                        to_remove.append(key)
+                    elif w.get("sell_filled"):
+                        # Sell already filled before window ended — finalize
                         ti = w["trade_info"]
                         ti["outcome"] = outcome
-
-                        if w.get("sell_filled"):
-                            # Already exited via sell — PnL already computed
-                            emoji = "✅" if ti["pnl"] > 0 else "❌"
-                            log(f"  {emoji} {key}: {outcome} | SOLD @ {w['exit_price']:.2f} "
-                                f"| PnL ${ti['pnl']:+.2f} | "
-                                f"session {self._win_count}/{self._trade_count} wins")
-                        else:
-                            # Sell didn't fill — cancel sell, fall back to resolution
-                            if w.get("sell_placed") and w.get("sell_order_id"):
-                                try:
-                                    client.cancel(w["sell_order_id"])
-                                    log(f"  🚫 Cancelled unfilled sell for {key}")
-                                except Exception:
-                                    pass
-
-                            won = (ti["side"] == outcome)
-                            pnl = (ti["shares"] - ti["cost"]) if won else -ti["cost"]
-                            ti["exit_type"] = "resolution"
-                            ti["won"] = won
-                            ti["pnl"] = round(pnl, 4)
-
-                            self._trade_count += 1
-                            if won:
-                                self._win_count += 1
-                                self._session_won += ti["shares"]  # get $1 per share
-                            self._session_cost += ti["cost"]
-
-                            emoji = "✅" if won else "❌"
-                            log(f"  {emoji} {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
-                                f"| {'WON' if won else 'LOST'} ${abs(pnl):.2f} (resolution) | "
-                                f"session {self._win_count}/{self._trade_count} wins")
+                        emoji = "✅" if ti["pnl"] > 0 else "❌"
+                        log(f"  {emoji} {key}: {outcome} | SOLD @ {w['exit_price']:.2f} "
+                            f"| PnL ${ti['pnl']:+.2f} | "
+                            f"session {self._win_count}/{self._trade_count} wins")
+                        self._save_window(w, outcome, ret)
+                        w["completed"] = True
+                        to_remove.append(key)
                     else:
-                        log(f"  📊 {key}: {outcome} (no trade) | ret={ret*100:+.3f}%")
-
-                    # Save completed window data
-                    self._save_window(w, outcome, ret)
+                        # Traded but sell not yet filled — keep alive for resolution
+                        log(f"  ⏳ {key}: window ended ({outcome}) — waiting for sell to fill at resolution")
                 else:
                     log(f"  ⚠ {key}: ended but missing price data")
+                    w["completed"] = True
+                    to_remove.append(key)
 
+                w["window_ended"] = True
+                w["window_ended_at"] = time.time()
+
+            # ─── Post-window: sell filled after window end ───
+            if (w["window_ended"] and w["traded"]
+                    and not w["completed"] and w.get("sell_filled")):
+                ti = w["trade_info"]
+                outcome = w.get("_outcome", "?")
+                ret = w.get("_return", 0)
+                ti["outcome"] = outcome
+                emoji = "✅" if ti["pnl"] > 0 else "❌"
+                log(f"  {emoji} {key}: {outcome} | SOLD @ {w['exit_price']:.2f} "
+                    f"| PnL ${ti['pnl']:+.2f} (post-window) | "
+                    f"session {self._win_count}/{self._trade_count} wins")
+                self._save_window(w, outcome, ret)
+                w["completed"] = True
+                to_remove.append(key)
+
+            # ─── Post-window timeout: sell didn't fill → loss ───
+            if (w["window_ended"] and w["traded"]
+                    and not w["completed"] and not w.get("sell_filled")
+                    and w.get("window_ended_at")
+                    and time.time() - w["window_ended_at"] > SELL_WAIT_AFTER_END):
+                ti = w["trade_info"]
+                outcome = w.get("_outcome", "?")
+                ret = w.get("_return", 0)
+                ti["outcome"] = outcome
+
+                # Cancel the sell order
+                if w.get("sell_placed") and w.get("sell_order_id"):
+                    try:
+                        client.cancel(w["sell_order_id"])
+                        log(f"  🚫 Cancelled unfilled sell for {key} (timeout {SELL_WAIT_AFTER_END}s)")
+                    except Exception:
+                        pass
+
+                won = (ti["side"] == outcome)
+                pnl = (ti["shares"] - ti["cost"]) if won else -ti["cost"]
+                ti["exit_type"] = "resolution"
+                ti["won"] = won
+                ti["pnl"] = round(pnl, 4)
+
+                self._trade_count += 1
+                if won:
+                    self._win_count += 1
+                    self._session_won += ti["shares"]
+                self._session_cost += ti["cost"]
+
+                emoji = "✅" if won else "❌"
+                log(f"  {emoji} {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
+                    f"| {'WON' if won else 'LOST'} ${abs(pnl):.2f} (resolution timeout) | "
+                    f"session {self._win_count}/{self._trade_count} wins")
+                self._save_window(w, outcome, ret)
                 w["completed"] = True
                 to_remove.append(key)
 
@@ -1444,6 +1482,9 @@ class Sniper:
                 traded_str = ""
                 if w.get("sell_filled"):
                     traded_str = " 💰SOLD"
+                elif w.get("window_ended") and w.get("sell_placed"):
+                    wait = int(time.time() - w.get("window_ended_at", time.time()))
+                    traded_str = f" ⏳RESOLVING({wait}s)"
                 elif w.get("sell_placed"):
                     traded_str = f" 📤SELL@{w.get('exit_price', 0):.2f}"
                 elif w["traded"]:
