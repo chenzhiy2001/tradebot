@@ -21,7 +21,7 @@ Strategy:
 Entry:
   - GTC limit buy at best_ask (crosses spread, fills immediately as taker)
   - Taker fee ~0.5-1.5% (negligible vs 15-25% edge)
-  - Only one trade per window, only when elapsed > MIN_ELAPSED_PCT
+  - Only one trade per window
 
 Exit:
   - After buy fills, place GTC limit sell at $0.99
@@ -90,8 +90,7 @@ KELLY_FRACTION = 0.25         # Use quarter-Kelly (conservative) to size bets
 MAX_POSITIONS = 8             # Max concurrent positions (windows we're active in)
 MIN_EDGE = 0.10               # Minimum |edge| to trade (data: 0.10+ = 89% WR, profitable)
 MIN_RETURN_ABS = 0.0001       # Minimum |crypto return| (0.01%) — data: profitable at this level
-MIN_ELAPSED_PCT = 0.60        # Don't trade before 60% of window elapsed (data: 84.6% WR)
-MAX_ELAPSED_PCT = 0.99        # Late entries OK (data: 90% WR at 97%+, $0.99 sell fills on resolution)
+# No MIN_ELAPSED_PCT — the Bayesian model's t_rem denominator handles timing naturally.
 ENTRY_PRICE_MIN = 0.50        # Only buy tokens priced ≥50¢ (cheap tokens 0/13 wins = -$78)
 ENTRY_PRICE_MAX = 0.90        # Don't buy tokens more expensive than this
 FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
@@ -357,12 +356,10 @@ class BayesianEngine:
         report["optimal_edge"] = optimal_edge
         report["current_edge"] = MIN_EDGE
 
-        # 4. Timing analysis — win rate by elapsed % bucket
-        #    Determines optimal MIN_ELAPSED_PCT
-        timing_buckets = [(0.50, 0.60), (0.60, 0.70), (0.70, 0.80), (0.80, 0.90), (0.90, 1.01)]
+        # 4. Timing analysis — informational only (model handles timing via t_rem)
+        timing_buckets = [(0.0, 0.20), (0.20, 0.40), (0.40, 0.60), (0.60, 0.80), (0.80, 1.01)]
         timing_analysis = []
         for lo, hi in timing_buckets:
-            # Signals in this elapsed-% range that had enough edge to trade
             eligible = [s for s in signals
                         if lo <= s["pct"] < hi
                         and abs(s["edge_up"]) >= optimal_edge
@@ -374,23 +371,12 @@ class BayesianEngine:
                 wr = wins / len(eligible)
                 timing_analysis.append({
                     "bucket": f"{lo:.0%}-{hi:.0%}",
-                    "lo": lo,
                     "n": len(eligible),
                     "win_rate": round(wr, 3),
-                    "profitable": wr >= 0.60,
                 })
         report["timing"] = timing_analysis
 
-        # 5. Optimal elapsed threshold — earliest bucket with 60%+ win rate
-        optimal_elapsed = MIN_ELAPSED_PCT
-        for t in timing_analysis:
-            if t["profitable"] and t["n"] >= 3:
-                optimal_elapsed = t["lo"]
-                break
-        report["optimal_elapsed"] = optimal_elapsed
-        report["current_elapsed"] = MIN_ELAPSED_PCT
-
-        # 6. Kelly criterion bet sizing
+        # 5. Kelly criterion bet sizing
         #    Kelly fraction f* = (p*b - q) / b
         #    where p = win rate, q = 1-p, b = net odds (win_payout / loss_cost)
         #    For Polymarket: buy at price P, win → $1/share, lose → $0
@@ -895,8 +881,7 @@ class Sniper:
                     w["signals"] = w["signals"][-4:] + [signal]
 
                     # ─── Trade decision ───
-                    if (MIN_ELAPSED_PCT <= pct <= MAX_ELAPSED_PCT
-                            and abs(current_return) >= MIN_RETURN_ABS):
+                    if abs(current_return) >= MIN_RETURN_ABS:
 
                         # Determine which side to buy
                         if edge_up >= MIN_EDGE:
@@ -1234,7 +1219,7 @@ class Sniper:
 
     def _run_reanalysis(self):
         """Run full reanalysis: σ, edge, timing, Kelly. Called every window."""
-        global MIN_EDGE, MIN_ELAPSED_PCT, BET_AMOUNT
+        global MIN_EDGE, BET_AMOUNT
 
         # Recalibrate volatility first
         self.engine._recompute_vol()
@@ -1278,15 +1263,6 @@ class Sniper:
             log(f"  🔧 AUTO-TUNE: MIN_EDGE {old_edge:.2f} → {MIN_EDGE:.2f}")
         else:
             log(f"  🔧 MIN_EDGE={MIN_EDGE:.2f} (optimal={optimal:.2f}, no change)")
-
-        # Auto-tune MIN_ELAPSED_PCT
-        optimal_elapsed = report.get("optimal_elapsed", MIN_ELAPSED_PCT)
-        if AUTO_TUNE_EDGE and optimal_elapsed != MIN_ELAPSED_PCT:
-            old_elapsed = MIN_ELAPSED_PCT
-            MIN_ELAPSED_PCT = optimal_elapsed
-            log(f"  🔧 AUTO-TUNE: MIN_ELAPSED {old_elapsed:.0%} → {MIN_ELAPSED_PCT:.0%}")
-        else:
-            log(f"  🔧 MIN_ELAPSED={MIN_ELAPSED_PCT:.0%} (optimal={optimal_elapsed:.0%}, no change)")
 
         # Auto-tune BET_AMOUNT via Kelly criterion
         kelly = report.get("kelly")
@@ -1411,7 +1387,7 @@ class Sniper:
             f"  🧠 Model: σ/√s={self.engine.vol_per_sec:.6f} "
             f"(~{self.engine.vol_per_sec * math.sqrt(300) * 100:.3f}%/5min) | "
             f"Data: {self.engine.n_windows} windows, {self.engine.signal_count} signals | "
-            f"MIN_EDGE={MIN_EDGE} MIN_ELAPSED={MIN_ELAPSED_PCT:.0%}"
+            f"MIN_EDGE={MIN_EDGE}"
         )
 
         # Last reanalysis summary
@@ -1437,7 +1413,7 @@ def main():
     mode = "DRY RUN" if DRY_RUN else "LIVE"
     log(f"═══ Sniper Bot ═══ [{mode}]")
     log(f"Strategy: Bayesian prediction → buy underpriced token → dynamic sell at bid")
-    log(f"Params: BET=${BET_AMOUNT} MIN_EDGE={MIN_EDGE} ELAPSED=[{MIN_ELAPSED_PCT:.0%},{MAX_ELAPSED_PCT:.0%}]")
+    log(f"Params: BET=${BET_AMOUNT} MIN_EDGE={MIN_EDGE} PRICE=[{ENTRY_PRICE_MIN},{ENTRY_PRICE_MAX}]")
     log(f"Tracking: {', '.join(c.upper() for c in CRYPTOS)}")
     log("")
 
