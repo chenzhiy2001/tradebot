@@ -69,10 +69,20 @@ founder_address = os.getenv("FUNDER_ADDRESS")
 HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 BINANCE_WS_URL = "wss://stream.binance.com:9443/stream"
 CHAIN_ID = 137
 FUNDER_ADDRESS = founder_address
 
+# Chainlink symbols (Polymarket resolution source)
+CHAINLINK_SYMBOLS = {
+    "btc": "btc/usd",
+    "eth": "eth/usd",
+    "sol": "sol/usd",
+    "xrp": "xrp/usd",
+}
+
+# Binance symbols (fallback only)
 CRYPTOS = {
     "btc": "btcusdt",
     "eth": "ethusdt",
@@ -468,7 +478,101 @@ class BayesianEngine:
 
 
 # =========================================================================
-# BINANCE PRICE FEED
+# CHAINLINK PRICE FEED (via Polymarket RTDS — matches resolution source)
+# =========================================================================
+class ChainlinkFeed:
+    """Real-time Chainlink prices from Polymarket RTDS WebSocket.
+    This is the SAME data source Polymarket uses to resolve crypto markets."""
+
+    def __init__(self):
+        self._prices = {}  # symbol -> {price, ts}
+        self._lock = threading.Lock()
+        self._connected = False
+
+    def start(self):
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def _run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._ws_loop())
+
+    async def _ws_loop(self):
+        import websockets
+
+        while True:
+            try:
+                async with websockets.connect(RTDS_WS_URL, close_timeout=5, open_timeout=10) as ws:
+                    # Subscribe to Chainlink crypto prices
+                    sub_msg = json.dumps({
+                        "action": "subscribe",
+                        "subscriptions": [{
+                            "topic": "crypto_prices_chainlink",
+                            "type": "*",
+                            "filters": "",
+                        }]
+                    })
+                    await ws.send(sub_msg)
+                    self._connected = True
+                    log("  \U0001f517 Chainlink RTDS connected (Polymarket resolution source)")
+
+                    last_ping = time.time()
+
+                    while True:
+                        # Keep alive
+                        if time.time() - last_ping > 4:
+                            try:
+                                await ws.send("PING")
+                                last_ping = time.time()
+                            except Exception:
+                                break
+
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=1)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        try:
+                            data = json.loads(msg)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+                        if data.get("topic") == "crypto_prices_chainlink":
+                            payload = data.get("payload", {})
+                            symbol = payload.get("symbol", "").lower()
+                            value = payload.get("value")
+                            ts = payload.get("timestamp")  # unix ms
+                            if symbol and value is not None:
+                                with self._lock:
+                                    self._prices[symbol] = {
+                                        "price": float(value),
+                                        "ts": (ts / 1000.0) if ts else time.time(),
+                                    }
+
+            except Exception as e:
+                self._connected = False
+                log(f"  \u26a0 Chainlink RTDS error: {e}, reconnecting in 2s...")
+                await asyncio.sleep(2)
+
+    def get_price(self, crypto):
+        """Get latest Chainlink price for a crypto (e.g. 'btc'). Returns (price, age_secs) or (None, None)."""
+        symbol = CHAINLINK_SYMBOLS.get(crypto.lower())
+        if not symbol:
+            return None, None
+        with self._lock:
+            data = self._prices.get(symbol)
+        if not data:
+            return None, None
+        return data["price"], time.time() - data["ts"]
+
+    @property
+    def connected(self):
+        return self._connected
+
+
+# =========================================================================
+# BINANCE PRICE FEED (fallback)
 # =========================================================================
 class BinanceFeed:
     """Real-time crypto prices from Binance WebSocket."""
@@ -744,7 +848,8 @@ def discover_markets():
 class Sniper:
     """Tracks active windows, computes Bayesian edge, executes trades."""
 
-    def __init__(self, binance, poly, engine):
+    def __init__(self, chainlink, binance, poly, engine):
+        self.chainlink = chainlink
         self.binance = binance
         self.poly = poly
         self.engine = engine
@@ -828,14 +933,17 @@ class Sniper:
             remaining = max(0, (end - now).total_seconds())
 
             crypto = w["crypto"]
-            binance_price, binance_age = self.binance.get_price(crypto)
+            # Use Chainlink (resolution source) as primary, Binance as fallback
+            cl_price, cl_age = self.chainlink.get_price(crypto)
+            bn_price, bn_age = self.binance.get_price(crypto)
+            price = cl_price if cl_price is not None else bn_price
 
             # Record open price at window start
-            if w["open_price"] is None and binance_price is not None:
+            if w["open_price"] is None and price is not None:
                 if pct <= 0.05:
-                    w["open_price"] = binance_price
+                    w["open_price"] = price
                 elif pct <= 0.15:
-                    w["open_price"] = binance_price  # Late join, best we can do
+                    w["open_price"] = price  # Late join, best we can do
 
             # ─── Check exit sell fills / retry placement ───
             if (w["traded"] and not w.get("sell_filled")
@@ -849,11 +957,11 @@ class Sniper:
 
             # ─── Compute Bayesian signal ───
             if (w["open_price"] is not None
-                    and binance_price is not None
+                    and price is not None
                     and not w["traded"]
                     and not w["completed"]):
 
-                current_return = (binance_price - w["open_price"]) / w["open_price"]
+                current_return = (price - w["open_price"]) / w["open_price"]
                 p_up = self.engine.prob_up(current_return, remaining)
 
                 # Get Polymarket implied probability
@@ -933,8 +1041,8 @@ class Sniper:
 
             # ─── Finalize completed windows ───
             if now >= end and not w["completed"]:
-                if binance_price is not None:
-                    w["close_price"] = binance_price
+                if price is not None:
+                    w["close_price"] = price
 
                 if w["open_price"] and w["close_price"]:
                     outcome = "UP" if w["close_price"] > w["open_price"] else "DOWN"
@@ -1303,11 +1411,14 @@ class Sniper:
                 remaining = max(0, (end - now).total_seconds())
 
                 crypto = w["crypto"].upper()
-                binance_price, _ = self.binance.get_price(w["crypto"])
+                cl_price, _ = self.chainlink.get_price(w["crypto"])
+                bn_price, _ = self.binance.get_price(w["crypto"])
+                dash_price = cl_price if cl_price is not None else bn_price
                 up_bid, up_ask, _ = self.poly.get_price(w["up_token"])
 
                 # Price & return
-                price_str = f"${binance_price:,.2f}" if binance_price else "?"
+                src_tag = "CL" if cl_price is not None else "BN"
+                price_str = f"${dash_price:,.2f}({src_tag})" if dash_price else "?"
                 open_str = f"${w['open_price']:,.2f}" if w["open_price"] else "?"
 
                 ret_str = "?"
@@ -1315,8 +1426,8 @@ class Sniper:
                 p_up_str = ""
                 edge_str = ""
 
-                if w["open_price"] and binance_price:
-                    ret = (binance_price - w["open_price"]) / w["open_price"]
+                if w["open_price"] and dash_price:
+                    ret = (dash_price - w["open_price"]) / w["open_price"]
                     direction = "🟢" if ret > 0 else ("🔴" if ret < 0 else "⚪")
                     ret_str = f"{ret*100:+.3f}%"
 
@@ -1409,12 +1520,16 @@ class Sniper:
 def main():
     mode = "DRY RUN" if DRY_RUN else "LIVE"
     log(f"═══ Sniper Bot ═══ [{mode}]")
-    log(f"Strategy: Bayesian prediction → buy underpriced token → dynamic sell at bid")
+    log(f"Strategy: Bayesian prediction → buy underpriced token → sell at $0.99")
+    log(f"Price source: Chainlink (via Polymarket RTDS) — matches resolution source")
     log(f"Params: BET=${BET_AMOUNT} MIN_EDGE={MIN_EDGE} PRICE=[{ENTRY_PRICE_MIN},{ENTRY_PRICE_MAX}]")
     log(f"Tracking: {', '.join(c.upper() for c in CRYPTOS)}")
     log("")
 
     # Start feeds
+    chainlink = ChainlinkFeed()
+    chainlink.start()
+
     binance = BinanceFeed()
     binance.start()
 
@@ -1422,15 +1537,17 @@ def main():
     poly.start()
 
     engine = BayesianEngine()
-    sniper = Sniper(binance, poly, engine)
+    sniper = Sniper(chainlink, binance, poly, engine)
 
     # Wait for WS connections
     log("Waiting for WebSocket connections...")
     for _ in range(30):
-        if binance.connected and poly.connected:
+        if (chainlink.connected or binance.connected) and poly.connected:
             break
         time.sleep(1)
 
+    if not chainlink.connected:
+        log("⚠ Chainlink RTDS not connected after 30s (using Binance fallback)")
     if not binance.connected:
         log("⚠ Binance WS not connected after 30s")
     if not poly.connected:
@@ -1455,12 +1572,13 @@ def main():
 
             # Dashboard
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            cl_status = "🟢" if chainlink.connected else "🔴"
             bn_status = "🟢" if binance.connected else "🔴"
             pm_status = "🟢" if poly.connected else "🔴"
             dashboard = sniper.get_dashboard()
 
             print(f"\033[2J\033[H", end="")
-            print(f"═══ Sniper Bot [{mode}] ═══  {now_str} UTC  │  Binance {bn_status}  Polymarket {pm_status}")
+            print(f"═══ Sniper Bot [{mode}] ═══  {now_str} UTC  │  Chainlink {cl_status}  Binance {bn_status}  Polymarket {pm_status}")
             print(f"{'─' * 90}")
             print(dashboard)
             print(f"\n{'─' * 90}")
