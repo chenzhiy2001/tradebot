@@ -1029,9 +1029,6 @@ class Sniper:
             return True
 
         try:
-            # Pre-trade balance
-            bal_before = get_usdc_balance()
-
             # Place GTC limit buy at ask price (will cross spread → taker fill)
             buy_order = OrderArgs(
                 token_id=token_id,
@@ -1057,11 +1054,11 @@ class Sniper:
             # Check if we got shares
             actual = get_share_balance(token_id)
             if actual is not None and actual >= 1:
-                # Compute actual cost
-                bal_after = get_usdc_balance()
-                actual_cost = (bal_before - bal_after) if bal_before and bal_after else BET_AMOUNT + fee_est
+                # Compute cost analytically (balance diff is unreliable with concurrent positions)
+                fee = compute_taker_fee(actual, buy_price)
+                actual_cost = round(actual * buy_price + fee, 4)
 
-                log(f"  ✅ Filled! {actual:.1f} shares, cost ${actual_cost:.2f}")
+                log(f"  ✅ Filled! {actual:.1f} shares, cost ${actual_cost:.2f} (fee ${fee:.2f})")
 
                 w["trade_info"] = {
                     "side": side,
