@@ -101,10 +101,10 @@ MAX_POSITIONS = 8             # Max concurrent positions (windows we're active i
 MIN_EDGE = 0.10               # Minimum |edge| to trade (data: 0.10+ = 89% WR, profitable)
 MIN_RETURN_ABS = 0.0001       # Minimum |crypto return| (0.01%) — data: profitable at this level
 # No MIN_ELAPSED_PCT — the Bayesian model's t_rem denominator handles timing naturally.
-ENTRY_PRICE_MIN = 0.50        # Only buy tokens priced ≥50¢ (cheap tokens 0/13 wins = -$78)
-ENTRY_PRICE_MAX = 0.90        # Don't buy tokens more expensive than this
+ENTRY_PRICE_MIN = 0.40        # Only buy tokens priced ≥40¢
 FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
 EXIT_PRICE = 0.99             # GTC sell price — fills when winning token → $1.00
+MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 SELL_RETRY_INTERVAL = 10      # Seconds between sell placement retries if first attempt fails
 SELL_WAIT_AFTER_END = 120     # Seconds to wait after window ends for sell to fill (resolution time)
 REANALYSIS_INTERVAL = 300     # Reanalyze every 5 minutes (not per-window)
@@ -127,8 +127,6 @@ DECISION_LOG = "sniper_log.txt"
 MARKET_POLL_INTERVAL = 30     # Seconds between market discovery polls
 TICK_INTERVAL = 1.0           # Main loop tick interval
 
-# Reanalysis — runs every N completed windows
-REANALYSIS_INTERVAL = 1       # Run reanalysis after every completed window
 AUTO_TUNE_EDGE = True         # Auto-adjust MIN_EDGE based on observed calibration
 
 DRY_RUN = "--dry-run" in sys.argv
@@ -539,6 +537,13 @@ class ChainlinkFeed:
                             data = json.loads(msg)
                         except (json.JSONDecodeError, TypeError):
                             continue
+
+                        # Debug: log first few messages to diagnose format
+                        if not hasattr(self, '_debug_count'):
+                            self._debug_count = 0
+                        if self._debug_count < 3:
+                            self._debug_count += 1
+                            log(f"  🔍 RTDS msg #{self._debug_count}: {str(data)[:200]}")
 
                         if data.get("topic") == "crypto_prices_chainlink":
                             payload = data.get("payload", {})
@@ -1019,7 +1024,7 @@ class Sniper:
                             continue
 
                         # Price range check
-                        if not (ENTRY_PRICE_MIN <= buy_price <= ENTRY_PRICE_MAX):
+                        if buy_price < ENTRY_PRICE_MIN:
                             continue
 
                         # Balance check
@@ -1037,7 +1042,8 @@ class Sniper:
 
                         # ─── EXECUTE TRADE ───
                         log(f"  🎯 SIGNAL {key}: {buy_side} | P(UP)={p_up:.3f} impl={implied_up:.3f} "
-                            f"edge={edge:.3f} | ret={current_return*100:+.3f}% | {remaining:.0f}s left")
+                            f"edge={edge:.3f} | ret={current_return*100:+.3f}% | {remaining:.0f}s left "
+                            f"| price={'CL' if cl_price is not None else 'BN'}")
 
                         success = self._execute_buy(
                             w, token_id, buy_side, buy_price, edge, our_prob, current_return
@@ -1161,6 +1167,13 @@ class Sniper:
         """Place a GTC limit buy and verify fill. Returns True if filled."""
         buy_price = round(buy_price, 2)
         est_shares = BET_AMOUNT / buy_price
+
+        # Ensure we buy enough shares to meet Polymarket's minimum order size
+        # (needed for both the buy and the subsequent exit sell)
+        if est_shares < MIN_ORDER_SIZE:
+            est_shares = MIN_ORDER_SIZE
+            log(f"  📐 Bumped to {MIN_ORDER_SIZE}sh minimum (${est_shares * buy_price:.2f} cost)")
+
         fee_est = compute_taker_fee(est_shares, buy_price)
 
         log(f"  💰 Buying {side}: ~{est_shares:.0f}sh @ {buy_price:.2f} "
@@ -1574,7 +1587,7 @@ def main():
     log(f"═══ Sniper Bot ═══ [{mode}]")
     log(f"Strategy: Bayesian prediction → buy underpriced token → sell at $0.99")
     log(f"Price source: Chainlink (via Polymarket RTDS) — matches resolution source")
-    log(f"Params: BET=${BET_AMOUNT} MIN_EDGE={MIN_EDGE} PRICE=[{ENTRY_PRICE_MIN},{ENTRY_PRICE_MAX}]")
+    log(f"Params: BET=${BET_AMOUNT} MIN_EDGE={MIN_EDGE} PRICE_MIN={ENTRY_PRICE_MIN} MIN_ORDER={MIN_ORDER_SIZE}sh")
     log(f"Tracking: {', '.join(c.upper() for c in CRYPTOS)}")
     log("")
 
