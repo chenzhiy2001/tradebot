@@ -101,7 +101,7 @@ MAX_POSITIONS = 8             # Max concurrent positions (windows we're active i
 MIN_EDGE = 0.10               # Minimum |edge| to trade (data: 0.10+ = 89% WR, profitable)
 MIN_RETURN_ABS = 0.0001       # Minimum |crypto return| (0.01%) — data: profitable at this level
 MAX_ELAPSED_PCT = 0.75        # Don't enter after 75% of window elapsed (data: 80%+ → 0% WR)
-ENTRY_PRICE_MIN = 0.40        # Only buy tokens priced ≥40¢
+ENTRY_PRICE_MIN = 0.47        # Only buy tokens priced ≥47¢
 FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
 EXIT_PRICE = 0.99             # GTC sell price — fills when winning token → $1.00
 MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
