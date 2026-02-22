@@ -1149,21 +1149,17 @@ class Sniper:
                     except Exception:
                         pass
 
-                won = (ti["side"] == outcome)
-                pnl = (ti["shares"] - ti["cost"]) if won else -ti["cost"]
+                won = False  # Sell didn't fill → loss (if we'd won, the $0.99 sell would have filled)
+                pnl = -ti["cost"]
                 ti["exit_type"] = "resolution"
-                ti["won"] = won
+                ti["won"] = False
                 ti["pnl"] = round(pnl, 4)
 
                 self._trade_count += 1
-                if won:
-                    self._win_count += 1
-                    self._session_won += ti["shares"]
                 self._session_cost += ti["cost"]
 
-                emoji = "✅" if won else "❌"
-                log(f"  {emoji} {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
-                    f"| {'WON' if won else 'LOST'} ${abs(pnl):.2f} (resolution timeout) | "
+                log(f"  ❌ {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
+                    f"| LOST ${abs(pnl):.2f} (resolution timeout) | "
                     f"session {self._win_count}/{self._trade_count} wins")
                 self._save_window(w, outcome, ret)
                 w["completed"] = True
