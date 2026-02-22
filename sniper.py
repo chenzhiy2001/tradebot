@@ -100,7 +100,7 @@ KELLY_FRACTION = 0.25         # Use quarter-Kelly (conservative) to size bets
 MAX_POSITIONS = 8             # Max concurrent positions (windows we're active in)
 MIN_EDGE = 0.10               # Minimum |edge| to trade (data: 0.10+ = 89% WR, profitable)
 MIN_RETURN_ABS = 0.0001       # Minimum |crypto return| (0.01%) — data: profitable at this level
-# No MIN_ELAPSED_PCT — the Bayesian model's t_rem denominator handles timing naturally.
+MAX_ELAPSED_PCT = 0.75        # Don't enter after 75% of window elapsed (data: 80%+ → 0% WR)
 ENTRY_PRICE_MIN = 0.40        # Only buy tokens priced ≥40¢
 FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
 EXIT_PRICE = 0.99             # GTC sell price — fills when winning token → $1.00
@@ -975,9 +975,11 @@ class Sniper:
                 if w.get("sell_placed"):
                     self._check_sell_fills(w, key)
                 elif not w["trade_info"].get("dry_run"):
-                    # Sell not yet placed — retry periodically
-                    if time.time() - w.get("_last_sell_attempt", 0) >= SELL_RETRY_INTERVAL:
-                        self._place_exit_sell(w)
+                    # Sell not yet placed — retry periodically (but only if we have enough shares)
+                    ti = w["trade_info"]
+                    if ti and ti.get("shares", 0) >= MIN_ORDER_SIZE:
+                        if time.time() - w.get("_last_sell_attempt", 0) >= SELL_RETRY_INTERVAL:
+                            self._place_exit_sell(w)
 
             # ─── Compute Bayesian signal ───
             if (w["open_price"] is not None
@@ -1013,6 +1015,8 @@ class Sniper:
                     w["signals"] = w["signals"][-4:] + [signal]
 
                     # ─── Trade decision ───
+                    if pct > MAX_ELAPSED_PCT:
+                        continue  # Too late in window — 0% WR historically
                     if abs(current_return) >= MIN_RETURN_ABS:
 
                         # Determine which side to buy
@@ -1259,8 +1263,11 @@ class Sniper:
                     "pnl": None,
                 }
 
-                # Place exit sell immediately
-                self._place_exit_sell(w)
+                # Place exit sell — but only if we have enough shares
+                if actual < MIN_ORDER_SIZE:
+                    log(f"  ⚠ Partial fill {actual:.1f}sh < {MIN_ORDER_SIZE} min — cannot sell, will resolve")
+                else:
+                    self._place_exit_sell(w)
 
                 return True
             else:
