@@ -15,9 +15,8 @@ Strategy:
   Compare this to Polymarket's implied probability (token mid-price).
   When the edge exceeds MIN_EDGE, buy the underpriced token.
 
-  Exit via dynamic limit sell at best_bid — instant USDC, no claiming.
-  Sell price updates every tick as the bid improves.
-  Aggressive exit in last 30s to guarantee fill.
+  Exit via GTC limit sell at $0.99 — fills when winning token resolves to $1.
+  Losing side: sell never fills, falls back to resolution ($0).
 
 Entry:
   - GTC limit buy at best_ask (crosses spread, fills immediately as taker)
@@ -25,10 +24,10 @@ Entry:
   - Only one trade per window, only when elapsed > MIN_ELAPSED_PCT
 
 Exit:
-  - After buy fills, place GTC limit sell at current best_bid
-  - Every tick: update sell price to track rising bid as window nears end
-  - Last 30s: sell at bid - 0.01 (aggressive) to guarantee fill before resolution
-  - USDC returned immediately on fill — no claiming needed
+  - After buy fills, place GTC limit sell at $0.99
+  - Winning token → $1.00 at resolution, $0.99 sell fills automatically
+  - If sell placement fails, retries every SELL_RETRY_INTERVAL seconds
+  - Losing token → $0, sell never fills → resolution (lose cost)
 
 Data:
   - Records every window (predictions, trades, outcomes) to sniper_data.jsonl
@@ -220,7 +219,7 @@ class BayesianEngine:
                     cp = rec.get("close_price")
                     interval = rec.get("interval", 5)
                     if op and cp and op > 0:
-                        ret = (cp - op) / op
+                        ret = math.log(cp / op)  # log return for consistency with P(UP) model
                         duration = interval * 60
                         self._window_returns.append((ret, duration))
                         loaded += 1
@@ -241,8 +240,8 @@ class BayesianEngine:
         # Only use the most recent windows — vol regime changes over time
         recent = self._window_returns[-VOL_LOOKBACK_WINDOWS:]
 
-        # Normalize returns to per-√second: z_i = R_i / √D_i
-        # Under the model, z_i ~ N(0, σ²), so std(z_i) = σ
+        # Normalize log returns to per-√second: z_i = log_ret_i / √D_i
+        # Under GBM (zero drift), log_ret ~ N(0, σ²t), so z_i ~ N(0, σ²)
         normalized = [r / math.sqrt(d) for r, d in recent if d > 0]
         if len(normalized) < MIN_WINDOWS_FOR_VOL:
             return
@@ -258,9 +257,11 @@ class BayesianEngine:
                 f"~{self._vol_per_sec * math.sqrt(300) * 100:.3f}% per 5min)")
 
     def add_completed_window(self, ret, duration_sec):
-        """Add a completed window's return to the dataset."""
+        """Add a completed window's return to the dataset.
+        ret: simple return (close-open)/open — converted to log return internally."""
         with self._lock:
-            self._window_returns.append((ret, duration_sec))
+            log_ret = math.log(1 + ret) if ret > -1 else -10  # log return
+            self._window_returns.append((log_ret, duration_sec))
 
     def add_signal_outcome(self, signal, outcome):
         """Record a signal and its actual outcome for reanalysis.
