@@ -115,8 +115,9 @@ SELL_WAIT_AFTER_END = 600     # Seconds to wait after window ends for sell to fi
 REANALYSIS_INTERVAL = 300     # Reanalyze every 5 minutes (not per-window)
 
 # Bayesian model
-DEFAULT_VOL_PER_SEC = 5.8e-5  # Default σ per √second (~0.1% per 5min window)
-MIN_WINDOWS_FOR_VOL = 10      # Need this many completed windows before using empirical vol
+DEFAULT_VOL_PER_SEC = 7.0e-5  # Default σ per √second (~0.121%/5min) — calibrated from 6 sessions
+                              # (observed range: 0.000060-0.000080, 7e-5 is conservative median)
+MIN_WINDOWS_FOR_VOL = 5       # Use empirical vol after just 5 windows (~25min) to escape cold start faster
 DATA_LOOKBACK_SECS = 7200     # Use data from the last 2 hours for both σ and signal reanalysis
                               # (vol regimes and market microstructure both shift hourly)
 
@@ -967,6 +968,14 @@ class Sniper:
         self._start_balance = get_usdc_balance()
         self._last_report = None
         self._last_reanalysis = 0  # epoch time of last reanalysis
+
+        # Scale initial BET_AMOUNT to balance — don't risk 36% on one trade
+        global BET_AMOUNT
+        if self._start_balance and self._start_balance > 0:
+            max_initial = round(self._start_balance * 0.10, 1)  # 10% of balance
+            if BET_AMOUNT > max_initial:
+                BET_AMOUNT = max(MIN_BET, max_initial)
+                log(f"  📐 Scaled BET_AMOUNT to ${BET_AMOUNT:.1f} (10% of ${self._start_balance:.0f} balance)")
 
     def update_markets(self, markets):
         """Add new market windows, subscribe tokens."""
