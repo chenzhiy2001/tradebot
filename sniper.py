@@ -106,7 +106,7 @@ FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
 EXIT_PRICE = 0.99             # GTC sell price — fills when winning token → $1.00
 MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 SELL_RETRY_INTERVAL = 10      # Seconds between sell placement retries if first attempt fails
-SELL_WAIT_AFTER_END = 120     # Seconds to wait after window ends for sell to fill (resolution time)
+SELL_WAIT_AFTER_END = 600     # Seconds to wait after window ends for sell to fill (resolution ~2-3min, buffer for delays)
 REANALYSIS_INTERVAL = 300     # Reanalyze every 5 minutes (not per-window)
 
 # Bayesian model
@@ -473,15 +473,14 @@ class BayesianEngine:
 
     def prob_up(self, current_return, seconds_remaining):
         """
-        P(UP | current state) under GBM with drift:
+        P(UP) = Φ( log(1+R) / (σ √t_rem) )
 
-          P(UP) = Φ( (log(1+R) + μ·τ) / (σ √τ) )
+        Uses symmetric GBM (zero drift). Drift estimation is kept for
+        monitoring only — using it in the formula caused wrong-side bets
+        during market reversals (positive return → DOWN bet due to stale drift).
 
-        where μ = estimated drift per second (from recent windows),
-        R = current return, τ = seconds_remaining, σ = vol per √second.
-        With μ=0 this reduces to the original symmetric formula.
-        Positive μ → market trending up → higher P(UP).
-        Negative μ → market trending down → lower P(UP).
+        current_return: (S(t) - S(0)) / S(0)  (e.g. 0.001 = 0.1%)
+        seconds_remaining: seconds until window closes
         """
         if seconds_remaining <= 0:
             # Window is over — return is final
@@ -489,7 +488,6 @@ class BayesianEngine:
 
         with self._lock:
             vol = self._vol_per_sec
-            drift = self._drift_per_sec
 
         # Avoid log of non-positive
         if current_return <= -1:
@@ -501,8 +499,7 @@ class BayesianEngine:
         if denom <= 0:
             return 0.5
 
-        # GBM with drift: z = (log(1+R) + μ·τ) / (σ√τ)
-        z = (log_return + drift * seconds_remaining) / denom
+        z = log_return / denom
         # Φ(z) = 0.5 * (1 + erf(z / √2))
         p = 0.5 * (1 + math.erf(z / math.sqrt(2)))
         return max(0.001, min(0.999, p))
