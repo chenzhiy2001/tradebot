@@ -317,6 +317,44 @@ class BayesianEngine:
                 "_ts": time.time(),
             })
 
+    @staticmethod
+    def _sig_tradeable(s, threshold):
+        """Check if signal would trigger a trade at given edge threshold."""
+        if "edge_down" in s:
+            return s["edge_up"] >= threshold or s["edge_down"] >= threshold
+        return abs(s["edge_up"]) >= threshold
+
+    @staticmethod
+    def _sig_win(s, threshold):
+        """Check if tradeable signal would have been a winning trade."""
+        if "edge_down" in s:
+            return ((s["edge_up"] >= threshold and s["actual_up"] == 1.0) or
+                    (s["edge_down"] >= threshold and s["actual_up"] == 0.0))
+        return ((s["edge_up"] >= threshold and s["actual_up"] == 1.0) or
+                (s["edge_up"] <= -threshold and s["actual_up"] == 0.0))
+
+    @staticmethod
+    def _sig_entry_price(s, threshold):
+        """Estimate entry price for a tradeable signal."""
+        if "edge_down" in s:
+            if s["edge_up"] >= threshold:
+                return s["implied_up"]
+            if s["edge_down"] >= threshold:
+                return 1.0 - s["implied_up"]
+        else:
+            if s["edge_up"] >= threshold:
+                return s["implied_up"]
+            if s["edge_up"] <= -threshold:
+                return 1.0 - s["implied_up"]
+        return 0.55
+
+    @staticmethod
+    def _sig_best_edge(s):
+        """Get the best (highest) edge from a signal."""
+        if "edge_down" in s:
+            return max(s.get("edge_up", 0), s.get("edge_down", 0))
+        return abs(s["edge_up"])
+
     def reanalyze(self):
         """Full reanalysis of prediction accuracy and edge calibration.
         Returns a report dict with findings and recommended adjustments."""
@@ -355,21 +393,11 @@ class BayesianEngine:
         #    what was the actual win rate vs predicted?
         for threshold in [0.10, 0.15, 0.20, 0.25, 0.30]:
             tradeable = [s for s in signals
-                         if abs(s["edge_up"]) >= threshold
+                         if self._sig_tradeable(s, threshold)
                          and abs(s["return"]) >= MIN_RETURN_ABS * 100]  # return is in %
             if len(tradeable) >= 5:
-                wins = 0
-                total_edge = 0
-                for s in tradeable:
-                    if s["edge_up"] >= threshold:
-                        # Would buy UP
-                        if s["actual_up"] == 1.0:
-                            wins += 1
-                    elif s["edge_up"] <= -threshold:
-                        # Would buy DOWN
-                        if s["actual_up"] == 0.0:
-                            wins += 1
-                    total_edge += abs(s["edge_up"])
+                wins = sum(1 for s in tradeable if self._sig_win(s, threshold))
+                total_edge = sum(self._sig_best_edge(s) for s in tradeable)
 
                 wr = wins / len(tradeable) if tradeable else 0
                 avg_edge = total_edge / len(tradeable) if tradeable else 0
@@ -378,12 +406,7 @@ class BayesianEngine:
                 #   Loss per share = avg_entry
                 #   Breakeven WR = avg_entry / EXIT_PRICE
                 # At avg entry 0.55: breakeven = 55.6%, at 0.65: 65.7%
-                entry_prices = []
-                for s in tradeable:
-                    if s["edge_up"] >= threshold:
-                        entry_prices.append(s["implied_up"])
-                    elif s["edge_up"] <= -threshold:
-                        entry_prices.append(1.0 - s["implied_up"])
+                entry_prices = [self._sig_entry_price(s, threshold) for s in tradeable]
                 avg_entry = sum(entry_prices) / len(entry_prices) if entry_prices else 0.55
                 breakeven_wr = avg_entry / EXIT_PRICE
                 report[f"edge_{threshold:.2f}"] = {
@@ -402,19 +425,12 @@ class BayesianEngine:
             if key not in report:
                 # Compute it if not already done
                 tradeable = [s for s in signals
-                             if abs(s["edge_up"]) >= threshold
+                             if self._sig_tradeable(s, threshold)
                              and abs(s["return"]) >= MIN_RETURN_ABS * 100]
                 if len(tradeable) >= 5:
-                    wins = sum(1 for s in tradeable
-                               if (s["edge_up"] >= threshold and s["actual_up"] == 1.0)
-                               or (s["edge_up"] <= -threshold and s["actual_up"] == 0.0))
+                    wins = sum(1 for s in tradeable if self._sig_win(s, threshold))
                     wr = wins / len(tradeable)
-                    entry_prices = []
-                    for s in tradeable:
-                        if s["edge_up"] >= threshold:
-                            entry_prices.append(s["implied_up"])
-                        elif s["edge_up"] <= -threshold:
-                            entry_prices.append(1.0 - s["implied_up"])
+                    entry_prices = [self._sig_entry_price(s, threshold) for s in tradeable]
                     avg_entry = sum(entry_prices) / len(entry_prices) if entry_prices else 0.55
                     breakeven_wr = avg_entry / EXIT_PRICE
                     report[key] = {"n": len(tradeable), "win_rate": round(wr, 3),
@@ -435,12 +451,10 @@ class BayesianEngine:
         for lo, hi in timing_buckets:
             eligible = [s for s in signals
                         if lo <= s["pct"] < hi
-                        and abs(s["edge_up"]) >= optimal_edge
+                        and self._sig_tradeable(s, optimal_edge)
                         and abs(s["return"]) >= MIN_RETURN_ABS * 100]
             if len(eligible) >= 3:
-                wins = sum(1 for s in eligible
-                           if (s["edge_up"] >= optimal_edge and s["actual_up"] == 1.0)
-                           or (s["edge_up"] <= -optimal_edge and s["actual_up"] == 0.0))
+                wins = sum(1 for s in eligible if self._sig_win(s, optimal_edge))
                 wr = wins / len(eligible)
                 timing_analysis.append({
                     "bucket": f"{lo:.0%}-{hi:.0%}",
@@ -461,13 +475,11 @@ class BayesianEngine:
         #    Also apply confidence scaling: Kelly ramps up as sqrt(n),
         #    reaching full confidence only at MIN_TRADES_FOR_FULL_KELLY.
         tradeable_at_optimal = [s for s in signals
-                                if abs(s["edge_up"]) >= optimal_edge
+                                if self._sig_tradeable(s, optimal_edge)
                                 and abs(s["return"]) >= MIN_RETURN_ABS * 100]
         if len(tradeable_at_optimal) >= 5:
             n_trades = len(tradeable_at_optimal)
-            wins = sum(1 for s in tradeable_at_optimal
-                       if (s["edge_up"] >= optimal_edge and s["actual_up"] == 1.0)
-                       or (s["edge_up"] <= -optimal_edge and s["actual_up"] == 0.0))
+            wins = sum(1 for s in tradeable_at_optimal if self._sig_win(s, optimal_edge))
 
             # Bayesian WR: Beta(1,1) prior → posterior mean = (wins+1)/(n+2)
             # This naturally penalizes small samples:
@@ -482,12 +494,7 @@ class BayesianEngine:
             confidence = min(1.0, math.sqrt(n_trades) / math.sqrt(MIN_TRADES_FOR_FULL_KELLY))
 
             # Estimate average entry price from implied probs
-            avg_prices = []
-            for s in tradeable_at_optimal:
-                if s["edge_up"] >= optimal_edge:
-                    avg_prices.append(s["implied_up"])  # buying UP around this price
-                elif s["edge_up"] <= -optimal_edge:
-                    avg_prices.append(1.0 - s["implied_up"])  # buying DOWN
+            avg_prices = [self._sig_entry_price(s, optimal_edge) for s in tradeable_at_optimal]
             avg_price = sum(avg_prices) / len(avg_prices) if avg_prices else 0.50
             avg_price = max(0.10, min(0.90, avg_price))
 
@@ -988,6 +995,19 @@ class Sniper:
             interval = m["_interval"]
             epoch = m["_epoch"]
 
+            # Verify token ordering from outcomes field
+            outcomes = json.loads(m.get("outcomes", "[]"))
+            if len(outcomes) == 2:
+                # Match tokens to UP/DOWN outcomes
+                up_idx = next((i for i, o in enumerate(outcomes) if "up" in o.lower()), 0)
+                down_idx = 1 - up_idx
+                up_token = tokens[up_idx]
+                down_token = tokens[down_idx]
+            else:
+                # Fallback: assume standard ordering
+                up_token = tokens[0]
+                down_token = tokens[1]
+
             # Compute window times from epoch (reliable, no timezone parsing needed)
             start_utc = datetime.fromtimestamp(epoch, tz=timezone.utc)
             end_utc = start_utc + timedelta(minutes=interval)
@@ -1008,8 +1028,8 @@ class Sniper:
                         "start_utc": start_utc,
                         "end_utc": end_utc,
                         "duration": interval * 60,
-                        "up_token": tokens[0],
-                        "down_token": tokens[1],
+                        "up_token": up_token,
+                        "down_token": down_token,
                         "open_price": None,
                         "close_price": None,
                         "traded": False,
@@ -1086,17 +1106,21 @@ class Sniper:
                 if up_bid and up_ask and up_bid > 0 and up_ask > 0:
                     implied_up = (up_bid + up_ask) / 2.0
 
-                if implied_up is not None:
-                    edge_up = p_up - implied_up           # + means UP token is cheap
-                    edge_down = (1.0 - p_up) - (1.0 - implied_up)  # = -edge_up
+                # Compute ask-based edges: edge = our_prob - actual_buy_price
+                # These reflect the REAL edge after crossing the spread.
+                # Mid-price edges systematically inflate edge by half the spread.
+                edge_up = (p_up - up_ask) if (up_ask and up_ask > 0) else None
+                edge_down = ((1.0 - p_up) - down_ask) if (down_ask and down_ask > 0) else None
 
-                    # Log signal for dashboard
+                if implied_up is not None:
+                    # Log signal for dashboard and reanalysis
                     signal = {
                         "pct": round(pct, 3),
                         "return": round(current_return * 100, 4),
                         "p_up": round(p_up, 4),
                         "implied_up": round(implied_up, 4),
-                        "edge_up": round(edge_up, 4),
+                        "edge_up": round(edge_up, 4) if edge_up is not None else 0,
+                        "edge_down": round(edge_down, 4) if edge_down is not None else 0,
                         "remaining": round(remaining, 1),
                     }
                     # Keep last 5 signals per window
@@ -1105,21 +1129,33 @@ class Sniper:
                     # ─── Trade decision ───
                     if pct > MAX_ELAPSED_PCT:
                         continue  # Too late in window — 0% WR historically
+
+                    # Skip if Polymarket prices are stale (>10s old)
+                    if poly_age is not None and poly_age > 10:
+                        continue
+
                     if abs(current_return) >= MIN_RETURN_ABS:
 
-                        # Determine which side to buy
-                        if edge_up >= MIN_EDGE:
-                            # UP token is underpriced → buy UP
+                        # Determine which side to buy (prefer higher edge)
+                        buy_up = edge_up is not None and edge_up >= MIN_EDGE
+                        buy_down = edge_down is not None and edge_down >= MIN_EDGE
+                        if buy_up and buy_down:
+                            # Both sides have edge — pick higher
+                            if edge_down > edge_up:
+                                buy_up = False
+                            else:
+                                buy_down = False
+
+                        if buy_up:
                             token_id = w["up_token"]
                             buy_side = "UP"
-                            buy_price = up_ask  # Cross spread for instant fill
+                            buy_price = up_ask
                             edge = edge_up
                             our_prob = p_up
-                        elif edge_down >= MIN_EDGE:
-                            # DOWN token is underpriced → buy DOWN
+                        elif buy_down:
                             token_id = w["down_token"]
                             buy_side = "DOWN"
-                            buy_price = down_ask if down_ask and down_ask > 0 else (1.0 - up_bid if up_bid else None)
+                            buy_price = down_ask
                             edge = edge_down
                             our_prob = 1.0 - p_up
                         else:
@@ -1151,10 +1187,7 @@ class Sniper:
 
                         # Exposure cap: don't exceed MAX_EXPOSURE_PCT of balance
                         if open_exposure + BET_AMOUNT > balance * MAX_EXPOSURE_PCT:
-                            available = balance * MAX_EXPOSURE_PCT - open_exposure
-                            if available < MIN_BET:
-                                continue  # Can't afford even MIN_BET within exposure limit
-                            # Could reduce bet here, but simpler to just skip
+                            continue  # Skip — would exceed exposure limit
 
                         # ─── EXECUTE TRADE ───
                         log(f"  🎯 SIGNAL {key}: {buy_side} | P(UP)={p_up:.3f} impl={implied_up:.3f} "
@@ -1690,10 +1723,12 @@ class Sniper:
                 # Show last signal
                 if w["signals"]:
                     s = w["signals"][-1]
+                    eu = s.get('edge_up', 0)
+                    ed = s.get('edge_down', 0)
                     lines.append(
                         f"         └ @{s['pct']:.0%}: ret={s['return']:+.3f}% "
                         f"P(UP)={s['p_up']:.3f} impl={s['implied_up']:.3f} "
-                        f"edge={s['edge_up']:+.3f}"
+                        f"eUP={eu:+.3f} eDN={ed:+.3f}"
                     )
 
         # ─── Session summary ───
