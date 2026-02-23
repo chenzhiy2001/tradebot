@@ -93,12 +93,11 @@ CRYPTOS = {
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
+BET_AMOUNT = 10               # Bet size in USDC per trade (auto-tuned by Kelly)
 MIN_BET = 5                   # Floor — never bet less than this
 MAX_BET = 50                  # Ceiling — never bet more than this
-KELLY_FRACTION = 0.15         # Sixth-Kelly — aggressive markets need extra caution
-MAX_BET_PCT = 0.10            # HARD CAP: never bet more than 10% of current balance
-MIN_BANKROLL = 15             # Stop trading if balance drops below this (circuit breaker)
-MAX_POSITIONS = 4             # Max concurrent positions (fewer = less correlated risk)
+KELLY_FRACTION = 0.25         # Use quarter-Kelly (conservative) to size bets
+MAX_POSITIONS = 8             # Max concurrent positions (windows we're active in)
 MIN_EDGE = 0.15               # Minimum |edge| to trade (data: 0.15+ = 68% WR, profitable)
 MIN_RETURN_ABS = 0.0001       # Minimum |crypto return| (0.01%) — data: profitable at this level
 MAX_ELAPSED_PCT = 0.75        # Don't enter after 75% of window elapsed (data: 80%+ → 0% WR)
@@ -1110,30 +1109,9 @@ class Sniper:
                         if buy_price < ENTRY_PRICE_MIN:
                             continue
 
-                        # Balance check + circuit breaker
+                        # Balance check
                         balance = get_usdc_balance()
-                        if balance is None or balance < MIN_BANKROLL:
-                            if balance is not None and balance < MIN_BANKROLL:
-                                log(f"  🛑 CIRCUIT BREAKER: balance ${balance:.2f} < ${MIN_BANKROLL} — stopping trades")
-                            continue
-
-                        # Per-trade Kelly bet sizing
-                        # Kelly f* = (p*b - q) / b for THIS trade's edge & price
-                        b_trade = (EXIT_PRICE - buy_price) / buy_price  # net odds for this trade
-                        if b_trade <= 0:
-                            continue
-                        q_trade = 1.0 - our_prob
-                        kelly_raw = (our_prob * b_trade - q_trade) / b_trade
-                        kelly_raw = max(0, kelly_raw)
-                        trade_bet_pct = kelly_raw * KELLY_FRACTION
-
-                        # Compute bet with hard cap on bankroll %
-                        raw_bet = balance * trade_bet_pct
-                        max_allowed = balance * MAX_BET_PCT  # never > 10% of balance
-                        trade_bet = round(max(MIN_BET, min(MAX_BET, raw_bet, max_allowed)), 2)
-
-                        # Final affordability check
-                        if trade_bet + 2 > balance:
+                        if balance is None or balance < BET_AMOUNT + 2:
                             continue
 
                         # Count active positions
@@ -1147,11 +1125,10 @@ class Sniper:
                         # ─── EXECUTE TRADE ───
                         log(f"  🎯 SIGNAL {key}: {buy_side} | P(UP)={p_up:.3f} impl={implied_up:.3f} "
                             f"edge={edge:.3f} | ret={current_return*100:+.3f}% | {remaining:.0f}s left "
-                            f"| price={'CL' if cl_price is not None else 'BN'} | bet=${trade_bet:.2f} kelly={trade_bet_pct:.1%}")
+                            f"| price={'CL' if cl_price is not None else 'BN'}")
 
                         success = self._execute_buy(
-                            w, token_id, buy_side, buy_price, edge, our_prob, current_return,
-                            bet_amount=trade_bet
+                            w, token_id, buy_side, buy_price, edge, our_prob, current_return
                         )
                         if success:
                             w["traded"] = True
@@ -1286,11 +1263,10 @@ class Sniper:
             for key in to_remove:
                 self._windows.pop(key, None)
 
-    def _execute_buy(self, w, token_id, side, buy_price, edge, our_prob, current_return, bet_amount=None):
+    def _execute_buy(self, w, token_id, side, buy_price, edge, our_prob, current_return):
         """Place a GTC limit buy and verify fill. Returns True if filled."""
         buy_price = round(buy_price, 2)
-        actual_bet = bet_amount if bet_amount is not None else MIN_BET
-        est_shares = actual_bet / buy_price
+        est_shares = BET_AMOUNT / buy_price
 
         # Ensure we buy enough shares to meet Polymarket's minimum order size
         # (needed for both the buy and the subsequent exit sell)
@@ -1301,7 +1277,7 @@ class Sniper:
         fee_est = compute_taker_fee(est_shares, buy_price)
 
         log(f"  💰 Buying {side}: ~{est_shares:.0f}sh @ {buy_price:.2f} "
-            f"(${actual_bet:.2f} + ~${fee_est:.2f} fee)")
+            f"(${BET_AMOUNT:.0f} + ~${fee_est:.2f} fee)")
 
         if DRY_RUN:
             log(f"  🧪 DRY RUN — skipping execution")
@@ -1310,7 +1286,7 @@ class Sniper:
                 "token_id": token_id,
                 "entry_price": buy_price,
                 "shares": est_shares,
-                "cost": actual_bet + fee_est,
+                "cost": BET_AMOUNT + fee_est,
                 "edge": edge,
                 "our_prob": our_prob,
                 "return_at_entry": current_return,
@@ -1515,7 +1491,7 @@ class Sniper:
 
     def _run_reanalysis(self):
         """Run full reanalysis: σ, edge, timing, Kelly. Called every window."""
-        global MIN_EDGE
+        global MIN_EDGE, BET_AMOUNT
 
         # Recalibrate volatility and drift
         self.engine._recompute_vol()
@@ -1561,6 +1537,26 @@ class Sniper:
             log(f"  🔧 AUTO-TUNE: MIN_EDGE {old_edge:.2f} → {MIN_EDGE:.2f}")
         else:
             log(f"  🔧 MIN_EDGE={MIN_EDGE:.2f} (optimal={optimal:.2f}, no change)")
+
+        # Auto-tune BET_AMOUNT via Kelly criterion
+        kelly = report.get("kelly")
+        if kelly and AUTO_TUNE_EDGE:
+            kelly_pct = kelly["kelly_bet_pct"]
+            if kelly_pct > 0:
+                balance = get_usdc_balance()
+                if balance and balance > 0:
+                    raw_bet = balance * kelly_pct
+                    new_bet = round(max(MIN_BET, min(MAX_BET, raw_bet)), 1)
+                    old_bet = BET_AMOUNT
+                    BET_AMOUNT = new_bet
+                    log(f"  🔧 AUTO-TUNE: BET_AMOUNT ${old_bet:.1f} → ${BET_AMOUNT:.1f} "
+                        f"(Kelly={kelly['kelly_full']:.1%} × {KELLY_FRACTION} = {kelly_pct:.1%} of ${balance:.0f})")
+                else:
+                    log(f"  🔧 BET_AMOUNT=${BET_AMOUNT:.1f} (Kelly={kelly['kelly_full']:.1%}, balance unknown)")
+            else:
+                log(f"  🔧 BET_AMOUNT=${BET_AMOUNT:.1f} (Kelly=0 — edge not profitable enough to bet)")
+        else:
+            log(f"  🔧 BET_AMOUNT=${BET_AMOUNT:.1f} (not enough data for Kelly)")
 
         log(f"  {'═' * 60}\n")
 
@@ -1704,7 +1700,7 @@ def main():
     log(f"═══ Sniper Bot ═══ [{mode}]")
     log(f"Strategy: Bayesian prediction → buy underpriced token → sell at $0.99")
     log(f"Price source: Chainlink (via Polymarket RTDS) — matches resolution source")
-    log(f"Params: MIN_EDGE={MIN_EDGE} PRICE_MIN={ENTRY_PRICE_MIN} MAX_BET_PCT={MAX_BET_PCT:.0%} MIN_BANKROLL=${MIN_BANKROLL} MIN_ORDER={MIN_ORDER_SIZE}sh")
+    log(f"Params: BET=${BET_AMOUNT} MIN_EDGE={MIN_EDGE} PRICE_MIN={ENTRY_PRICE_MIN} MIN_ORDER={MIN_ORDER_SIZE}sh")
     log(f"Tracking: {', '.join(c.upper() for c in CRYPTOS)}")
     log("")
 
