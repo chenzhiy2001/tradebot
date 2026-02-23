@@ -1083,18 +1083,6 @@ class Sniper:
                         if buy_price is None or buy_price <= 0:
                             continue
 
-                        # Side bias filter — require extra edge against strong trend
-                        up_rate, bias_n = self.engine.recent_side_bias()
-                        if bias_n >= 10:
-                            if buy_side == "UP" and up_rate < 0.35:
-                                # Market heavily favors DOWN — require 50% extra edge
-                                if edge < MIN_EDGE * 1.5:
-                                    continue
-                            elif buy_side == "DOWN" and up_rate > 0.65:
-                                # Market heavily favors UP — require 50% extra edge
-                                if edge < MIN_EDGE * 1.5:
-                                    continue
-
                         # Price range check
                         if buy_price < ENTRY_PRICE_MIN:
                             continue
