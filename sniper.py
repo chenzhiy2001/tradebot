@@ -103,6 +103,7 @@ MAX_EXPOSURE_PCT = 0.50       # Never more than 50% of balance deployed in open 
 BET_RAMP_FACTOR = 1.5         # Max bet size INCREASE per reanalysis cycle (1.5 = +50%)
 DRAWDOWN_HALT_PCT = 0.30      # If balance < 30% of session start, lock to MIN_BET
 MIN_EDGE = 0.15               # Minimum |edge| to trade (data: 0.15+ = 68% WR, profitable)
+MIN_EDGE_FLOOR = 0.15         # Hard floor — auto-tune can raise MIN_EDGE but NEVER lower below this
 MIN_RETURN_ABS = 0.0001       # Minimum |crypto return| (0.01%) — data: profitable at this level
 MAX_ELAPSED_PCT = 0.75        # Don't enter after 75% of window elapsed (data: 80%+ → 0% WR)
 ENTRY_PRICE_MIN = 0.55        # Only buy tokens priced ≥55¢ (lower = 50/50 WR, fees eat profits)
@@ -1583,14 +1584,16 @@ class Sniper:
                 marker = "✅" if t["win_rate"] >= 0.60 else "❌"
                 log(f"    {marker} {t['bucket']}: WR={t['win_rate']:.0%} (n={t['n']})")
 
-        # Auto-tune MIN_EDGE
+        # Auto-tune MIN_EDGE (can go UP but never below MIN_EDGE_FLOOR)
         optimal = report.get("optimal_edge", MIN_EDGE)
-        if AUTO_TUNE_EDGE and optimal != MIN_EDGE:
+        clamped = max(optimal, MIN_EDGE_FLOOR)
+        if AUTO_TUNE_EDGE and clamped != MIN_EDGE:
             old_edge = MIN_EDGE
-            MIN_EDGE = optimal
-            log(f"  🔧 AUTO-TUNE: MIN_EDGE {old_edge:.2f} → {MIN_EDGE:.2f}")
+            MIN_EDGE = clamped
+            log(f"  🔧 AUTO-TUNE: MIN_EDGE {old_edge:.2f} → {MIN_EDGE:.2f}"
+                f"{f' (optimal={optimal:.2f} clamped to floor {MIN_EDGE_FLOOR:.2f})' if optimal < MIN_EDGE_FLOOR else ''}")
         else:
-            log(f"  🔧 MIN_EDGE={MIN_EDGE:.2f} (optimal={optimal:.2f}, no change)")
+            log(f"  🔧 MIN_EDGE={MIN_EDGE:.2f} (optimal={optimal:.2f}, floor={MIN_EDGE_FLOOR:.2f}, no change)")
 
         # Auto-tune BET_AMOUNT via Kelly criterion
         #   Bayesian WR + confidence scaling + bet smoothing + drawdown halt
@@ -1844,22 +1847,32 @@ def main():
             time.sleep(TICK_INTERVAL)
 
         except KeyboardInterrupt:
-            log(f"\nStopping — cancelling all open orders...")
-            # Cancel all open sell orders so shares can resolve naturally
+            log(f"\nStopping — keeping sell orders live, cancelling unfilled buys...")
+            # Keep sell orders alive! They auto-fill when market resolves correctly.
+            # Only cancel unfilled BUY orders to prevent new positions.
+            sell_order_ids = set()
             with sniper._lock:
                 for key, w in sniper._windows.items():
-                    if w.get("sell_placed") and w.get("sell_order_id") and not w.get("sell_filled"):
-                        try:
-                            client.cancel(w["sell_order_id"])
-                            log(f"  🚫 Cancelled sell for {key}")
-                        except Exception:
-                            pass
-            # Also cancel any other open orders on the book
+                    if w.get("sell_order_id") and not w.get("sell_filled"):
+                        sell_order_ids.add(w["sell_order_id"])
+                        log(f"  ✅ Keeping sell order for {key} (id={w['sell_order_id'][:8]}...)")
+            # Cancel remaining open orders EXCEPT our sell orders
             try:
-                client.cancel_all()
-                log(f"  🚫 Cancelled all remaining open orders")
+                open_orders = client.get_orders()
+                if open_orders:
+                    for order in open_orders:
+                        oid = order.get("id", "")
+                        if oid not in sell_order_ids:
+                            try:
+                                client.cancel(oid)
+                                log(f"  🚫 Cancelled order {oid[:8]}...")
+                            except Exception:
+                                pass
             except Exception:
                 pass
+            if sell_order_ids:
+                log(f"  📌 {len(sell_order_ids)} sell order(s) left live — they'll fill on correct resolution")
+                log(f"     Run claimer.py later to redeem resolved positions")
             bal = get_usdc_balance()
             if bal and sniper._start_balance:
                 log(f"Final balance: ${bal:.2f} (Δ{bal - sniper._start_balance:+.2f})")
