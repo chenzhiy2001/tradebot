@@ -98,7 +98,7 @@ MIN_BET = 5                   # Floor — never bet less than this
 MAX_BET = 50                  # Ceiling — never bet more than this
 KELLY_FRACTION = 0.25         # Use quarter-Kelly (conservative) to size bets
 MAX_POSITIONS = 8             # Max concurrent positions (windows we're active in)
-MIN_EDGE = 0.10               # Minimum |edge| to trade (data: 0.10+ = 89% WR, profitable)
+MIN_EDGE = 0.15               # Minimum |edge| to trade (data: 0.15+ = 68% WR, profitable)
 MIN_RETURN_ABS = 0.0001       # Minimum |crypto return| (0.01%) — data: profitable at this level
 MAX_ELAPSED_PCT = 0.75        # Don't enter after 75% of window elapsed (data: 80%+ → 0% WR)
 ENTRY_PRICE_MIN = 0.47        # Only buy tokens priced ≥47¢
@@ -206,6 +206,7 @@ class BayesianEngine:
 
     def __init__(self):
         self._vol_per_sec = DEFAULT_VOL_PER_SEC
+        self._drift_per_sec = 0.0  # Estimated drift (μ) per second from recent windows
         self._window_returns = []  # (return, duration_sec) from completed windows
         self._signal_history = []  # dicts of {p_up, implied_up, edge_up, return, actual_up}
         self._lock = threading.Lock()
@@ -244,6 +245,7 @@ class BayesianEngine:
 
         if loaded > 0:
             self._recompute_vol()
+            self._recompute_drift()
             log(f"  📊 Loaded {loaded} historical windows → σ/√s = {self._vol_per_sec:.6f}")
         else:
             log(f"  📊 No historical data — using default σ/√s = {self._vol_per_sec:.6f}")
@@ -272,6 +274,25 @@ class BayesianEngine:
             log(f"  📊 Vol recalibrated: σ/√s = {self._vol_per_sec:.6f} "
                 f"(from {len(normalized)}/{len(self._window_returns)} recent windows, "
                 f"~{self._vol_per_sec * math.sqrt(300) * 100:.3f}% per 5min)")
+
+    def _recompute_drift(self):
+        """Estimate drift (μ per second) from recent completed windows.
+        Positive μ → UP bias, negative μ → DOWN bias.
+        Used in P(UP) formula to account for market momentum."""
+        if len(self._window_returns) < MIN_WINDOWS_FOR_VOL:
+            return
+
+        cutoff = time.time() - DATA_LOOKBACK_SECS
+        recent = [(r, d) for r, d, ts in self._window_returns if ts >= cutoff]
+        drift_estimates = [r / d for r, d in recent if d > 0]
+        if len(drift_estimates) < MIN_WINDOWS_FOR_VOL:
+            return
+
+        self._drift_per_sec = sum(drift_estimates) / len(drift_estimates)
+        drift_5m = self._drift_per_sec * 300 * 100  # % per 5min window
+        direction = "↑" if self._drift_per_sec > 0 else "↓"
+        log(f"  📊 Drift estimated: μ/s = {self._drift_per_sec:.2e} "
+            f"({direction}{abs(drift_5m):.4f}%/5min from {len(drift_estimates)} windows)")
 
     def add_completed_window(self, ret, duration_sec):
         """Add a completed window's return to the dataset.
@@ -428,7 +449,7 @@ class BayesianEngine:
             avg_price = sum(avg_prices) / len(avg_prices) if avg_prices else 0.50
             avg_price = max(0.10, min(0.90, avg_price))
 
-            b = (1.0 - avg_price) / avg_price  # net odds
+            b = (EXIT_PRICE - avg_price) / avg_price  # net odds (sell at $0.99, not $1.00)
             kelly_full = (p * b - q) / b if b > 0 else 0
             kelly_full = max(0, kelly_full)  # never negative
 
@@ -452,10 +473,15 @@ class BayesianEngine:
 
     def prob_up(self, current_return, seconds_remaining):
         """
-        P(UP) = Φ( log(1+R) / (σ √t_rem) )
+        P(UP | current state) under GBM with drift:
 
-        current_return: (S(t) - S(0)) / S(0)  (e.g. 0.001 = 0.1%)
-        seconds_remaining: seconds until window closes
+          P(UP) = Φ( (log(1+R) + μ·τ) / (σ √τ) )
+
+        where μ = estimated drift per second (from recent windows),
+        R = current return, τ = seconds_remaining, σ = vol per √second.
+        With μ=0 this reduces to the original symmetric formula.
+        Positive μ → market trending up → higher P(UP).
+        Negative μ → market trending down → lower P(UP).
         """
         if seconds_remaining <= 0:
             # Window is over — return is final
@@ -463,6 +489,7 @@ class BayesianEngine:
 
         with self._lock:
             vol = self._vol_per_sec
+            drift = self._drift_per_sec
 
         # Avoid log of non-positive
         if current_return <= -1:
@@ -474,7 +501,8 @@ class BayesianEngine:
         if denom <= 0:
             return 0.5
 
-        z = log_return / denom
+        # GBM with drift: z = (log(1+R) + μ·τ) / (σ√τ)
+        z = (log_return + drift * seconds_remaining) / denom
         # Φ(z) = 0.5 * (1 + erf(z / √2))
         p = 0.5 * (1 + math.erf(z / math.sqrt(2)))
         return max(0.001, min(0.999, p))
@@ -483,6 +511,21 @@ class BayesianEngine:
     def vol_per_sec(self):
         with self._lock:
             return self._vol_per_sec
+
+    @property
+    def drift_per_sec(self):
+        with self._lock:
+            return self._drift_per_sec
+
+    def recent_side_bias(self):
+        """Returns (up_rate, n) — fraction of recent windows that resolved UP."""
+        cutoff = time.time() - DATA_LOOKBACK_SECS
+        with self._lock:
+            recent = [s for s in self._signal_history if s.get("_ts", 0) >= cutoff]
+        if len(recent) < 10:
+            return 0.5, len(recent)  # Not enough data — assume neutral
+        up_count = sum(1 for s in recent if s.get("actual_up", 0) == 1.0)
+        return up_count / len(recent), len(recent)
 
     @property
     def n_windows(self):
@@ -1040,6 +1083,18 @@ class Sniper:
                         if buy_price is None or buy_price <= 0:
                             continue
 
+                        # Side bias filter — require extra edge against strong trend
+                        up_rate, bias_n = self.engine.recent_side_bias()
+                        if bias_n >= 10:
+                            if buy_side == "UP" and up_rate < 0.35:
+                                # Market heavily favors DOWN — require 50% extra edge
+                                if edge < MIN_EDGE * 1.5:
+                                    continue
+                            elif buy_side == "DOWN" and up_rate > 0.65:
+                                # Market heavily favors UP — require 50% extra edge
+                                if edge < MIN_EDGE * 1.5:
+                                    continue
+
                         # Price range check
                         if buy_price < ENTRY_PRICE_MIN:
                             continue
@@ -1406,8 +1461,9 @@ class Sniper:
         """Run full reanalysis: σ, edge, timing, Kelly. Called every window."""
         global MIN_EDGE, BET_AMOUNT
 
-        # Recalibrate volatility first
+        # Recalibrate volatility and drift
         self.engine._recompute_vol()
+        self.engine._recompute_drift()
 
         report = self.engine.reanalyze()
         if not report:
@@ -1574,10 +1630,16 @@ class Sniper:
         )
 
         # Model info
+        drift = self.engine.drift_per_sec
+        drift_dir = "↑" if drift > 0 else ("↓" if drift < 0 else "→")
+        drift_5m = drift * 300 * 100  # % per 5min
+        up_rate, bias_n = self.engine.recent_side_bias()
         lines.append(
             f"  🧠 Model: σ/√s={self.engine.vol_per_sec:.6f} "
             f"(~{self.engine.vol_per_sec * math.sqrt(300) * 100:.3f}%/5min) | "
-            f"Data: {self.engine.n_windows} windows, {self.engine.signal_count} signals | "
+            f"μ={drift_dir}{abs(drift_5m):.4f}%/5min | "
+            f"Bias: {up_rate:.0%}UP/{1-up_rate:.0%}DN(n={bias_n}) | "
+            f"Data: {self.engine.n_windows}w {self.engine.signal_count}s | "
             f"MIN_EDGE={MIN_EDGE}"
         )
 
