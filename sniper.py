@@ -1730,6 +1730,62 @@ class Sniper:
                         f"eUP={eu:+.3f} eDN={ed:+.3f}"
                     )
 
+        # ─── Active positions & recent trades ───
+        positions = []
+        completed_trades = []
+        with self._lock:
+            for w in self._windows.values():
+                if not w.get("traded") or not w.get("trade_info"):
+                    continue
+                ti = w["trade_info"]
+                if w.get("completed"):
+                    completed_trades.append((w, ti))
+                else:
+                    positions.append((w, ti))
+
+        if positions or completed_trades:
+            lines.append(f"\n{'─' * 90}")
+            lines.append("  📋 Positions:")
+
+        if positions:
+            for w, ti in positions:
+                side_icon = "🟢" if ti["side"] == "UP" else "🔴"
+                status = "?"
+                if w.get("sell_filled"):
+                    status = "💰 SOLD"
+                elif w.get("window_ended") and w.get("sell_placed"):
+                    wait = int(time.time() - w.get("window_ended_at", time.time()))
+                    status = f"⏳ RESOLVING {wait}s"
+                elif w.get("sell_placed"):
+                    status = f"📤 SELL@{EXIT_PRICE}"
+                else:
+                    status = "🔄 PENDING SELL"
+                edge_x = ti.get("edge", 0) / MIN_EDGE if MIN_EDGE > 0 else 1.0
+                lines.append(
+                    f"    {side_icon} {w['crypto']:3s} {w['interval']:2d}m {ti['side']:4s} "
+                    f"@ {ti['entry_price']:.2f} | {ti['shares']:.0f}sh ${ti['cost']:.2f} "
+                    f"| edge={ti.get('edge', 0):.3f} ({edge_x:.1f}×) | {status}"
+                )
+        elif not completed_trades:
+            pass  # no section at all
+        else:
+            lines.append("    (none open)")
+
+        if completed_trades:
+            # Show up to last 8 completed trades, most recent first
+            completed_trades.sort(key=lambda x: x[0].get("window_ended_at", 0), reverse=True)
+            lines.append("  📜 Recent trades:")
+            for w, ti in completed_trades[:8]:
+                won = ti.get("won")
+                pnl = ti.get("pnl", 0) or 0
+                icon = "✅" if won else "❌"
+                exit_t = ti.get("exit_type", "?")
+                lines.append(
+                    f"    {icon} {w['crypto']:3s} {w['interval']:2d}m {ti['side']:4s} "
+                    f"@ {ti['entry_price']:.2f} | ${ti['cost']:.2f} → "
+                    f"${pnl:+.2f} | {exit_t}"
+                )
+
         # ─── Session summary ───
         elapsed_min = (time.time() - self._session_start) / 60
         lines.append(f"\n{'─' * 90}")
