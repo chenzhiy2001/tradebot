@@ -1156,9 +1156,14 @@ class Sniper:
                         if buy_price < ENTRY_PRICE_MIN:
                             continue
 
+                        # ─── Per-trade edge-proportional sizing ───
+                        # Higher edge → bigger bet (linear scale from MIN_EDGE)
+                        edge_scale = edge / MIN_EDGE  # 1.0 at MIN_EDGE, 2.0 at 2×MIN_EDGE, etc.
+                        trade_bet = round(max(MIN_BET, min(MAX_BET, BET_AMOUNT * edge_scale)), 1)
+
                         # Balance check
                         balance = get_usdc_balance()
-                        if balance is None or balance < BET_AMOUNT + 2:
+                        if balance is None or balance < trade_bet + 2:
                             continue
 
                         # Count active positions & total exposure
@@ -1174,16 +1179,18 @@ class Sniper:
                             continue
 
                         # Exposure cap: don't exceed MAX_EXPOSURE_PCT of balance
-                        if open_exposure + BET_AMOUNT > balance * MAX_EXPOSURE_PCT:
+                        if open_exposure + trade_bet > balance * MAX_EXPOSURE_PCT:
                             continue  # Skip — would exceed exposure limit
 
                         # ─── EXECUTE TRADE ───
                         log(f"  🎯 SIGNAL {key}: {buy_side} | P(UP)={p_up:.3f} impl={implied_up:.3f} "
                             f"edge={edge:.3f} | ret={current_return*100:+.3f}% | {remaining:.0f}s left "
-                            f"| price={'CL' if cl_price is not None else 'BN'}")
+                            f"| price={'CL' if cl_price is not None else 'BN'}"
+                            f" | bet=${trade_bet:.0f} ({edge_scale:.1f}×)")
 
                         success = self._execute_buy(
-                            w, token_id, buy_side, buy_price, edge, our_prob, current_return
+                            w, token_id, buy_side, buy_price, edge, our_prob, current_return,
+                            trade_bet=trade_bet,
                         )
                         if success:
                             w["traded"] = True
@@ -1318,10 +1325,12 @@ class Sniper:
             for key in to_remove:
                 self._windows.pop(key, None)
 
-    def _execute_buy(self, w, token_id, side, buy_price, edge, our_prob, current_return):
+    def _execute_buy(self, w, token_id, side, buy_price, edge, our_prob, current_return,
+                     trade_bet=None):
         """Place a GTC limit buy and verify fill. Returns True if filled."""
+        bet = trade_bet if trade_bet is not None else BET_AMOUNT
         buy_price = round(buy_price, 2)
-        est_shares = BET_AMOUNT / buy_price
+        est_shares = bet / buy_price
 
         # Ensure we buy enough shares to meet Polymarket's minimum order size
         # (needed for both the buy and the subsequent exit sell)
@@ -1332,7 +1341,7 @@ class Sniper:
         fee_est = compute_taker_fee(est_shares, buy_price)
 
         log(f"  💰 Buying {side}: ~{est_shares:.0f}sh @ {buy_price:.2f} "
-            f"(${BET_AMOUNT:.0f} + ~${fee_est:.2f} fee)")
+            f"(${bet:.0f} + ~${fee_est:.2f} fee)")
 
         if DRY_RUN:
             log(f"  🧪 DRY RUN — skipping execution")
@@ -1341,7 +1350,7 @@ class Sniper:
                 "token_id": token_id,
                 "entry_price": buy_price,
                 "shares": est_shares,
-                "cost": BET_AMOUNT + fee_est,
+                "cost": bet + fee_est,
                 "edge": edge,
                 "our_prob": our_prob,
                 "return_at_entry": current_return,
