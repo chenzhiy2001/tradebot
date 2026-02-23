@@ -220,11 +220,7 @@ def claim_all(
                 outcome_index=p.outcome_index,
                 neg_risk=p.negative_risk,
             )
-            tx_hash = (
-                receipt.get("transactionHash", "?")
-                if isinstance(receipt, dict)
-                else getattr(receipt, "transactionHash", "?")
-            )
+            tx_hash = getattr(receipt, "tx_hash", None) or "?"
             log.info("  ✓ Claimed  tx=%s", tx_hash)
             claimed += 1
 
