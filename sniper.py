@@ -101,7 +101,7 @@ MAX_POSITIONS = 8             # Max concurrent positions (windows we're active i
 MIN_EDGE = 0.15               # Minimum |edge| to trade (data: 0.15+ = 68% WR, profitable)
 MIN_RETURN_ABS = 0.0001       # Minimum |crypto return| (0.01%) — data: profitable at this level
 MAX_ELAPSED_PCT = 0.75        # Don't enter after 75% of window elapsed (data: 80%+ → 0% WR)
-ENTRY_PRICE_MIN = 0.47        # Only buy tokens priced ≥47¢
+ENTRY_PRICE_MIN = 0.55        # Only buy tokens priced ≥55¢ (lower = 50/50 WR, fees eat profits)
 FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
 EXIT_PRICE = 0.99             # GTC sell price — fills when winning token → $1.00
 MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
@@ -369,14 +369,29 @@ class BayesianEngine:
 
                 wr = wins / len(tradeable) if tradeable else 0
                 avg_edge = total_edge / len(tradeable) if tradeable else 0
+                # Compute breakeven WR from actual payoff asymmetry:
+                #   Win payout per share = EXIT_PRICE - avg_entry
+                #   Loss per share = avg_entry
+                #   Breakeven WR = avg_entry / EXIT_PRICE
+                # At avg entry 0.55: breakeven = 55.6%, at 0.65: 65.7%
+                entry_prices = []
+                for s in tradeable:
+                    if s["edge_up"] >= threshold:
+                        entry_prices.append(s["implied_up"])
+                    elif s["edge_up"] <= -threshold:
+                        entry_prices.append(1.0 - s["implied_up"])
+                avg_entry = sum(entry_prices) / len(entry_prices) if entry_prices else 0.55
+                breakeven_wr = avg_entry / EXIT_PRICE
                 report[f"edge_{threshold:.2f}"] = {
                     "n": len(tradeable),
                     "win_rate": round(wr, 3),
                     "avg_edge": round(avg_edge, 3),
-                    "profitable": wr > 0.55,  # Need >55% to cover fees
+                    "avg_entry": round(avg_entry, 3),
+                    "breakeven_wr": round(breakeven_wr, 3),
+                    "profitable": wr > breakeven_wr + 0.03,  # Need WR > breakeven + 3% margin
                 }
 
-        # 3. Optimal edge threshold — find lowest threshold that's still profitable
+        # 3. Optimal edge threshold — find lowest threshold that beats breakeven WR
         optimal_edge = MIN_EDGE
         for threshold in [0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.30]:
             key = f"edge_{threshold:.2f}"
@@ -390,10 +405,20 @@ class BayesianEngine:
                                if (s["edge_up"] >= threshold and s["actual_up"] == 1.0)
                                or (s["edge_up"] <= -threshold and s["actual_up"] == 0.0))
                     wr = wins / len(tradeable)
-                    report[key] = {"n": len(tradeable), "win_rate": round(wr, 3)}
+                    entry_prices = []
+                    for s in tradeable:
+                        if s["edge_up"] >= threshold:
+                            entry_prices.append(s["implied_up"])
+                        elif s["edge_up"] <= -threshold:
+                            entry_prices.append(1.0 - s["implied_up"])
+                    avg_entry = sum(entry_prices) / len(entry_prices) if entry_prices else 0.55
+                    breakeven_wr = avg_entry / EXIT_PRICE
+                    report[key] = {"n": len(tradeable), "win_rate": round(wr, 3),
+                                   "breakeven_wr": round(breakeven_wr, 3)}
             data = report.get(key)
             if data and data.get("n", 0) >= 5:
-                if data["win_rate"] >= 0.60:  # 60%+ win rate is safe
+                be_wr = data.get("breakeven_wr", 0.65)  # conservative default
+                if data["win_rate"] >= be_wr + 0.03:  # WR beats breakeven + 3% margin
                     optimal_edge = threshold
                     break  # Use the lowest profitable threshold
 
@@ -1189,18 +1214,40 @@ class Sniper:
                     except Exception:
                         pass
 
-                won = False  # Sell didn't fill → loss (if we'd won, the $0.99 sell would have filled)
-                pnl = -ti["cost"]
-                ti["exit_type"] = "resolution"
-                ti["won"] = False
-                ti["pnl"] = round(pnl, 4)
+                # Check if our direction was actually correct
+                direction_correct = (ti["side"] == outcome) if outcome in ("UP", "DOWN") else False
 
-                self._trade_count += 1
-                self._session_cost += ti["cost"]
+                if direction_correct:
+                    # Direction correct but sell didn't fill at $0.99 — shares are
+                    # still in wallet and redeemable via claimer.py at $1.00/share.
+                    # Don't count as loss — mark as pending claim.
+                    pnl_est = ti["shares"] * EXIT_PRICE - ti["cost"]  # estimated profit after claim
+                    ti["exit_type"] = "pending_claim"
+                    ti["won"] = True
+                    ti["pnl"] = round(pnl_est, 4)
 
-                log(f"  ❌ {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
-                    f"| LOST ${abs(pnl):.2f} (resolution timeout) | "
-                    f"session {self._win_count}/{self._trade_count} wins")
+                    self._trade_count += 1
+                    self._win_count += 1
+                    self._session_won += ti["shares"] * EXIT_PRICE
+                    self._session_cost += ti["cost"]
+
+                    log(f"  ⏳ {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
+                        f"| direction CORRECT, sell didn't fill → pending claim "
+                        f"({ti['shares']:.1f}sh × $1.00 ≈ ${pnl_est:+.2f}) | "
+                        f"session {self._win_count}/{self._trade_count} wins")
+                else:
+                    # Direction wrong — genuine loss
+                    pnl = -ti["cost"]
+                    ti["exit_type"] = "resolution"
+                    ti["won"] = False
+                    ti["pnl"] = round(pnl, 4)
+
+                    self._trade_count += 1
+                    self._session_cost += ti["cost"]
+
+                    log(f"  ❌ {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
+                        f"| LOST ${abs(pnl):.2f} (resolution timeout) | "
+                        f"session {self._win_count}/{self._trade_count} wins")
                 self._save_window(w, outcome, ret)
                 w["completed"] = True
                 to_remove.append(key)
@@ -1471,8 +1518,9 @@ class Sniper:
             key = f"edge_{threshold:.2f}"
             if key in report:
                 d = report[key]
-                marker = "✅" if d.get("profitable") or d["win_rate"] >= 0.60 else "❌"
-                log(f"    {marker} edge≥{threshold:.2f}: WR={d['win_rate']:.0%} (n={d['n']})")
+                be = d.get("breakeven_wr", 0.65)
+                marker = "✅" if d.get("profitable") or d["win_rate"] >= be + 0.03 else "❌"
+                log(f"    {marker} edge≥{threshold:.2f}: WR={d['win_rate']:.0%} vs BE={be:.0%} (n={d['n']})")
 
         # Print timing analysis
         if report.get("timing"):
