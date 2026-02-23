@@ -98,6 +98,10 @@ MIN_BET = 5                   # Floor — never bet less than this
 MAX_BET = 50                  # Ceiling — never bet more than this
 KELLY_FRACTION = 0.25         # Use quarter-Kelly (conservative) to size bets
 MAX_POSITIONS = 8             # Max concurrent positions (windows we're active in)
+MIN_TRADES_FOR_FULL_KELLY = 50  # Need this many trades before Kelly confidence = 100%
+MAX_EXPOSURE_PCT = 0.50       # Never more than 50% of balance deployed in open positions
+BET_RAMP_FACTOR = 1.5         # Max bet size INCREASE per reanalysis cycle (1.5 = +50%)
+DRAWDOWN_HALT_PCT = 0.30      # If balance < 30% of session start, lock to MIN_BET
 MIN_EDGE = 0.15               # Minimum |edge| to trade (data: 0.15+ = 68% WR, profitable)
 MIN_RETURN_ABS = 0.0001       # Minimum |crypto return| (0.01%) — data: profitable at this level
 MAX_ELAPSED_PCT = 0.75        # Don't enter after 75% of window elapsed (data: 80%+ → 0% WR)
@@ -451,20 +455,33 @@ class BayesianEngine:
         #    For Polymarket: buy at price P, win → $1/share, lose → $0
         #      b = (1-P)/P (e.g. buy at 0.60 → b = 0.667)
         #    Use average entry price from tradeable signals
+        #
+        #    KEY FIX: Use Bayesian WR (Beta posterior) instead of raw WR to
+        #    prevent small-sample overconfidence (7/7 wins = 100% WR → ruin).
+        #    Also apply confidence scaling: Kelly ramps up as sqrt(n),
+        #    reaching full confidence only at MIN_TRADES_FOR_FULL_KELLY.
         tradeable_at_optimal = [s for s in signals
                                 if abs(s["edge_up"]) >= optimal_edge
                                 and abs(s["return"]) >= MIN_RETURN_ABS * 100]
         if len(tradeable_at_optimal) >= 5:
+            n_trades = len(tradeable_at_optimal)
             wins = sum(1 for s in tradeable_at_optimal
                        if (s["edge_up"] >= optimal_edge and s["actual_up"] == 1.0)
                        or (s["edge_up"] <= -optimal_edge and s["actual_up"] == 0.0))
-            p = wins / len(tradeable_at_optimal)
+
+            # Bayesian WR: Beta(1,1) prior → posterior mean = (wins+1)/(n+2)
+            # This naturally penalizes small samples:
+            #   7/7 wins → 8/9 = 0.889 (not 1.0)
+            #  20/30 wins → 21/32 = 0.656 (not 0.667)
+            p_raw = wins / n_trades
+            p = (wins + 1) / (n_trades + 2)  # Bayesian posterior mean
             q = 1 - p
 
+            # Confidence scaling: ramp up Kelly with sample size
+            # Full confidence at MIN_TRADES_FOR_FULL_KELLY trades
+            confidence = min(1.0, math.sqrt(n_trades) / math.sqrt(MIN_TRADES_FOR_FULL_KELLY))
+
             # Estimate average entry price from implied probs
-            # When edge_up > 0, we buy UP at ~(1 - implied_up); vice versa
-            # Approximate: avg entry price ≈ 0.50 (midpoint assumption)
-            # More precise: use the implied of the side NOT favored
             avg_prices = []
             for s in tradeable_at_optimal:
                 if s["edge_up"] >= optimal_edge:
@@ -478,13 +495,19 @@ class BayesianEngine:
             kelly_full = (p * b - q) / b if b > 0 else 0
             kelly_full = max(0, kelly_full)  # never negative
 
+            # Effective Kelly = full_kelly × KELLY_FRACTION × confidence
+            kelly_bet_pct = kelly_full * KELLY_FRACTION * confidence
+
             report["kelly"] = {
-                "win_rate": round(p, 3),
+                "win_rate_raw": round(p_raw, 3),
+                "win_rate_bayes": round(p, 3),
+                "n_trades": n_trades,
                 "avg_entry_price": round(avg_price, 3),
                 "net_odds": round(b, 3),
                 "kelly_full": round(kelly_full, 4),
                 "kelly_fraction": KELLY_FRACTION,
-                "kelly_bet_pct": round(kelly_full * KELLY_FRACTION, 4),
+                "confidence": round(confidence, 3),
+                "kelly_bet_pct": round(kelly_bet_pct, 4),
             }
         else:
             report["kelly"] = None
@@ -1114,13 +1137,24 @@ class Sniper:
                         if balance is None or balance < BET_AMOUNT + 2:
                             continue
 
-                        # Count active positions
-                        active_count = sum(
-                            1 for ww in self._windows.values()
-                            if ww.get("traded") and not ww.get("completed")
-                        )
+                        # Count active positions & total exposure
+                        active_count = 0
+                        open_exposure = 0.0
+                        for ww in self._windows.values():
+                            if ww.get("traded") and not ww.get("completed"):
+                                active_count += 1
+                                ti = ww.get("trade_info")
+                                if ti:
+                                    open_exposure += ti.get("cost", 0)
                         if active_count >= MAX_POSITIONS:
                             continue
+
+                        # Exposure cap: don't exceed MAX_EXPOSURE_PCT of balance
+                        if open_exposure + BET_AMOUNT > balance * MAX_EXPOSURE_PCT:
+                            available = balance * MAX_EXPOSURE_PCT - open_exposure
+                            if available < MIN_BET:
+                                continue  # Can't afford even MIN_BET within exposure limit
+                            # Could reduce bet here, but simpler to just skip
 
                         # ─── EXECUTE TRADE ───
                         log(f"  🎯 SIGNAL {key}: {buy_side} | P(UP)={p_up:.3f} impl={implied_up:.3f} "
@@ -1539,18 +1573,40 @@ class Sniper:
             log(f"  🔧 MIN_EDGE={MIN_EDGE:.2f} (optimal={optimal:.2f}, no change)")
 
         # Auto-tune BET_AMOUNT via Kelly criterion
+        #   Bayesian WR + confidence scaling + bet smoothing + drawdown halt
         kelly = report.get("kelly")
         if kelly and AUTO_TUNE_EDGE:
             kelly_pct = kelly["kelly_bet_pct"]
             if kelly_pct > 0:
                 balance = get_usdc_balance()
                 if balance and balance > 0:
-                    raw_bet = balance * kelly_pct
-                    new_bet = round(max(MIN_BET, min(MAX_BET, raw_bet)), 1)
-                    old_bet = BET_AMOUNT
-                    BET_AMOUNT = new_bet
-                    log(f"  🔧 AUTO-TUNE: BET_AMOUNT ${old_bet:.1f} → ${BET_AMOUNT:.1f} "
-                        f"(Kelly={kelly['kelly_full']:.1%} × {KELLY_FRACTION} = {kelly_pct:.1%} of ${balance:.0f})")
+                    # Use session starting balance for drawdown detection
+                    start_bal = self._start_balance or balance
+
+                    # Drawdown halt: if balance < DRAWDOWN_HALT_PCT of start, lock to MIN_BET
+                    drawdown_active = balance < start_bal * DRAWDOWN_HALT_PCT
+                    if drawdown_active:
+                        old_bet = BET_AMOUNT
+                        BET_AMOUNT = MIN_BET
+                        log(f"  🔧 AUTO-TUNE: BET_AMOUNT ${old_bet:.1f} → ${BET_AMOUNT:.1f} "
+                            f"(DRAWDOWN HALT: ${balance:.0f} < {DRAWDOWN_HALT_PCT:.0%} of ${start_bal:.0f})")
+                    else:
+                        raw_bet = balance * kelly_pct
+                        new_bet = round(max(MIN_BET, min(MAX_BET, raw_bet)), 1)
+
+                        # Bet smoothing: cap INCREASES to BET_RAMP_FACTOR per cycle
+                        # (decreases are uncapped — protect capital fast)
+                        old_bet = BET_AMOUNT
+                        if new_bet > old_bet * BET_RAMP_FACTOR:
+                            new_bet = round(old_bet * BET_RAMP_FACTOR, 1)
+                            new_bet = max(MIN_BET, min(MAX_BET, new_bet))
+
+                        BET_AMOUNT = new_bet
+                        conf = kelly.get('confidence', 1.0)
+                        log(f"  🔧 AUTO-TUNE: BET_AMOUNT ${old_bet:.1f} → ${BET_AMOUNT:.1f} "
+                            f"(Kelly={kelly['kelly_full']:.1%} × {KELLY_FRACTION} × conf={conf:.2f} "
+                            f"= {kelly_pct:.1%} of ${balance:.0f})"
+                            f"{' [ramped]' if new_bet < raw_bet else ''}")
                 else:
                     log(f"  🔧 BET_AMOUNT=${BET_AMOUNT:.1f} (Kelly={kelly['kelly_full']:.1%}, balance unknown)")
             else:
