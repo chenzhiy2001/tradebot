@@ -320,40 +320,27 @@ class BayesianEngine:
     @staticmethod
     def _sig_tradeable(s, threshold):
         """Check if signal would trigger a trade at given edge threshold."""
-        if "edge_down" in s:
-            return s["edge_up"] >= threshold or s["edge_down"] >= threshold
-        return abs(s["edge_up"]) >= threshold
+        return s["edge_up"] >= threshold or s["edge_down"] >= threshold
 
     @staticmethod
     def _sig_win(s, threshold):
         """Check if tradeable signal would have been a winning trade."""
-        if "edge_down" in s:
-            return ((s["edge_up"] >= threshold and s["actual_up"] == 1.0) or
-                    (s["edge_down"] >= threshold and s["actual_up"] == 0.0))
         return ((s["edge_up"] >= threshold and s["actual_up"] == 1.0) or
-                (s["edge_up"] <= -threshold and s["actual_up"] == 0.0))
+                (s["edge_down"] >= threshold and s["actual_up"] == 0.0))
 
     @staticmethod
     def _sig_entry_price(s, threshold):
         """Estimate entry price for a tradeable signal."""
-        if "edge_down" in s:
-            if s["edge_up"] >= threshold:
-                return s["implied_up"]
-            if s["edge_down"] >= threshold:
-                return 1.0 - s["implied_up"]
-        else:
-            if s["edge_up"] >= threshold:
-                return s["implied_up"]
-            if s["edge_up"] <= -threshold:
-                return 1.0 - s["implied_up"]
+        if s["edge_up"] >= threshold:
+            return s["implied_up"]
+        if s["edge_down"] >= threshold:
+            return 1.0 - s["implied_up"]
         return 0.55
 
     @staticmethod
     def _sig_best_edge(s):
         """Get the best (highest) edge from a signal."""
-        if "edge_down" in s:
-            return max(s.get("edge_up", 0), s.get("edge_down", 0))
-        return abs(s["edge_up"])
+        return max(s["edge_up"], s["edge_down"])
 
     def reanalyze(self):
         """Full reanalysis of prediction accuracy and edge calibration.
