@@ -101,6 +101,8 @@ MAX_POSITIONS = 8             # Max concurrent positions (windows we're active i
 MIN_TRADES_FOR_FULL_KELLY = 50  # Need this many trades before Kelly confidence = 100%
 MAX_EXPOSURE_PCT = 0.50       # Never more than 50% of balance deployed in open positions
 BET_RAMP_FACTOR = 1.5         # Max bet size INCREASE per reanalysis cycle (1.5 = +50%)
+MAX_EV_SCALE = 2.0            # Cap EV-proportional bet scaling (prevents $5→$19 blowups)
+MAX_SINGLE_TRADE_PCT = 0.15   # No single trade > 15% of balance (separate from 50% total exposure)
 DRAWDOWN_HALT_PCT = 0.30      # If balance < 30% of session start, lock to MIN_BET
 MIN_EDGE = 0.15               # Minimum |edge| to trade (data: 0.15+ = 68% WR, profitable)
 MIN_EDGE_FLOOR = 0.15         # Hard floor — auto-tune can raise MIN_EDGE but NEVER lower below this
@@ -115,9 +117,14 @@ SELL_WAIT_AFTER_END = 600     # Seconds to wait after window ends for WRONG-dire
 SELL_WAIT_CORRECT = 7200      # Seconds to wait for CORRECT-direction sells (keep order live up to 2h)
 REANALYSIS_INTERVAL = 300     # Reanalyze every 5 minutes (not per-window)
 
+# Regime detection — penalize contrarian trades in strongly-biased markets
+REGIME_LOOKBACK = 20          # Windows to look back for regime detection
+REGIME_BIAS_THRESHOLD = 0.75  # If >75% of recent windows are same direction → regime
+REGIME_EXTRA_EDGE = 0.10      # Extra edge required for contrarian trades in regime
+
 # Bayesian model
-DEFAULT_VOL_PER_SEC = 7.0e-5  # Default σ per √second (~0.121%/5min) — calibrated from 6 sessions
-                              # (observed range: 0.000060-0.000080, 7e-5 is conservative median)
+DEFAULT_VOL_PER_SEC = 1.0e-4  # Default σ per √second (~0.173%/5min) — conservative cold-start default
+                              # (observed 3-8e-5 after calibration; high default avoids overconfident early trades)
 MIN_WINDOWS_FOR_VOL = 5       # Use empirical vol after just 5 windows (~25min) to escape cold start faster
 DATA_LOOKBACK_SECS = 7200     # Use data from the last 2 hours for both σ and signal reanalysis
                               # (vol regimes and market microstructure both shift hourly)
@@ -1131,6 +1138,36 @@ class Sniper:
 
         self.poly.subscribe(all_tokens)
 
+    def _get_regime(self):
+        """Detect market regime from recent completed windows.
+
+        Returns (bias_direction, bias_pct):
+          bias_direction: "UP" or "DOWN" (whichever dominates)
+          bias_pct: fraction in [0.5, 1.0] — how biased the market is
+          Returns ("NEUTRAL", 0.5) if insufficient data.
+        """
+        recent_outcomes = []
+        now = datetime.now(timezone.utc)
+        for w in self._windows.values():
+            if w.get("completed") and w.get("outcome"):
+                # Only consider recent windows
+                ended = w.get("window_ended_at")
+                if ended and (now - ended).total_seconds() < DATA_LOOKBACK_SECS:
+                    recent_outcomes.append(w["outcome"])
+
+        # Also respect REGIME_LOOKBACK: only last N
+        recent_outcomes = recent_outcomes[-REGIME_LOOKBACK:]
+
+        if len(recent_outcomes) < 8:
+            return ("NEUTRAL", 0.5)
+
+        up_count = sum(1 for o in recent_outcomes if o == "UP")
+        down_count = len(recent_outcomes) - up_count
+        if up_count >= down_count:
+            return ("UP", up_count / len(recent_outcomes))
+        else:
+            return ("DOWN", down_count / len(recent_outcomes))
+
     def tick(self):
         """Main tick: compute signals, execute trades, finalize windows."""
         now = datetime.now(timezone.utc)
@@ -1232,9 +1269,20 @@ class Sniper:
 
                     if abs(current_return) >= MIN_RETURN_ABS:
 
+                        # ─── Regime filter ───
+                        # If market is strongly biased, require extra edge for contrarian trades
+                        regime_dir, regime_pct = self._get_regime()
+                        effective_min_edge = MIN_EDGE
+                        if regime_dir != "NEUTRAL" and regime_pct >= REGIME_BIAS_THRESHOLD:
+                            # Check if this trade is contrarian (buying opposite of regime)
+                            is_contrarian_up = (regime_dir == "DOWN" and edge_up is not None and edge_up >= MIN_EDGE)
+                            is_contrarian_down = (regime_dir == "UP" and edge_down is not None and edge_down >= MIN_EDGE)
+                            if is_contrarian_up or is_contrarian_down:
+                                effective_min_edge = MIN_EDGE + REGIME_EXTRA_EDGE
+
                         # Determine which side to buy (prefer higher edge)
-                        buy_up = edge_up is not None and edge_up >= MIN_EDGE
-                        buy_down = edge_down is not None and edge_down >= MIN_EDGE
+                        buy_up = edge_up is not None and edge_up >= effective_min_edge
+                        buy_down = edge_down is not None and edge_down >= effective_min_edge
                         if buy_up and buy_down:
                             # Both sides have edge — pick higher
                             if edge_down > edge_up:
@@ -1275,14 +1323,19 @@ class Sniper:
                             continue  # Need at least 5% expected return per dollar risked
 
                         # ─── Per-trade EV-proportional sizing ───
-                        # Higher EV → bigger bet (scale from 5% baseline)
-                        ev_scale = ev_per_dollar / 0.05  # 1.0 at 5% EV, 2.0 at 10% EV, etc.
+                        # Higher EV → bigger bet (scale from 5% baseline), capped at MAX_EV_SCALE
+                        ev_scale = min(MAX_EV_SCALE, ev_per_dollar / 0.05)  # capped: prevents $5→$19 on small balance
                         trade_bet = round(max(MIN_BET, min(MAX_BET, BET_AMOUNT * ev_scale)), 1)
 
                         # Balance check
                         balance = get_usdc_balance()
                         if balance is None or balance < trade_bet + 2:
                             continue
+
+                        # Single-trade cap: never risk more than MAX_SINGLE_TRADE_PCT of balance
+                        max_single = round(balance * MAX_SINGLE_TRADE_PCT, 1)
+                        if trade_bet > max_single:
+                            trade_bet = max(MIN_BET, max_single)
 
                         # Count active positions & total exposure
                         # Exclude awaiting_resolution — those are won, just waiting for settlement
@@ -1302,10 +1355,13 @@ class Sniper:
                             continue  # Skip — would exceed exposure limit
 
                         # ─── EXECUTE TRADE ───
+                        regime_tag = ""
+                        if regime_dir != "NEUTRAL" and regime_pct >= REGIME_BIAS_THRESHOLD:
+                            regime_tag = f" | regime={regime_dir}@{regime_pct:.0%}"
                         log(f"  🎯 SIGNAL {key}: {buy_side} | P(UP)={p_up:.3f} impl={implied_up:.3f} "
                             f"edge={edge:.3f} EV={ev_per_dollar:.1%} | ret={current_return*100:+.3f}% | {remaining:.0f}s left "
                             f"| price={'CL' if cl_price is not None else 'BN'}"
-                            f" | bet=${trade_bet:.0f} ({ev_scale:.1f}×)")
+                            f" | bet=${trade_bet:.0f} ({ev_scale:.1f}×){regime_tag}")
 
                         success = self._execute_buy(
                             w, token_id, buy_side, buy_price, edge, our_prob, current_return,
