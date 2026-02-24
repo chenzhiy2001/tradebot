@@ -111,7 +111,8 @@ FILL_WAIT = 5                 # Seconds to wait for GTC limit buy fill
 EXIT_PRICE = 0.99             # GTC sell price — fills when winning token → $1.00
 MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 SELL_RETRY_INTERVAL = 10      # Seconds between sell placement retries if first attempt fails
-SELL_WAIT_AFTER_END = 600     # Seconds to wait after window ends for sell to fill (resolution ~2-3min, buffer for delays)
+SELL_WAIT_AFTER_END = 600     # Seconds to wait after window ends for WRONG-direction sells (cancel fast)
+SELL_WAIT_CORRECT = 7200      # Seconds to wait for CORRECT-direction sells (keep order live up to 2h)
 REANALYSIS_INTERVAL = 300     # Reanalyze every 5 minutes (not per-window)
 
 # Bayesian model
@@ -965,6 +966,7 @@ class Sniper:
         self._session_won = 0.0   # Total USDC from winning trades
         self._trade_count = 0
         self._win_count = 0
+        self._pending_claims = 0   # Wins where sell didn't fill (separate from realized)
         self._start_balance = get_usdc_balance()
         self._last_report = None
         self._last_reanalysis = 0  # epoch time of last reanalysis
@@ -1176,10 +1178,11 @@ class Sniper:
                             continue
 
                         # Count active positions & total exposure
+                        # Exclude awaiting_resolution — those are won, just waiting for settlement
                         active_count = 0
                         open_exposure = 0.0
                         for ww in self._windows.values():
-                            if ww.get("traded") and not ww.get("completed"):
+                            if ww.get("traded") and not ww.get("completed") and not ww.get("awaiting_resolution"):
                                 active_count += 1
                                 ti = ww.get("trade_info")
                                 if ti:
@@ -1242,8 +1245,37 @@ class Sniper:
                         w["completed"] = True
                         to_remove.append(key)
                     else:
-                        # Traded but sell not yet filled — keep alive for resolution
-                        log(f"  ⏳ {key}: window ended ({outcome}) — waiting for sell to fill at resolution")
+                        # Traded but sell not yet filled — check direction
+                        ti = w["trade_info"]
+                        direction_correct = (ti["side"] == outcome) if outcome in ("UP", "DOWN") else False
+
+                        if direction_correct:
+                            # Direction correct — keep sell order live, wait for resolution
+                            w["awaiting_resolution"] = True
+                            log(f"  ⏳ {key}: window ended ({outcome}) — direction correct, keeping sell order live")
+                        else:
+                            # Direction WRONG — cancel sell immediately, count as loss
+                            if w.get("sell_placed") and w.get("sell_order_id"):
+                                try:
+                                    client.cancel(w["sell_order_id"])
+                                except Exception:
+                                    pass
+
+                            pnl = -ti["cost"]
+                            ti["exit_type"] = "resolution"
+                            ti["outcome"] = outcome
+                            ti["won"] = False
+                            ti["pnl"] = round(pnl, 4)
+
+                            self._trade_count += 1
+                            self._session_cost += ti["cost"]
+
+                            log(f"  ❌ {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
+                                f"| LOST ${abs(pnl):.2f} (wrong direction) | "
+                                f"session {self._win_count}/{self._trade_count} wins")
+                            self._save_window(w, outcome, ret)
+                            w["completed"] = True
+                            to_remove.append(key)
                 else:
                     log(f"  ⚠ {key}: ended but missing price data")
                     w["completed"] = True
@@ -1267,58 +1299,42 @@ class Sniper:
                 w["completed"] = True
                 to_remove.append(key)
 
-            # ─── Post-window timeout: sell didn't fill → loss ───
-            if (w["window_ended"] and w["traded"]
-                    and not w["completed"] and not w.get("sell_filled")
+            # ─── Post-window: direction-correct sell still waiting for fill ───
+            # Keep sell order live much longer for correct-direction trades.
+            # The sell at $0.99 will fill when Polymarket resolves the market.
+            if (w.get("awaiting_resolution") and not w.get("sell_filled")
+                    and not w["completed"]
                     and w.get("window_ended_at")
-                    and time.time() - w["window_ended_at"] > SELL_WAIT_AFTER_END):
+                    and time.time() - w["window_ended_at"] > SELL_WAIT_CORRECT):
                 ti = w["trade_info"]
                 outcome = w.get("_outcome", "?")
                 ret = w.get("_return", 0)
                 ti["outcome"] = outcome
 
-                # Cancel the sell order
+                # Very long timeout — cancel sell and mark as pending claim
                 if w.get("sell_placed") and w.get("sell_order_id"):
                     try:
                         client.cancel(w["sell_order_id"])
-                        log(f"  🚫 Cancelled unfilled sell for {key} (timeout {SELL_WAIT_AFTER_END}s)")
+                        log(f"  🚫 Cancelled unfilled sell for {key} (timeout {SELL_WAIT_CORRECT}s)")
                     except Exception:
                         pass
 
-                # Check if our direction was actually correct
-                direction_correct = (ti["side"] == outcome) if outcome in ("UP", "DOWN") else False
+                # Direction was correct but sell never filled — mark as pending claim
+                pnl_est = ti["shares"] * EXIT_PRICE - ti["cost"]
+                ti["exit_type"] = "pending_claim"
+                ti["won"] = True
+                ti["pnl"] = round(pnl_est, 4)
 
-                if direction_correct:
-                    # Direction correct but sell didn't fill at $0.99 — shares are
-                    # still in wallet and redeemable via claimer.py at $1.00/share.
-                    # Don't count as loss — mark as pending claim.
-                    pnl_est = ti["shares"] * EXIT_PRICE - ti["cost"]  # estimated profit after claim
-                    ti["exit_type"] = "pending_claim"
-                    ti["won"] = True
-                    ti["pnl"] = round(pnl_est, 4)
+                self._trade_count += 1
+                self._win_count += 1
+                self._pending_claims += 1
+                self._session_won += ti["shares"] * EXIT_PRICE
+                self._session_cost += ti["cost"]
 
-                    self._trade_count += 1
-                    self._win_count += 1
-                    self._session_won += ti["shares"] * EXIT_PRICE
-                    self._session_cost += ti["cost"]
-
-                    log(f"  ⏳ {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
-                        f"| direction CORRECT, sell didn't fill → pending claim "
-                        f"({ti['shares']:.1f}sh × $1.00 ≈ ${pnl_est:+.2f}) | "
-                        f"session {self._win_count}/{self._trade_count} wins")
-                else:
-                    # Direction wrong — genuine loss
-                    pnl = -ti["cost"]
-                    ti["exit_type"] = "resolution"
-                    ti["won"] = False
-                    ti["pnl"] = round(pnl, 4)
-
-                    self._trade_count += 1
-                    self._session_cost += ti["cost"]
-
-                    log(f"  ❌ {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
-                        f"| LOST ${abs(pnl):.2f} (resolution timeout) | "
-                        f"session {self._win_count}/{self._trade_count} wins")
+                log(f"  ⏳ {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
+                    f"| direction CORRECT, sell didn't fill → pending claim "
+                    f"({ti['shares']:.1f}sh × $1.00 ≈ ${pnl_est:+.2f}) | "
+                    f"session {self._win_count}/{self._trade_count} wins")
                 self._save_window(w, outcome, ret)
                 w["completed"] = True
                 to_remove.append(key)
@@ -1950,7 +1966,7 @@ def main():
             bal = get_usdc_balance()
             if bal and sniper._start_balance:
                 log(f"Final balance: ${bal:.2f} (Δ{bal - sniper._start_balance:+.2f})")
-            log(f"Trades: {sniper._trade_count} | Wins: {sniper._win_count}")
+            log(f"Trades: {sniper._trade_count} | Wins: {sniper._win_count} ({sniper._win_count - sniper._pending_claims} realized, {sniper._pending_claims} pending)")
             break
         except Exception as e:
             log(f"⚠ Main loop error: {e}")
