@@ -50,7 +50,7 @@ import threading
 import re
 import requests
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     OrderArgs, OrderType, OpenOrderParams,
@@ -529,7 +529,8 @@ class BayesianEngine:
         """
         if seconds_remaining <= 0:
             # Window is over — return is final
-            return 1.0 if current_return > 0 else 0.0
+            # Polymarket resolves UP when close >= open (equal counts as UP)
+            return 1.0 if current_return >= 0 else 0.0
 
         with self._lock:
             vol = self._vol_per_sec
@@ -578,12 +579,18 @@ class BayesianEngine:
 # =========================================================================
 # CHAINLINK PRICE FEED (via Polymarket RTDS — matches resolution source)
 # =========================================================================
+PRICE_BUFFER_SECONDS = 900  # Keep 15 min of price history (covers any window)
+
 class ChainlinkFeed:
     """Real-time Chainlink prices from Polymarket RTDS WebSocket.
-    This is the SAME data source Polymarket uses to resolve crypto markets."""
+    This is the SAME data source Polymarket uses to resolve crypto markets.
+    
+    Keeps a rolling buffer of all prices so we can look up the EXACT price
+    at any timestamp — critical for matching Polymarket's resolution."""
 
     def __init__(self):
-        self._prices = {}  # symbol -> {price, ts}
+        self._prices = {}  # symbol -> {price, ts}  (latest)
+        self._buffers = {}  # symbol -> deque of (unix_ts_secs, price)
         self._lock = threading.Lock()
         self._connected = False
 
@@ -649,11 +656,22 @@ class ChainlinkFeed:
                             value = payload.get("value")
                             ts = payload.get("timestamp")  # unix ms
                             if symbol and value is not None:
+                                price_val = float(value)
+                                ts_secs = (ts / 1000.0) if ts else time.time()
                                 with self._lock:
                                     self._prices[symbol] = {
-                                        "price": float(value),
-                                        "ts": (ts / 1000.0) if ts else time.time(),
+                                        "price": price_val,
+                                        "ts": ts_secs,
                                     }
+                                    # Add to rolling buffer
+                                    if symbol not in self._buffers:
+                                        self._buffers[symbol] = deque()
+                                    buf = self._buffers[symbol]
+                                    buf.append((ts_secs, price_val))
+                                    # Trim old entries
+                                    cutoff = time.time() - PRICE_BUFFER_SECONDS
+                                    while buf and buf[0][0] < cutoff:
+                                        buf.popleft()
 
             except Exception as e:
                 self._connected = False
@@ -670,6 +688,42 @@ class ChainlinkFeed:
         if not data:
             return None, None
         return data["price"], time.time() - data["ts"]
+
+    def get_price_at(self, crypto, target_ts):
+        """Get the Chainlink price closest to target_ts (unix seconds).
+        
+        Uses the price with timestamp <= target_ts (last known price at that moment),
+        falling back to nearest price if no price exists before target.
+        Returns (price, delta_secs) or (None, None).
+        delta_secs = how far the matched price timestamp is from target_ts."""
+        symbol = CHAINLINK_SYMBOLS.get(crypto.lower())
+        if not symbol:
+            return None, None
+        with self._lock:
+            buf = self._buffers.get(symbol)
+            if not buf or len(buf) == 0:
+                return None, None
+            
+            # Binary search for the last entry with ts <= target_ts
+            # (the price that was current at the target moment)
+            lo, hi = 0, len(buf) - 1
+            best_idx = None
+            
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if buf[mid][0] <= target_ts:
+                    best_idx = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            
+            if best_idx is not None:
+                ts, price = buf[best_idx]
+                return price, abs(target_ts - ts)
+            
+            # No price before target — use the earliest available
+            ts, price = buf[0]
+            return price, abs(target_ts - ts)
 
     @property
     def connected(self):
@@ -765,6 +819,7 @@ class PolymarketFeed:
         self._active = set()
         self._connected = False
         self._force_reconnect = False
+        self._resolutions = {}  # asset_id -> {"winning_outcome": str, "winning_asset_id": str, "ts": float}
 
     def start(self):
         t = threading.Thread(target=self._run, daemon=True)
@@ -857,6 +912,8 @@ class PolymarketFeed:
             self._on_book(data)
         elif etype == "price_change":
             self._on_price_change(data)
+        elif etype == "market_resolved":
+            self._on_market_resolved(data)
 
     def _on_bba(self, data):
         asset_id = data.get("asset_id", "")
@@ -899,6 +956,34 @@ class PolymarketFeed:
                         "best_ask": best_ask if best_ask > 0 else existing.get("best_ask", 0),
                         "ts": time.time(),
                     }
+
+    def _on_market_resolved(self, data):
+        """Handle market_resolved events — ground truth from Polymarket."""
+        winning_outcome = data.get("winning_outcome", "")
+        winning_asset = data.get("winning_asset_id", "")
+        slug = data.get("slug", "")
+        assets = data.get("assets_ids", [])
+        
+        log(f"  🏁 MARKET RESOLVED: {slug} → {winning_outcome} "
+            f"(winning_asset={winning_asset[:20]}...)")
+        
+        with self._lock:
+            for aid in assets:
+                self._resolutions[aid] = {
+                    "winning_outcome": winning_outcome,
+                    "winning_asset_id": winning_asset,
+                    "slug": slug,
+                    "ts": time.time(),
+                }
+
+    def get_resolution(self, token_id):
+        """Check if this token's market has been resolved.
+        Returns (winning_outcome, winning_asset_id) or (None, None)."""
+        with self._lock:
+            res = self._resolutions.get(token_id)
+        if not res:
+            return None, None
+        return res["winning_outcome"], res["winning_asset_id"]
 
     def subscribe(self, token_ids):
         with self._lock:
@@ -1068,12 +1153,24 @@ class Sniper:
             bn_price, bn_age = self.binance.get_price(crypto)
             price = cl_price if cl_price is not None else bn_price
 
-            # Record open price at window start
-            if w["open_price"] is None and price is not None:
-                if pct <= 0.05:
+            # Record open price from Chainlink buffer at the EXACT window start time.
+            # Polymarket resolves using "the price at the beginning of that range"
+            # which means the Chainlink data stream value at the epoch timestamp.
+            if w["open_price"] is None:
+                start_ts = w["start_utc"].timestamp()
+                buf_price, delta = self.chainlink.get_price_at(crypto, start_ts)
+                if buf_price is not None and delta <= 5.0:
+                    # Have a Chainlink price within 5s of the exact start — use it
+                    w["open_price"] = buf_price
+                    w["_open_price_delta"] = round(delta, 2)
+                elif price is not None and pct <= 0.05:
+                    # Fallback: use live price if within first 5% of window
                     w["open_price"] = price
-                elif pct <= 0.15:
-                    w["open_price"] = price  # Late join, best we can do
+                    w["_open_price_delta"] = round(elapsed, 1)
+                elif price is not None and pct <= 0.15:
+                    # Late join fallback
+                    w["open_price"] = price
+                    w["_open_price_delta"] = round(elapsed, 1)
 
             # ─── Check exit sell fills / retry placement ───
             # Keep checking even after window ends — sell fills at resolution
@@ -1163,14 +1260,24 @@ class Sniper:
                         if buy_price is None or buy_price <= 0:
                             continue
 
-                        # Price range check
+                        # Price floor check (very cheap tokens = noisy 50/50, fees eat edge)
                         if buy_price < ENTRY_PRICE_MIN:
                             continue
 
-                        # ─── Per-trade edge-proportional sizing ───
-                        # Higher edge → bigger bet (linear scale from MIN_EDGE)
-                        edge_scale = edge / MIN_EDGE  # 1.0 at MIN_EDGE, 2.0 at 2×MIN_EDGE, etc.
-                        trade_bet = round(max(MIN_BET, min(MAX_BET, BET_AMOUNT * edge_scale)), 1)
+                        # ─── Expected Value gate ───
+                        # EV per $ = prob * (payout ratio) - (1 - prob)
+                        # payout_ratio = (EXIT_PRICE - buy_price) / buy_price
+                        # e.g. buy@0.60, prob=0.75: EV = 0.75*(0.39/0.60) - 0.25 = 0.2375 (23.8% per $)
+                        # e.g. buy@0.80, prob=0.85: EV = 0.85*(0.19/0.80) - 0.15 = 0.0519 (5.2% per $)
+                        payout_ratio = (EXIT_PRICE - buy_price) / buy_price
+                        ev_per_dollar = our_prob * payout_ratio - (1.0 - our_prob)
+                        if ev_per_dollar < 0.05:
+                            continue  # Need at least 5% expected return per dollar risked
+
+                        # ─── Per-trade EV-proportional sizing ───
+                        # Higher EV → bigger bet (scale from 5% baseline)
+                        ev_scale = ev_per_dollar / 0.05  # 1.0 at 5% EV, 2.0 at 10% EV, etc.
+                        trade_bet = round(max(MIN_BET, min(MAX_BET, BET_AMOUNT * ev_scale)), 1)
 
                         # Balance check
                         balance = get_usdc_balance()
@@ -1196,9 +1303,9 @@ class Sniper:
 
                         # ─── EXECUTE TRADE ───
                         log(f"  🎯 SIGNAL {key}: {buy_side} | P(UP)={p_up:.3f} impl={implied_up:.3f} "
-                            f"edge={edge:.3f} | ret={current_return*100:+.3f}% | {remaining:.0f}s left "
+                            f"edge={edge:.3f} EV={ev_per_dollar:.1%} | ret={current_return*100:+.3f}% | {remaining:.0f}s left "
                             f"| price={'CL' if cl_price is not None else 'BN'}"
-                            f" | bet=${trade_bet:.0f} ({edge_scale:.1f}×)")
+                            f" | bet=${trade_bet:.0f} ({ev_scale:.1f}×)")
 
                         success = self._execute_buy(
                             w, token_id, buy_side, buy_price, edge, our_prob, current_return,
@@ -1209,14 +1316,36 @@ class Sniper:
 
             # ─── Window ended: record data once ───
             if now >= end and not w["window_ended"]:
-                if price is not None:
+                # Record close price from Chainlink buffer at EXACT window end time.
+                # Polymarket resolves using "the price at the end of the time range"
+                end_ts = w["end_utc"].timestamp()
+                buf_close, close_delta = self.chainlink.get_price_at(crypto, end_ts)
+                if buf_close is not None and close_delta <= 5.0:
+                    w["close_price"] = buf_close
+                    w["_close_price_delta"] = round(close_delta, 2)
+                elif price is not None:
+                    # Fallback: use current price
                     w["close_price"] = price
+                    w["_close_price_delta"] = round((now - end).total_seconds(), 2)
 
                 if w["open_price"] and w["close_price"]:
-                    outcome = "UP" if w["close_price"] > w["open_price"] else "DOWN"
+                    # Polymarket resolves UP when close >= open (NOT strictly >)
+                    outcome = "UP" if w["close_price"] >= w["open_price"] else "DOWN"
                     ret = (w["close_price"] - w["open_price"]) / w["open_price"]
                     w["_outcome"] = outcome
                     w["_return"] = ret
+
+                    # Cross-verify with Polymarket resolution (if available already)
+                    pm_outcome, pm_winner = self.poly.get_resolution(w["up_token"])
+                    if pm_outcome is not None:
+                        # Map Polymarket's "Up"/"Down" to our "UP"/"DOWN"
+                        pm_mapped = pm_outcome.upper()
+                        if pm_mapped != outcome:
+                            log(f"  ⚠️ RESOLUTION MISMATCH {key}: computed={outcome} "
+                                f"but Polymarket={pm_mapped} — USING POLYMARKET'S OUTCOME")
+                            outcome = pm_mapped
+                            w["_outcome"] = outcome
+                            w["_resolution_mismatch"] = True
 
                     # Vol data (σ) — pure price, always safe at window end
                     self.engine.add_completed_window(ret, duration)
@@ -1229,7 +1358,10 @@ class Sniper:
 
                     if not w["traded"]:
                         # No trade — finalize immediately
-                        log(f"  📊 {key}: {outcome} (no trade) | ret={ret*100:+.3f}%")
+                        open_d = w.get("_open_price_delta", "?")
+                        close_d = w.get("_close_price_delta", "?")
+                        log(f"  📊 {key}: {outcome} (no trade) | ret={ret*100:+.3f}% "
+                            f"| open_Δ={open_d}s close_Δ={close_d}s")
                         self._save_window(w, outcome, ret)
                         w["completed"] = True
                         to_remove.append(key)
@@ -1304,40 +1436,100 @@ class Sniper:
             # The sell at $0.99 will fill when Polymarket resolves the market.
             if (w.get("awaiting_resolution") and not w.get("sell_filled")
                     and not w["completed"]
-                    and w.get("window_ended_at")
-                    and time.time() - w["window_ended_at"] > SELL_WAIT_CORRECT):
-                ti = w["trade_info"]
-                outcome = w.get("_outcome", "?")
-                ret = w.get("_return", 0)
-                ti["outcome"] = outcome
+                    and w.get("window_ended_at")):
 
-                # Very long timeout — cancel sell and mark as pending claim
-                if w.get("sell_placed") and w.get("sell_order_id"):
-                    try:
-                        client.cancel(w["sell_order_id"])
-                        log(f"  🚫 Cancelled unfilled sell for {key} (timeout {SELL_WAIT_CORRECT}s)")
-                    except Exception:
-                        pass
+                # Check if Polymarket has actually resolved this market
+                pm_outcome, pm_winner = self.poly.get_resolution(w["up_token"])
+                time_waiting = time.time() - w["window_ended_at"]
+                
+                if pm_outcome is not None:
+                    # Ground truth available — check if we ACTUALLY won
+                    pm_mapped = pm_outcome.upper()
+                    ti = w["trade_info"]
+                    actually_correct = (ti["side"] == pm_mapped)
+                    outcome = pm_mapped
+                    ret = w.get("_return", 0)
+                    w["_outcome"] = outcome
 
-                # Direction was correct but sell never filled — mark as pending claim
-                pnl_est = ti["shares"] * EXIT_PRICE - ti["cost"]
-                ti["exit_type"] = "pending_claim"
-                ti["won"] = True
-                ti["pnl"] = round(pnl_est, 4)
+                    if actually_correct:
+                        # We really won — mark as pending claim (shares worth $1)
+                        pnl_est = ti["shares"] * EXIT_PRICE - ti["cost"]
+                        ti["exit_type"] = "pending_claim"
+                        ti["outcome"] = outcome
+                        ti["won"] = True
+                        ti["pnl"] = round(pnl_est, 4)
 
-                self._trade_count += 1
-                self._win_count += 1
-                self._pending_claims += 1
-                self._session_won += ti["shares"] * EXIT_PRICE
-                self._session_cost += ti["cost"]
+                        self._trade_count += 1
+                        self._win_count += 1
+                        self._pending_claims += 1
+                        self._session_won += ti["shares"] * EXIT_PRICE
+                        self._session_cost += ti["cost"]
 
-                log(f"  ⏳ {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
-                    f"| direction CORRECT, sell didn't fill → pending claim "
-                    f"({ti['shares']:.1f}sh × $1.00 ≈ ${pnl_est:+.2f}) | "
-                    f"session {self._win_count}/{self._trade_count} wins")
-                self._save_window(w, outcome, ret)
-                w["completed"] = True
-                to_remove.append(key)
+                        log(f"  ✅ {key}: RESOLVED {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
+                            f"| direction CORRECT (confirmed by Polymarket) → pending claim "
+                            f"({ti['shares']:.1f}sh × $1.00 ≈ ${pnl_est:+.2f}) | "
+                            f"session {self._win_count}/{self._trade_count} wins")
+                    else:
+                        # We actually LOST despite thinking we were right
+                        if w.get("sell_placed") and w.get("sell_order_id"):
+                            try:
+                                client.cancel(w["sell_order_id"])
+                            except Exception:
+                                pass
+
+                        pnl = -ti["cost"]
+                        ti["exit_type"] = "resolution"
+                        ti["outcome"] = outcome
+                        ti["won"] = False
+                        ti["pnl"] = round(pnl, 4)
+
+                        self._trade_count += 1
+                        self._session_cost += ti["cost"]
+
+                        log(f"  ❌ {key}: RESOLVED {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
+                            f"| LOST (Polymarket resolved OPPOSITE of our prediction!) "
+                            f"| ${abs(pnl):.2f} lost | "
+                            f"session {self._win_count}/{self._trade_count} wins")
+                        w["_resolution_mismatch"] = True
+
+                    self._save_window(w, outcome, ret)
+                    w["completed"] = True
+                    to_remove.append(key)
+
+                elif time_waiting > SELL_WAIT_CORRECT:
+                    # Timeout — no resolution event received, fall back to our computed outcome
+                    ti = w["trade_info"]
+                    outcome = w.get("_outcome", "?")
+                    ret = w.get("_return", 0)
+                    ti["outcome"] = outcome
+
+                    # Cancel sell and mark as pending claim
+                    if w.get("sell_placed") and w.get("sell_order_id"):
+                        try:
+                            client.cancel(w["sell_order_id"])
+                            log(f"  🚫 Cancelled unfilled sell for {key} (timeout {SELL_WAIT_CORRECT}s)")
+                        except Exception:
+                            pass
+
+                    # Direction was correct per our calculation — mark as pending claim
+                    pnl_est = ti["shares"] * EXIT_PRICE - ti["cost"]
+                    ti["exit_type"] = "pending_claim"
+                    ti["won"] = True
+                    ti["pnl"] = round(pnl_est, 4)
+
+                    self._trade_count += 1
+                    self._win_count += 1
+                    self._pending_claims += 1
+                    self._session_won += ti["shares"] * EXIT_PRICE
+                    self._session_cost += ti["cost"]
+
+                    log(f"  ⏳ {key}: {outcome} | trade={ti['side']} @ {ti['entry_price']:.2f} "
+                        f"| direction correct (no Polymarket confirmation), sell didn't fill → pending claim "
+                        f"({ti['shares']:.1f}sh × $1.00 ≈ ${pnl_est:+.2f}) | "
+                        f"session {self._win_count}/{self._trade_count} wins")
+                    self._save_window(w, outcome, ret)
+                    w["completed"] = True
+                    to_remove.append(key)
 
         # Periodic reanalysis — run every REANALYSIS_INTERVAL seconds
         # instead of per-window, so we see a complete batch of signal data
