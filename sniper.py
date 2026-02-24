@@ -1062,6 +1062,7 @@ class Sniper:
         self._start_balance = get_usdc_balance()
         self._last_report = None
         self._last_reanalysis = 0  # epoch time of last reanalysis
+        self._kelly_pause = False  # True when Kelly says 0 → stop trading
 
         # Scale initial BET_AMOUNT to balance — don't risk 36% on one trade
         global BET_AMOUNT
@@ -1222,10 +1223,50 @@ class Sniper:
                         if time.time() - w.get("_last_sell_attempt", 0) >= SELL_RETRY_INTERVAL:
                             self._place_exit_sell(w)
 
+            # ─── Detect leaked fills from "cancelled" buy orders ───
+            # If buy was attempted but not considered filled, check if shares
+            # arrived anyway (cancel can fail silently, leaving order live).
+            if (w.get("_buy_attempted") and not w["traded"]
+                    and not w["completed"]):
+                # Determine which token was being bought
+                buy_token = w.get("_buy_token_id")
+                if buy_token:
+                    leaked = get_share_balance(buy_token)
+                    if leaked is not None and leaked >= MIN_ORDER_SIZE:
+                        buy_price = w.get("_buy_price", 0.50)
+                        fee = compute_taker_fee(leaked, buy_price)
+                        actual_cost = round(leaked * buy_price + fee, 4)
+                        buy_side = w.get("_buy_side", "?")
+                        our_prob = w.get("_buy_prob", 0.5)
+                        edge = w.get("_buy_edge", 0)
+                        ret_at_entry = w.get("_buy_return", 0)
+
+                        log(f"  ⚠ LEAKED FILL {key}: {leaked:.1f}sh of {buy_side} detected (cancel failed) — adopting position")
+                        w["trade_info"] = {
+                            "side": buy_side,
+                            "token_id": buy_token,
+                            "entry_price": buy_price,
+                            "shares": leaked,
+                            "cost": actual_cost,
+                            "edge": edge,
+                            "our_prob": our_prob,
+                            "return_at_entry": ret_at_entry,
+                            "dry_run": False,
+                            "exit_type": None,
+                            "outcome": None,
+                            "won": None,
+                            "pnl": None,
+                        }
+                        w["traded"] = True
+                        self._trade_count += 1
+                        self._session_cost += actual_cost
+                        self._place_exit_sell(w)
+
             # ─── Compute Bayesian signal ───
             if (w["open_price"] is not None
                     and price is not None
                     and not w["traded"]
+                    and not w.get("_buy_attempted")  # prevent double-buy if cancel failed
                     and not w["completed"]):
 
                 current_return = (price - w["open_price"]) / w["open_price"]
@@ -1265,6 +1306,10 @@ class Sniper:
 
                     # Skip if Polymarket prices are stale (>10s old)
                     if poly_age is not None and poly_age > 10:
+                        continue
+
+                    # Kelly pause: if Kelly says edge isn't profitable, don't trade
+                    if self._kelly_pause:
                         continue
 
                     if abs(current_return) >= MIN_RETURN_ABS:
@@ -1655,6 +1700,15 @@ class Sniper:
 
             log(f"  📝 Order placed (id: {order_id[:8] if order_id else '?'})")
 
+            # Mark buy attempted — prevents double-buy if cancel fails
+            w["_buy_attempted"] = True
+            w["_buy_token_id"] = token_id
+            w["_buy_price"] = buy_price
+            w["_buy_side"] = side
+            w["_buy_prob"] = our_prob
+            w["_buy_edge"] = edge
+            w["_buy_return"] = current_return
+
             # Wait for fill
             time.sleep(FILL_WAIT)
 
@@ -1669,7 +1723,9 @@ class Sniper:
                 pass
 
             if actual is not None and actual >= MIN_ORDER_SIZE:
-                # Compute cost analytically (balance diff is unreliable with concurrent positions)
+                # Compute cost analytically — use actual fill shares, not est_shares
+                # NOTE: if a previous "cancelled" order also filled, actual may include
+                # shares from both orders. The cost calc uses buy_price from THIS order.
                 fee = compute_taker_fee(actual, buy_price)
                 actual_cost = round(actual * buy_price + fee, 4)
 
@@ -1698,7 +1754,8 @@ class Sniper:
                 log(f"  ⚠ Partial fill {actual:.1f}sh < {MIN_ORDER_SIZE} min — cannot trade, skipping")
                 return False
             else:
-                # Not filled at all
+                # Not filled at all — but keep _buy_attempted=True
+                # because the cancel may have failed and order could fill later
                 log(f"  ⏳ Not filled after {FILL_WAIT}s — cancelled")
                 return False
 
@@ -1883,6 +1940,10 @@ class Sniper:
         if kelly and AUTO_TUNE_EDGE:
             kelly_pct = kelly["kelly_bet_pct"]
             if kelly_pct > 0:
+                was_paused = self._kelly_pause
+                self._kelly_pause = False  # Kelly positive → resume trading
+                if was_paused:
+                    log(f"  ✅ Kelly positive — RESUMING trades")
                 balance = get_usdc_balance()
                 if balance and balance > 0:
                     # Use session starting balance for drawdown detection
@@ -1915,7 +1976,8 @@ class Sniper:
                 else:
                     log(f"  🔧 BET_AMOUNT=${BET_AMOUNT:.1f} (Kelly={kelly['kelly_full']:.1%}, balance unknown)")
             else:
-                log(f"  🔧 BET_AMOUNT=${BET_AMOUNT:.1f} (Kelly=0 — edge not profitable enough to bet)")
+                self._kelly_pause = True
+                log(f"  🔧 BET_AMOUNT=${BET_AMOUNT:.1f} (Kelly=0 — PAUSING new trades)")
         else:
             log(f"  🔧 BET_AMOUNT=${BET_AMOUNT:.1f} (not enough data for Kelly)")
 
