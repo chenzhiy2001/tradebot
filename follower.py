@@ -131,6 +131,43 @@ def get_usdc_balance():
         return None
 
 
+def get_share_balance(token_id):
+    """Get on-chain share balance for a conditional token."""
+    try:
+        client.update_balance_allowance(
+            params=BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=1,
+            )
+        )
+        ba = client.get_balance_allowance(
+            params=BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=1,
+            )
+        )
+        return float(ba.get("balance", 0)) / 1e6
+    except Exception:
+        return None
+
+
+def wait_for_settlement(token_id, expected_shares, timeout=30):
+    """Poll until on-chain balance shows shares, or timeout.
+    Returns (settled: bool, balance: float)."""
+    deadline = time.time() + timeout
+    last_balance = 0
+    while time.time() < deadline:
+        bal = get_share_balance(token_id)
+        if bal is not None:
+            last_balance = bal
+            if bal >= expected_shares * 0.9:  # allow small rounding
+                return True, bal
+        time.sleep(2)
+    return False, last_balance
+
+
 def compute_taker_fee(shares, price):
     if price <= 0 or price >= 1:
         return 0.0
@@ -201,17 +238,14 @@ class SellWorker:
             return
 
         try:
-            # Ensure conditional token allowance is set
-            try:
-                client.update_balance_allowance(
-                    params=BalanceAllowanceParams(
-                        asset_type=AssetType.CONDITIONAL,
-                        token_id=token_id,
-                        signature_type=1,
-                    )
-                )
-            except Exception:
-                pass
+            # Refresh on-chain balance/allowance before selling
+            bal = get_share_balance(token_id)
+            if bal is not None and bal < 1.0:
+                log(f"  🔄✅ Background sell: shares already gone "
+                    f"({side}, balance={bal:.1f})")
+                with self._lock:
+                    self._active_count -= 1
+                return
 
             bid, _, _ = self.poly.get_price(token_id)
             price = round(bid, 2) if bid and bid > 0 else 0.01
@@ -715,17 +749,17 @@ class Follower:
             log(f"  ✅ FOK filled! {actual_shares:.1f}sh @ ~{fill_price:.3f} "
                 f"(spent ${actual_cost:.2f})")
 
-            # Set conditional token allowance so we can sell later
-            try:
-                client.update_balance_allowance(
-                    params=BalanceAllowanceParams(
-                        asset_type=AssetType.CONDITIONAL,
-                        token_id=token_id,
-                        signature_type=1,
-                    )
-                )
-            except Exception as ae:
-                log(f"  ⚠ Allowance update warning: {ae}")
+            # Wait for on-chain settlement (Polygon block confirmation)
+            log(f"  ⏳ Waiting for on-chain settlement...")
+            settled, on_chain_shares = wait_for_settlement(
+                token_id, actual_shares, timeout=30
+            )
+            if settled:
+                log(f"  ✅ Settled: {on_chain_shares:.1f}sh on-chain")
+                actual_shares = on_chain_shares  # use confirmed amount
+            else:
+                log(f"  ⚠ Settlement timeout ({on_chain_shares:.1f}sh on-chain) "
+                    f"— proceeding anyway")
 
             eth_mid_now = self.poly.mid_price(token_id) or fill_price
             btc_current = self.detector.get_current(side)
@@ -833,18 +867,6 @@ class Follower:
             self._position = None
             self._cooldowns[side] = time.time()
             return
-
-        # Ensure conditional token allowance is set before selling
-        try:
-            client.update_balance_allowance(
-                params=BalanceAllowanceParams(
-                    asset_type=AssetType.CONDITIONAL,
-                    token_id=token_id,
-                    signature_type=1,
-                )
-            )
-        except Exception as ae:
-            log(f"  ⚠ Sell allowance update warning: {ae}")
 
         # Use FOK market sell — amount = shares to sell
         sell_amount = shares
