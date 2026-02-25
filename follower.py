@@ -36,7 +36,7 @@ from datetime import datetime, timezone, timedelta
 from collections import deque
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
-    OrderArgs, OrderType, OpenOrderParams,
+    MarketOrderArgs, OrderType,
     BalanceAllowanceParams, AssetType,
 )
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -62,34 +62,23 @@ BET_AMOUNT = 10               # USDC per trade
 MIN_BET = 5                   # Polymarket minimum
 MAX_BET = 30                  # Cap per trade
 MAX_EXPOSURE_PCT = 0.30       # Max 30% of balance at risk
-FILL_WAIT = 3                 # Seconds to wait for buy fill
 MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 
 # Spike detection — BTC token price must rise this much this fast
 SPIKE_THRESHOLD = 0.10        # BTC token mid-price jump ≥ 10¢
-SPIKE_WINDOW = 5              # … within 5 seconds (was 2s - too tight)
-SPIKE_COOLDOWN = 0           # Don't re-enter same side for 60s (was 30s)
-MAX_SPIKES_PER_WINDOW = 1000     # Max spike entries per 5m window (prevent churn)
-
-# Entry quality — verify BTC is still spiking after fill
-POST_FILL_BTC_CHECK = True    # After fill, verify BTC still above spike threshold
-BUY_PRICE_OFFSET = 0.01       # Buy at mid + 1¢ instead of ask (better entry)
+SPIKE_WINDOW = 5              # … within 5 seconds
+SPIKE_COOLDOWN = 0            # Cooldown between same-side trades (0 = no limit)
+MAX_SPIKES_PER_WINDOW = 1000  # Max spike entries per 5m window
 
 # Exit conditions
 EXIT_REVERT = 0.10            # Sell ETH when BTC token drops 10¢ from its peak post-entry
 STOP_LOSS = 0.04              # Sell ETH if its price drops 4¢ from entry MID (not ask)
-TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢ from entry (essentially any gain)
+TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢
 MAX_HOLD_SECS = 120           # Hard time stop: sell after 2 minutes regardless
-ENTRY_GRACE_SECS = 5          # Don't check stop-loss for first 5s (let position settle)
-SELL_RETRY_ATTEMPTS = 3       # Number of sell retry attempts with decreasing price
-SELL_RETRY_STEP = 0.01        # Price decrease per retry step
-
-# Leaked fill scanning
-LEAK_CHECK_INTERVAL = 5       # Check for leaked fills every 5 seconds
-LEAK_CHECK_COUNT = 3          # Check this many times before clearing a potential leak
+ENTRY_GRACE_SECS = 3          # Don't check stop-loss for first 3s (let position settle)
 
 # Window timing
-MAX_ENTRY_PCT = 0.80          # Only enter in first 80% of window (was 65%)
+MAX_ENTRY_PCT = 0.80          # Only enter in first 80% of window
 INTERVALS = [5]               # Only 5-minute windows (faster signal)
 
 # Polymarket fee formula (5m/15m crypto)
@@ -138,27 +127,6 @@ def get_usdc_balance():
         return float(ba.get("balance", 0)) / 1e6
     except Exception as e:
         log(f"  ⚠ Balance error: {e}")
-        return None
-
-
-def get_share_balance(token_id):
-    try:
-        client.update_balance_allowance(
-            params=BalanceAllowanceParams(
-                asset_type=AssetType.CONDITIONAL,
-                token_id=token_id,
-                signature_type=1,
-            )
-        )
-        ba = client.get_balance_allowance(
-            params=BalanceAllowanceParams(
-                asset_type=AssetType.CONDITIONAL,
-                token_id=token_id,
-                signature_type=1,
-            )
-        )
-        return float(ba.get("balance", 0)) / 1e6
-    except Exception:
         return None
 
 
@@ -488,29 +456,6 @@ class Follower:
         self._total_pnl = 0.0
         self._lock = threading.Lock()
         self._window_trade_count = {}  # epoch -> count of trades in this window
-        # Persistent leaked-fill tracker:
-        # List of {token_id, order_id, cancel_time, checks_done}
-        # We keep scanning these tokens for several seconds after "cancel"
-        self._pending_leak_checks = []
-        self._last_leak_scan = 0
-
-    def _emergency_sell(self, token_id, shares):
-        """Emergency sell leaked shares at bid."""
-        log(f"    Placing emergency sell for {shares:.1f}sh of {token_id[:10]}")
-        bid, _, _ = self.poly.get_price(token_id)
-        sell_p = round(bid - 0.01, 2) if bid and bid > 0.02 else 0.01
-        try:
-            sell_order = OrderArgs(
-                token_id=token_id,
-                price=sell_p,
-                size=shares,
-                side=SELL,
-            )
-            signed = client.create_order(sell_order)
-            resp = client.post_order(signed, OrderType.GTC)
-            log(f"    Emergency sell @ {sell_p} ({resp})")
-        except Exception as e:
-            log(f"    ⚠ Emergency sell error: {e}")
 
     def update_markets(self, markets):
         """Update tracked windows and subscribe to all tokens."""
@@ -540,30 +485,6 @@ class Follower:
                     mid = self.poly.mid_price(btc_token)
                     if mid is not None:
                         self.detector.update(side, mid)
-
-        # ─── Persistent leaked-fill scanner ───
-        # Scan ALL recently-cancelled buy tokens for leaked fills (not just last one)
-        if (self._pending_leak_checks
-                and now - self._last_leak_scan >= LEAK_CHECK_INTERVAL
-                and self._position is None):
-            self._last_leak_scan = now
-            still_pending = []
-            for item in self._pending_leak_checks:
-                token_id = item["token_id"]
-                checks = item["checks_done"]
-                leaked = get_share_balance(token_id)
-                if leaked is not None and leaked >= MIN_ORDER_SIZE:
-                    log(f"  ⚠ LEAKED FILL detected: {leaked:.1f}sh of {token_id[:10]} "
-                        f"(check #{checks+1}, {now - item['cancel_time']:.0f}s after cancel)")
-                    self._emergency_sell(token_id, leaked)
-                    # Don't add back to pending — dealt with
-                    continue
-                item["checks_done"] = checks + 1
-                if item["checks_done"] < LEAK_CHECK_COUNT:
-                    still_pending.append(item)  # Keep checking
-                else:
-                    pass  # Checked enough times, no leak found — drop it
-            self._pending_leak_checks = still_pending
 
         # ─── Manage open position ───
         if self._position is not None:
@@ -608,10 +529,6 @@ class Follower:
                 if not eth_bid or eth_bid <= 0:
                     continue
 
-                # Buy at mid + offset (not at ask — ask is already the moved price)
-                eth_mid_now = (eth_bid + eth_ask) / 2.0
-                buy_price = min(round(eth_mid_now + BUY_PRICE_OFFSET, 2), eth_ask)
-
                 # Check balance
                 balance = get_usdc_balance()
                 if balance is None:
@@ -622,39 +539,32 @@ class Follower:
 
                 log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} in {SPIKE_WINDOW}s "
                     f"(btc_mid={btc_price:.3f})")
-                log(f"  🎯 Buying ETH {side} @ {buy_price:.2f} (mid={eth_mid_now:.2f} ask={eth_ask:.2f}) | "
+                log(f"  🎯 Buying ETH {side} @ market | "
                     f"bet=${bet:.0f} | window {pct:.0%} elapsed")
 
                 success = self._buy_eth(
-                    eth_token, side, buy_price, bet, epoch, info
+                    eth_token, side, bet, epoch, info
                 )
                 if success:
                     self._window_trade_count[epoch] = wnd_trades + 1
                     return  # Only one position at a time
 
-    def _buy_eth(self, token_id, side, buy_price, bet, epoch, window_info):
-        """Place a GTC limit buy on ETH token at the ask. Returns True if filled."""
-        buy_price = round(buy_price, 2)
-        est_shares = bet / buy_price
+    def _buy_eth(self, token_id, side, bet, epoch, window_info):
+        """FOK market buy on ETH token. Returns True if filled."""
 
-        if est_shares < MIN_ORDER_SIZE:
-            est_shares = MIN_ORDER_SIZE
-
-        fee_est = compute_taker_fee(est_shares, buy_price)
-
-        log(f"  💰 Buying ETH {side}: ~{est_shares:.0f}sh @ {buy_price:.2f} "
-            f"(${bet:.0f} + ~${fee_est:.2f} fee)")
+        log(f"  💰 Buying ETH {side}: ${bet:.0f} FOK market order")
 
         if DRY_RUN:
-            log(f"  🧪 DRY RUN — skipping execution")
-            eth_mid = self.poly.mid_price(token_id) or buy_price
+            eth_mid = self.poly.mid_price(token_id) or 0.50
+            est_shares = bet / eth_mid if eth_mid > 0 else 0
+            log(f"  🧪 DRY RUN — ~{est_shares:.0f}sh @ ~{eth_mid:.2f}")
             self._position = {
                 "token_id": token_id,
                 "side": side,
-                "entry_price": buy_price,
-                "entry_mid": eth_mid,  # mid at entry for stop-loss comparison
+                "entry_price": eth_mid,
+                "entry_mid": eth_mid,
                 "shares": est_shares,
-                "cost": bet + fee_est,
+                "cost": bet,
                 "entry_time": time.time(),
                 "epoch": epoch,
                 "btc_token": window_info.get(f"btc_{side.lower()}"),
@@ -664,93 +574,53 @@ class Follower:
             return True
 
         try:
-            buy_order = OrderArgs(
+            market_order = MarketOrderArgs(
                 token_id=token_id,
-                price=buy_price,
-                size=est_shares,
+                amount=bet,
                 side=BUY,
             )
-            signed_buy = client.create_order(buy_order)
-            resp = client.post_order(signed_buy, OrderType.GTC)
+            signed = client.create_market_order(market_order)
+            resp = client.post_order(signed, OrderType.FOK)
 
             order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
-            resp_status = resp.get("status", "") if isinstance(resp, dict) else ""
+            status = resp.get("status", "") if isinstance(resp, dict) else ""
+            success = resp.get("success", False) if isinstance(resp, dict) else False
+            taking = float(resp.get("takingAmount", 0)) if isinstance(resp, dict) else 0
+            making = float(resp.get("makingAmount", 0)) if isinstance(resp, dict) else 0
 
-            if not resp_status or resp_status == "error":
+            if not success and status == "error":
                 log(f"  ⚠ Buy rejected: {resp}")
                 return False
 
-            log(f"  📝 Order placed (id: {order_id[:8] if order_id else '?'})")
-
-            time.sleep(FILL_WAIT)
-
-            # CANCEL FIRST, then check balance (prevent additional fills)
-            try:
-                if order_id:
-                    client.cancel(order_id)
-            except Exception:
-                pass
-            time.sleep(1.0)  # 1s pause for cancel + balance to settle
-
-            actual = get_share_balance(token_id)
-
-            if actual is not None and actual >= MIN_ORDER_SIZE:
-                fee = compute_taker_fee(actual, buy_price)
-                actual_cost = round(actual * buy_price + fee, 4)
-                log(f"  ✅ Filled! {actual:.1f}sh, cost ${actual_cost:.2f} (fee ${fee:.2f})")
-
-                # Post-fill validation: is BTC still spiking?
-                if POST_FILL_BTC_CHECK:
-                    btc_now = self.detector.get_current(side)
-                    btc_spike_start = self.detector.get_spike_start(side)
-                    if btc_now is not None and btc_spike_start is not None:
-                        btc_move = btc_now - btc_spike_start
-                        if btc_move < SPIKE_THRESHOLD * 0.5:
-                            log(f"  ⚠ POST-FILL CHECK FAIL: BTC {side} momentum gone "
-                                f"(now={btc_now:.3f}, spike_start={btc_spike_start:.3f}, "
-                                f"move={btc_move:+.3f} < {SPIKE_THRESHOLD * 0.5:.3f})")
-                            log(f"    Immediately selling — spike already over")
-                            # Sell immediately at bid
-                            bid, _, _ = self.poly.get_price(token_id)
-                            sell_p = round(bid, 2) if bid and bid > 0 else buy_price
-                            try:
-                                so = OrderArgs(token_id=token_id, price=sell_p,
-                                               size=actual, side=SELL)
-                                signed_s = client.create_order(so)
-                                resp_s = client.post_order(signed_s, OrderType.GTC)
-                                log(f"    Emergency sell @ {sell_p}: {resp_s}")
-                            except Exception as e:
-                                log(f"    Emergency sell error: {e}")
-                            return False
-
-                # Record ETH mid at entry for fair stop-loss comparison
-                eth_mid_now = self.poly.mid_price(token_id) or buy_price
-                btc_current = self.detector.get_current(side)
-                self._position = {
-                    "token_id": token_id,
-                    "side": side,
-                    "entry_price": buy_price,
-                    "entry_mid": eth_mid_now,  # mid at entry for stop-loss
-                    "shares": actual,
-                    "cost": actual_cost,
-                    "entry_time": time.time(),
-                    "epoch": epoch,
-                    "btc_token": window_info.get(f"btc_{side.lower()}"),
-                    "btc_peak": btc_current or buy_price,
-                    "order_id": order_id,
-                    "dry_run": False,
-                }
-                return True
-            else:
-                log(f"  ⏳ Not filled after {FILL_WAIT}s — cancelled")
-                # Register for persistent leak scanning (check multiple times)
-                self._pending_leak_checks.append({
-                    "token_id": token_id,
-                    "order_id": order_id,
-                    "cancel_time": time.time(),
-                    "checks_done": 0,
-                })
+            if making <= 0:
+                log(f"  ⚠ Buy got 0 shares: {resp}")
                 return False
+
+            # FOK fills instantly — making = shares received, taking = USDC spent
+            actual_shares = making
+            actual_cost = taking
+            fill_price = round(actual_cost / actual_shares, 4) if actual_shares > 0 else 0
+
+            log(f"  ✅ FOK filled! {actual_shares:.1f}sh @ ~{fill_price:.3f} "
+                f"(spent ${actual_cost:.2f})")
+
+            eth_mid_now = self.poly.mid_price(token_id) or fill_price
+            btc_current = self.detector.get_current(side)
+            self._position = {
+                "token_id": token_id,
+                "side": side,
+                "entry_price": fill_price,
+                "entry_mid": eth_mid_now,
+                "shares": actual_shares,
+                "cost": actual_cost,
+                "entry_time": time.time(),
+                "epoch": epoch,
+                "btc_token": window_info.get(f"btc_{side.lower()}"),
+                "btc_peak": btc_current or fill_price,
+                "order_id": order_id,
+                "dry_run": False,
+            }
+            return True
 
         except Exception as e:
             log(f"  ⚠ Buy error: {e}")
@@ -817,7 +687,7 @@ class Follower:
             return
 
     def _sell_eth(self, reason):
-        """Sell ETH position at best bid (market sell)."""
+        """FOK market sell of ETH position."""
         pos = self._position
         if pos is None:
             return
@@ -826,11 +696,10 @@ class Follower:
         shares = pos["shares"]
         side = pos["side"]
 
-        # Get current best bid for market sell
         eth_bid, _, _ = self.poly.get_price(token_id)
         sell_price = round(eth_bid, 2) if eth_bid and eth_bid > 0 else 0.01
 
-        log(f"  📤 Selling ETH {side}: {shares:.1f}sh @ {sell_price:.2f} ({reason})")
+        log(f"  📤 Selling ETH {side}: {shares:.1f}sh @ ~{sell_price:.2f} FOK ({reason})")
 
         if pos.get("dry_run"):
             fee = compute_taker_fee(shares, sell_price)
@@ -842,148 +711,62 @@ class Follower:
             self._cooldowns[side] = time.time()
             return
 
-        try:
-            sell_order = OrderArgs(
-                token_id=token_id,
-                price=sell_price,
-                size=shares,
-                side=SELL,
-            )
-            signed = client.create_order(sell_order)
-            resp = client.post_order(signed, OrderType.GTC)
+        # Use FOK market sell — amount in USDC
+        sell_amount = round(shares * sell_price, 4)
+        max_retries = 3
 
-            order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
-            status = resp.get("status", "") if isinstance(resp, dict) else ""
-
-            if order_id and status != "error":
-                log(f"  📝 Sell order placed (id: {order_id[:8]})")
-            else:
-                log(f"  ⚠ Sell order failed: {resp}")
-
-            # Wait for fill — need enough time for balance API to update
-            time.sleep(4)
-
-            # Check remaining shares (may be stale — we verify multiple times)
-            remaining = get_share_balance(token_id)
-            sold = shares - (remaining or 0)
-
-            if sold > 0.5:
-                fee = compute_taker_fee(sold, sell_price)
-                revenue = sold * sell_price - fee
-                pnl = revenue - pos["cost"]
-                log(f"  💰 Sold {sold:.1f}sh @ {sell_price:.2f} "
-                    f"→ PnL ${pnl:+.2f} ({reason})")
-                self._record_trade(pos, sell_price, pnl, reason)
-            else:
-                # Balance API might be stale — cancel first sell, re-check balance
-                log(f"  ⚠ Sell may not have filled (remaining={remaining}) — cancelling")
-                try:
-                    if order_id:
-                        client.cancel(order_id)
-                except Exception as ce:
-                    log(f"    Cancel error: {ce}")
-
-                # Wait and re-check balance to catch stale API
-                time.sleep(2)
-                remaining2 = get_share_balance(token_id)
-                sold2 = shares - (remaining2 or 0)
-
-                if sold2 > 0.5:
-                    # The sell DID fill — balance just was stale on first check
-                    fee = compute_taker_fee(sold2, sell_price)
-                    revenue = sold2 * sell_price - fee
-                    pnl = revenue - pos["cost"]
-                    log(f"  💰 Sell DID fill (stale balance): {sold2:.1f}sh @ {sell_price:.2f} "
-                        f"→ PnL ${pnl:+.2f} ({reason})")
-                    self._record_trade(pos, sell_price, pnl, reason)
-                elif remaining2 is not None and remaining2 < 1.0:
-                    # Shares are basically gone — sell filled but balance shows ~0
-                    fee = compute_taker_fee(shares, sell_price)
-                    revenue = shares * sell_price - fee
-                    pnl = revenue - pos["cost"]
-                    log(f"  💰 Sell confirmed (shares gone): {shares:.1f}sh @ {sell_price:.2f} "
-                        f"→ PnL ${pnl:+.2f} ({reason})")
-                    self._record_trade(pos, sell_price, pnl, reason)
-                else:
-                    # Genuinely not filled — retry with decreasing price
-                    log(f"  ⚠ Sell confirmed NOT filled (remaining={remaining2:.1f}) — retrying")
-                    final_sold = 0
-                    final_price = sell_price
-                    balance_error_count = 0
-
-                    for attempt in range(SELL_RETRY_ATTEMPTS):
-                        retry_price = round(max(0.01, sell_price - SELL_RETRY_STEP * (attempt + 1)), 2)
-                        log(f"  📝 Retry sell #{attempt+1} @ {retry_price}")
-                        try:
-                            sell_order_r = OrderArgs(
-                                token_id=token_id,
-                                price=retry_price,
-                                size=shares,
-                                side=SELL,
-                            )
-                            signed_r = client.create_order(sell_order_r)
-                            resp_r = client.post_order(signed_r, OrderType.GTC)
-                            order_id_r = resp_r.get("orderID", "") if isinstance(resp_r, dict) else ""
-
-                            time.sleep(3)
-                            remaining_r = get_share_balance(token_id)
-                            sold_r = shares - (remaining_r or 0)
-
-                            if sold_r > 0.5:
-                                final_sold = sold_r
-                                final_price = retry_price
-                                log(f"  ✅ Retry filled: {sold_r:.1f}sh @ {retry_price}")
-                                break
-                            else:
-                                try:
-                                    if order_id_r:
-                                        client.cancel(order_id_r)
-                                    time.sleep(0.3)
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            err_str = str(e)
-                            log(f"    Retry #{attempt+1} error: {e}")
-                            # "not enough balance / allowance" means shares are
-                            # already gone — the ORIGINAL sell filled after all!
-                            if "not enough balance" in err_str or "allowance" in err_str:
-                                balance_error_count += 1
-                                if balance_error_count >= 2:
-                                    log(f"  💰 Shares confirmed GONE (balance errors) "
-                                        f"— original sell @ {sell_price} likely filled")
-                                    final_sold = shares
-                                    final_price = sell_price
-                                    break
-
-                    if final_sold > 0.5:
-                        fee_r = compute_taker_fee(final_sold, final_price)
-                        revenue_r = final_sold * final_price - fee_r
-                        pnl_r = revenue_r - pos["cost"]
-                        log(f"  💰 Sold {final_sold:.1f}sh @ {final_price} → PnL ${pnl_r:+.2f}")
-                        self._record_trade(pos, final_price, pnl_r, reason)
-                    else:
-                        log(f"  ⚠ All sell retries failed — shares stuck")
-                        self._record_trade(pos, 0, -pos["cost"], reason + "_stuck")
-
-            # Cancel any remaining open orders for this token
+        for attempt in range(max_retries):
             try:
-                open_orders = client.get_orders(
-                    OpenOrderParams(market=token_id)
+                market_order = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=sell_amount,
+                    side=SELL,
                 )
-                if open_orders:
-                    for order in open_orders:
-                        oid = order.get("id", "")
-                        if oid:
-                            try:
-                                client.cancel(oid)
-                            except Exception:
-                                pass
-            except Exception:
-                pass
+                signed = client.create_market_order(market_order)
+                resp = client.post_order(signed, OrderType.FOK)
 
-        except Exception as e:
-            log(f"  ⚠ Sell error: {e}")
-            self._record_trade(pos, 0, -pos["cost"], reason + "_error")
+                success = resp.get("success", False) if isinstance(resp, dict) else False
+                taking = float(resp.get("takingAmount", 0)) if isinstance(resp, dict) else 0
+                making = float(resp.get("makingAmount", 0)) if isinstance(resp, dict) else 0
+
+                if success or taking > 0:
+                    # taking = USDC received (already net of fees from Polymarket)
+                    # making = shares sold
+                    actual_revenue = taking
+                    actual_shares_sold = making if making > 0 else shares
+                    actual_price = round(actual_revenue / actual_shares_sold, 4) if actual_shares_sold > 0 else sell_price
+                    # No fee subtraction — takingAmount is already net of fees
+                    pnl = actual_revenue - pos["cost"]
+                    log(f"  💰 Sold {actual_shares_sold:.1f}sh @ ~{actual_price:.3f} "
+                        f"→ PnL ${pnl:+.2f} ({reason})")
+                    self._record_trade(pos, actual_price, pnl, reason)
+                    self._position = None
+                    self._cooldowns[side] = time.time()
+                    return
+
+                # FOK rejected — lower price and retry
+                log(f"  ⚠ Sell FOK rejected (attempt {attempt+1}): {resp}")
+                sell_price = round(max(0.01, sell_price - 0.02), 2)
+                sell_amount = round(shares * sell_price, 4)
+                time.sleep(0.5)
+
+            except Exception as e:
+                err_str = str(e)
+                log(f"  ⚠ Sell error (attempt {attempt+1}): {e}")
+                if "not enough balance" in err_str or "allowance" in err_str:
+                    # Shares already gone — a previous sell likely went through
+                    log(f"  💰 Shares already sold (balance error) — recording at {sell_price}")
+                    fee = compute_taker_fee(shares, sell_price)
+                    pnl = shares * sell_price - fee - pos["cost"]
+                    self._record_trade(pos, sell_price, pnl, reason)
+                    self._position = None
+                    self._cooldowns[side] = time.time()
+                    return
+                time.sleep(0.5)
+
+        # All retries failed
+        log(f"  ⚠ All sell retries failed — shares may be stuck")
+        self._record_trade(pos, 0, -pos["cost"], reason + "_stuck")
 
         self._position = None
         self._cooldowns[side] = time.time()
