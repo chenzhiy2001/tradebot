@@ -59,29 +59,29 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BET_AMOUNT = 10               # USDC per trade
+BET_AMOUNT = 8                # USDC per trade (smaller = more frequent)
 MIN_BET = 5                   # Polymarket minimum
-MAX_BET = 30                  # Cap per trade
+MAX_BET = 20                  # Cap per trade
 MAX_EXPOSURE_PCT = 0.30       # Max 30% of balance at risk
 MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 
 # Spike detection — BTC token price must rise this much this fast
-SPIKE_THRESHOLD = 0.18        # BTC token mid-price jump ≥ 18¢ (very strong signal only)
+SPIKE_THRESHOLD = 0.12        # BTC token mid-price jump ≥ 12¢ (more signals)
 SPIKE_WINDOW = 5              # … within 5 seconds
 SPIKE_COOLDOWN = 0            # Cooldown between same-side trades (0 = no limit)
-MAX_SPIKES_PER_WINDOW = 2     # Max spike entries per 5m window (avoid whipsaw)
+MAX_SPIKES_PER_WINDOW = 3     # Max spike entries per 5m window
 
 # Entry quality filter — only buy tokens already trending in our direction
-MIN_ETH_MID = 0.65            # Only buy ETH token if its mid ≥ 65¢ (data: 7W/11T +$4.29)
+MIN_ETH_MID = 0.55            # Only buy ETH token if its mid ≥ 55¢
 MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = bad fills)
 
 # Exit conditions
 EXIT_REVERT = 0.20            # Sell ETH when BTC token drops 20¢ from peak (emergency only)
-STOP_LOSS = 0.08              # Sell ETH if its price drops 8¢ from entry MID
+STOP_LOSS = 0.06              # Sell ETH if its price drops 6¢ from FILL price
 TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢
-ETH_TRAIL_STOP = 0.04         # Exit when ETH drops 4¢ from its post-entry peak
-ETH_TRAIL_ACTIVATION = 0.02   # Only trail after ETH peaks 2¢ above entry mid
-MAX_HOLD_SECS = 120           # Hard time stop: sell after 2 minutes regardless
+ETH_TRAIL_STOP = 0.025        # Exit when ETH drops 2.5¢ from peak (tight = lock profits fast)
+ETH_TRAIL_ACTIVATION = 0.01   # Trail activates after just 1¢ gain (scalp small profits)
+MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
 ENTRY_GRACE_SECS = 8          # Don't check stop-loss for first 8s (settlement + spread settle)
 
 # Window timing
@@ -724,9 +724,9 @@ class Follower:
                 balance = get_usdc_balance()
                 if balance is None:
                     continue
-                # Higher entry price = more conviction = bigger bet
-                # 0.65 → $10, 0.80 → $15, 0.90+ → $20
-                price_scale = min(2.0, max(1.0, (eth_mid - 0.50) / 0.30 + 0.5))
+                # Scale bet by entry price — higher = more conviction
+                # 0.55 → $8, 0.70 → $11, 0.85+ → $16
+                price_scale = min(2.0, max(1.0, (eth_mid - 0.40) / 0.30 + 0.5))
                 base_bet = BET_AMOUNT * price_scale
                 bet = max(MIN_BET, min(MAX_BET, base_bet, balance * MAX_EXPOSURE_PCT))
                 if bet < MIN_BET:
@@ -814,18 +814,20 @@ class Follower:
 
             eth_mid_now = self.poly.mid_price(token_id) or fill_price
             btc_current = self.detector.get_current(side)
+            # Use fill_price as entry_mid (not post-settlement WS mid)
+            # The WS mid can inflate during settlement, causing premature stop-loss
             self._position = {
                 "token_id": token_id,
                 "side": side,
                 "entry_price": fill_price,
-                "entry_mid": eth_mid_now,
+                "entry_mid": fill_price,
                 "shares": actual_shares,
                 "cost": actual_cost,
                 "entry_time": time.time(),
                 "epoch": epoch,
                 "btc_token": window_info.get(f"btc_{side.lower()}"),
                 "btc_peak": btc_current or fill_price,
-                "eth_peak": eth_mid_now,
+                "eth_peak": fill_price,
                 "order_id": order_id,
                 "dry_run": False,
             }
