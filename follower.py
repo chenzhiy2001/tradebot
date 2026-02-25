@@ -78,6 +78,7 @@ ETH_TRAIL_PCT = 0.40          # Dynamic trail: allow 40% retracement of gain (ke
 ETH_TRAIL_ACTIVATION = 0.02   # Trail activates after 2¢ gain (avoid noise)
 MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
 NO_GAIN_EXIT_SECS = 45        # If no gain after 45s, thesis is wrong — exit early
+NO_GAIN_MAX_DRAWDOWN = 0.10   # If down 10¢+ with no gain, exit immediately (after grace)
 ENTRY_GRACE_SECS = 8          # Don't check exits for first 8s (settlement)
 TOKEN_COOLDOWN_SECS = 10      # Don't re-buy same token_id within 10s (settlement overlap)
 
@@ -930,11 +931,20 @@ class Follower:
                     self._sell_eth("eth_trail")
                     return
 
-        # 3. No-momentum exit — if ETH never gained after 30s, thesis is wrong
-        #    This catches trades where BTC spike didn't transfer to ETH at all
-        if hold_secs >= NO_GAIN_EXIT_SECS:
+        # 3. No-momentum exit — if ETH never gained, thesis is wrong
+        #    Two triggers (both require trail never activated):
+        #    a) After grace period: down 10¢+ from entry → exit immediately
+        #    b) After 45s: still no gain → exit
+        if hold_secs >= ENTRY_GRACE_SECS:
             eth_peak = pos.get("eth_peak", entry_mid)
-            if eth_peak < entry_mid + ETH_TRAIL_ACTIVATION:
+            no_gain = eth_peak < entry_mid + ETH_TRAIL_ACTIVATION
+            drawdown = entry_mid - eth_mid
+            if no_gain and drawdown >= NO_GAIN_MAX_DRAWDOWN:
+                log(f"  ❌ NO GAIN DRAWDOWN: {side} down {drawdown:.3f} with no gain "
+                    f"(entry={entry_mid:.3f}, now={eth_mid:.3f}, peak={eth_peak:.3f})")
+                self._sell_eth("no_gain")
+                return
+            if hold_secs >= NO_GAIN_EXIT_SECS and no_gain:
                 log(f"  ❌ NO GAIN: {side} held {hold_secs:.0f}s, peak only "
                     f"{eth_peak - entry_mid:+.3f} above entry "
                     f"(entry={entry_mid:.3f}, now={eth_mid:.3f})")
@@ -1110,6 +1120,7 @@ def main():
     log(f"Strategy: BTC spike → buy ETH same side → sell on BTC revert")
     log(f"Params: BET=${BET_AMOUNT} SPIKE={SPIKE_THRESHOLD:.2f}/{SPIKE_WINDOW}s "
         f"TRAIL={ETH_TRAIL_STOP}/{ETH_TRAIL_PCT:.0%}retr/{ETH_TRAIL_ACTIVATION} TP={TAKE_PROFIT}")
+    log(f"NoGain: {NO_GAIN_EXIT_SECS}s / drawdown={NO_GAIN_MAX_DRAWDOWN}")
     log(f"Windows: {INTERVALS}m | Max hold: {MAX_HOLD_SECS}s")
     log("")
 
