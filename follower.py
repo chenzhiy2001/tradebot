@@ -66,7 +66,7 @@ FILL_WAIT = 3                 # Seconds to wait for buy fill
 MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 
 # Spike detection — BTC token price must rise this much this fast
-SPIKE_THRESHOLD = 0.04        # BTC token mid-price jump ≥ 4¢ (e.g. 0.50 → 0.54)
+SPIKE_THRESHOLD = 0.10        # BTC token mid-price jump ≥ 4¢ (e.g. 0.50 → 0.54)
 SPIKE_WINDOW = 15             # … within 15 seconds
 SPIKE_COOLDOWN = 30           # Don't re-enter same side for 30s after a trade
 
