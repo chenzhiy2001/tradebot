@@ -123,19 +123,6 @@ client = ClobClient(
 client.set_api_creds(client.create_or_derive_api_creds())
 
 
-def ensure_usdc_allowance():
-    """Set USDC spending allowance on the exchange contract."""
-    try:
-        client.update_balance_allowance(
-            params=BalanceAllowanceParams(
-                asset_type=AssetType.COLLATERAL, token_id="", signature_type=1
-            )
-        )
-        log("  ✅ USDC allowance set")
-    except Exception as e:
-        log(f"  ⚠ USDC allowance error: {e}")
-
-
 def get_usdc_balance():
     try:
         ba = client.get_balance_allowance(
@@ -660,7 +647,6 @@ class Follower:
         self._lock = threading.Lock()
         self._window_trade_count = {}  # epoch -> count of trades in this window
         self._sell_worker = SellWorker(poly)
-        self._buy_error_until = 0  # Cooldown after buy errors
 
     def update_markets(self, markets):
         """Update tracked windows and subscribe to all tokens."""
@@ -770,7 +756,7 @@ class Follower:
                 balance = get_usdc_balance()
                 if balance is None:
                     continue
-                bet = int(min(BET_AMOUNT, balance * MAX_EXPOSURE_PCT))
+                bet = min(BET_AMOUNT, balance * MAX_EXPOSURE_PCT)
                 if bet < MIN_BET:
                     continue
 
@@ -788,10 +774,6 @@ class Follower:
 
     def _buy_eth(self, token_id, side, bet, epoch, window_info):
         """FOK market buy on ETH token. Returns True if filled."""
-
-        # Skip if in buy-error cooldown
-        if time.time() < self._buy_error_until:
-            return False
 
         log(f"  💰 Buying ETH {side}: ${bet:.0f} FOK market order")
 
@@ -886,8 +868,6 @@ class Follower:
 
         except Exception as e:
             log(f"  ⚠ Buy error: {e}")
-            # Cooldown after buy failure to avoid spamming
-            self._buy_error_until = time.time() + 30
             return False
 
     def _manage_position(self):
@@ -1158,8 +1138,6 @@ def main():
 
     if not poly.connected:
         log("⚠ Polymarket WS not connected after 30s")
-
-    ensure_usdc_allowance()
 
     balance = get_usdc_balance()
     if balance:
