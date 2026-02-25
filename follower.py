@@ -201,6 +201,18 @@ class SellWorker:
             return
 
         try:
+            # Ensure conditional token allowance is set
+            try:
+                client.update_balance_allowance(
+                    params=BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL,
+                        token_id=token_id,
+                        signature_type=1,
+                    )
+                )
+            except Exception:
+                pass
+
             bid, _, _ = self.poly.get_price(token_id)
             price = round(bid, 2) if bid and bid > 0 else 0.01
 
@@ -228,12 +240,6 @@ class SellWorker:
                 return
 
         except Exception as e:
-            err_str = str(e)
-            if "not enough balance" in err_str or "allowance" in err_str:
-                log(f"  🔄✅ Background sell: shares already gone ({side})")
-                with self._lock:
-                    self._active_count -= 1
-                return
             log(f"  🔄⚠ Background sell error (attempt {attempts+1}): {e}")
 
         # Re-queue for retry
@@ -709,6 +715,18 @@ class Follower:
             log(f"  ✅ FOK filled! {actual_shares:.1f}sh @ ~{fill_price:.3f} "
                 f"(spent ${actual_cost:.2f})")
 
+            # Set conditional token allowance so we can sell later
+            try:
+                client.update_balance_allowance(
+                    params=BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL,
+                        token_id=token_id,
+                        signature_type=1,
+                    )
+                )
+            except Exception as ae:
+                log(f"  ⚠ Allowance update warning: {ae}")
+
             eth_mid_now = self.poly.mid_price(token_id) or fill_price
             btc_current = self.detector.get_current(side)
             self._position = {
@@ -816,6 +834,18 @@ class Follower:
             self._cooldowns[side] = time.time()
             return
 
+        # Ensure conditional token allowance is set before selling
+        try:
+            client.update_balance_allowance(
+                params=BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token_id,
+                    signature_type=1,
+                )
+            )
+        except Exception as ae:
+            log(f"  ⚠ Sell allowance update warning: {ae}")
+
         # Use FOK market sell — amount = shares to sell
         sell_amount = shares
         max_retries = 3
@@ -854,17 +884,7 @@ class Follower:
                 time.sleep(0.5)
 
             except Exception as e:
-                err_str = str(e)
                 log(f"  ⚠ Sell error (attempt {attempt+1}): {e}")
-                if "not enough balance" in err_str or "allowance" in err_str:
-                    # Shares already gone — a previous sell likely went through
-                    log(f"  💰 Shares already sold (balance error) — recording at {sell_price}")
-                    fee = compute_taker_fee(shares, sell_price)
-                    pnl = shares * sell_price - fee - pos["cost"]
-                    self._record_trade(pos, sell_price, pnl, reason)
-                    self._position = None
-                    self._cooldowns[side] = time.time()
-                    return
                 time.sleep(0.5)
 
         # All inline retries failed — hand off to background sell worker
