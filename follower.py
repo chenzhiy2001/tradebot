@@ -59,6 +59,7 @@ FUNDER_ADDRESS = founder_address
 # STRATEGY PARAMETERS
 # =========================================================================
 MIN_BET = 5                   # Polymarket minimum
+MAX_BET = 50                  # Cap bet size — compound up to here, then steady
 BET_PCT = 0.90                # Bet 90% of balance, keep 10% buffer
 
 # Spike detection — BTC token price must rise this much this fast
@@ -755,7 +756,7 @@ class Follower:
                 balance = get_usdc_balance()
                 if balance is None:
                     continue
-                bet = int(balance * BET_PCT)
+                bet = int(min(balance * BET_PCT, MAX_BET))
                 if bet < MIN_BET:
                     continue
 
