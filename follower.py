@@ -77,6 +77,7 @@ ETH_TRAIL_STOP = 0.03         # Minimum trail: exit when ETH drops 3¢ from peak
 ETH_TRAIL_PCT = 0.40          # Dynamic trail: allow 40% retracement of gain (keep 60%)
 ETH_TRAIL_ACTIVATION = 0.02   # Trail activates after 2¢ gain (avoid noise)
 MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
+NO_GAIN_EXIT_SECS = 30        # If no gain after 30s, thesis is wrong — exit early
 ENTRY_GRACE_SECS = 8          # Don't check exits for first 8s (settlement)
 TOKEN_COOLDOWN_SECS = 10      # Don't re-buy same token_id within 10s (settlement overlap)
 
@@ -923,7 +924,18 @@ class Follower:
                     self._sell_eth("eth_trail")
                     return
 
-        # 3. Time stop
+        # 3. No-momentum exit — if ETH never gained after 30s, thesis is wrong
+        #    This catches trades where BTC spike didn't transfer to ETH at all
+        if hold_secs >= NO_GAIN_EXIT_SECS:
+            eth_peak = pos.get("eth_peak", entry_mid)
+            if eth_peak < entry_mid + ETH_TRAIL_ACTIVATION:
+                log(f"  ❌ NO GAIN: {side} held {hold_secs:.0f}s, peak only "
+                    f"{eth_peak - entry_mid:+.3f} above entry "
+                    f"(entry={entry_mid:.3f}, now={eth_mid:.3f})")
+                self._sell_eth("no_gain")
+                return
+
+        # 4. Time stop
         if hold_secs > MAX_HOLD_SECS:
             log(f"  ⏰ TIME STOP: held {hold_secs:.0f}s (ETH change={price_change:+.3f})")
             self._sell_eth("time_stop")
