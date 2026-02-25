@@ -72,7 +72,7 @@ SPIKE_COOLDOWN = 0            # Cooldown between same-side trades (0 = no limit)
 MAX_SPIKES_PER_WINDOW = 1000  # Max spike entries per 5m window
 
 # Entry quality filter — only buy tokens already trending in our direction
-MIN_ETH_MID = 0.50            # Only buy ETH token if its mid ≥ 50¢ (>50% implied prob)
+MIN_ETH_MID = 0.01            # Only buy ETH token if its mid ≥ 1¢ (>1% implied prob)
 
 # Exit conditions
 EXIT_REVERT = 0.15            # Sell ETH when BTC token drops 15¢ from peak (wider = hold longer)
