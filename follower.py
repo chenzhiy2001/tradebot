@@ -77,13 +77,15 @@ MAX_FOLLOWER_SPREAD = 0.06    # Skip if bid-ask spread > 6¢ (thin book = bad fi
 
 # Exit conditions
 TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢
+HARD_STOP_LOSS = 0.05         # Hard stop: exit if down 5¢ from entry (fires after settlement, no grace)
+SETTLEMENT_SECS = 5           # Settlement wait before hard stop activates
 TRAIL_STOP = 0.03             # Minimum trail: exit when price drops 3¢ from peak
 TRAIL_PCT = 0.40              # Dynamic trail: allow 40% retracement of gain (keep 60%)
 MIN_PROFIT_TARGET = 1.0       # Trail only activates after $1+ unrealized profit
 MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
 NO_GAIN_EXIT_SECS = 30        # If no gain after 30s, thesis is wrong — exit early
 NO_GAIN_MAX_DRAWDOWN = 0.10   # If down 10¢+ with no gain, exit immediately (after grace)
-ENTRY_GRACE_SECS = 8          # Don't check exits for first 8s (settlement)
+ENTRY_GRACE_SECS = 8          # Don't check trail/no-gain for first 8s (settlement noise)
 TOKEN_COOLDOWN_SECS = 10      # Don't re-buy same token_id within 10s (settlement overlap)
 
 # Window timing
@@ -950,7 +952,16 @@ class Follower:
             self._sell_position("take_profit")
             return
 
-        # 2. Trailing stop — lock in gains when price reverses from peak
+        # 2. HARD STOP-LOSS — fires right after settlement, no 8s grace
+        #    This prevents catastrophic losses like the -$4.66 crash
+        if hold_secs >= SETTLEMENT_SECS:
+            if price_change <= -HARD_STOP_LOSS:
+                log(f"  🛑 STOP LOSS: {crypto_label} {side} {price_change:+.3f} "
+                    f"(entry={entry_mid:.3f}, now={mid:.3f}, limit=-{HARD_STOP_LOSS})")
+                self._sell_position("stop_loss")
+                return
+
+        # 3. Trailing stop — lock in gains when price reverses from peak
         #    Only activates when unrealized $ profit ≥ MIN_PROFIT_TARGET ($1)
         #    Trail distance = max(TRAIL_STOP, TRAIL_PCT * gain)
         if hold_secs >= ENTRY_GRACE_SECS:
@@ -1170,7 +1181,8 @@ def main():
     log(f"Strategy: {LEADER.upper()} spike → buy {followers_str} same side → sell on revert")
     log(f"Params: ALL-IN SPIKE={SPIKE_THRESHOLD:.2f}/{SPIKE_WINDOW}s "
         f"TRAIL={TRAIL_STOP}/{TRAIL_PCT:.0%}retr/min${MIN_PROFIT_TARGET} TP={TAKE_PROFIT}")
-    log(f"NoGain: {NO_GAIN_EXIT_SECS}s / drawdown={NO_GAIN_MAX_DRAWDOWN}")
+    log(f"HardStop: {HARD_STOP_LOSS} after {SETTLEMENT_SECS}s | "
+        f"NoGain: {NO_GAIN_EXIT_SECS}s / drawdown={NO_GAIN_MAX_DRAWDOWN}")
     log(f"Windows: {INTERVALS}m | Max hold: {MAX_HOLD_SECS}s")
     log("")
 
