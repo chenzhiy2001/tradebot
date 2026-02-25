@@ -72,9 +72,10 @@ SPIKE_COOLDOWN = 0            # Cooldown between same-side trades (0 = no limit)
 MAX_SPIKES_PER_WINDOW = 3     # Max spike entries per 5m window
 
 # Entry quality filter — only buy tokens already trending in our direction
-MIN_ETH_MID = 0.55            # Only buy ETH token if its mid ≥ 55¢
+MIN_ETH_MID = 0.48            # Only buy ETH token if its mid ≥ 48¢ (was 0.55, blocked all DOWN entries)
+MAX_ETH_MID = 0.90            # Don't buy ETH token if mid ≥ 90¢ (no upside, huge downside)
 MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = bad fills)
-MAX_ETH_ALREADY_MOVED = 0.08  # Skip if ETH already moved >8¢ in last 5s (buying the top)
+MAX_ETH_ALREADY_MOVED = 0.08  # Skip if ETH already moved >8¢ in last 15s (buying the top)
 BTC_REVERT_ON_SETTLE = 0.08   # If BTC drops >8¢ from spike peak during settlement, bail out
 
 # Exit conditions
@@ -611,9 +612,10 @@ class SpikeDetector:
         else:
             self._eth_history_down.append((now, mid_price))
 
-    def eth_recent_move(self, side, window=5.0):
+    def eth_recent_move(self, side, window=15.0):
         """How much ETH moved in the last `window` seconds.
-        Returns (change, oldest_price, current_price) or (0, None, None)."""
+        Returns (change, min_price, current_price) or (0, None, None).
+        Uses MIN price in window (not oldest) so rolling window can't hide big moves."""
         history = self._eth_history_up if side == "UP" else self._eth_history_down
         if len(history) < 2:
             return 0, None, None
@@ -621,14 +623,14 @@ class SpikeDetector:
         current_ts, current_price = history[-1]
         if now - current_ts > 2.0:
             return 0, None, None
-        oldest_price = None
+        min_price = None
         for ts, price in history:
             if now - ts <= window:
-                oldest_price = price
-                break
-        if oldest_price is None:
+                if min_price is None or price < min_price:
+                    min_price = price
+        if min_price is None:
             return 0, None, None
-        return current_price - oldest_price, oldest_price, current_price
+        return current_price - min_price, min_price, current_price
 
 
 # =========================================================================
@@ -752,6 +754,12 @@ class Follower:
                 if eth_mid < MIN_ETH_MID:
                     log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} — "
                         f"SKIP: ETH {side} mid={eth_mid:.2f} < {MIN_ETH_MID}")
+                    continue
+
+                # Don't buy near certainty — no upside left
+                if eth_mid >= MAX_ETH_MID:
+                    log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} — "
+                        f"SKIP: ETH {side} mid={eth_mid:.2f} >= {MAX_ETH_MID} (no upside)")
                     continue
 
                 # Skip thin books — wide spread means bad fills
