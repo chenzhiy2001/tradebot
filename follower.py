@@ -67,17 +67,17 @@ MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 
 # Spike detection — BTC token price must rise this much this fast
 SPIKE_THRESHOLD = 0.10        # BTC token mid-price jump ≥ 4¢ (e.g. 0.50 → 0.54)
-SPIKE_WINDOW = 15             # … within 15 seconds
+SPIKE_WINDOW = 2             # … within 2 seconds
 SPIKE_COOLDOWN = 30           # Don't re-enter same side for 30s after a trade
 
 # Exit conditions
-EXIT_REVERT = 0.02            # Sell ETH when BTC token drops 2¢ from its peak post-entry
+EXIT_REVERT = 0.10            # Sell ETH when BTC token drops 10¢ from its peak post-entry
 STOP_LOSS = 0.04              # Sell ETH if its price drops 4¢ from entry
-TAKE_PROFIT = 0.06            # Sell ETH if its price rises 6¢ from entry
+TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢ from entry (essentially any gain)
 MAX_HOLD_SECS = 120           # Hard time stop: sell after 2 minutes regardless
 
 # Window timing
-MAX_ENTRY_PCT = 0.60          # Only enter in first 60% of window (need exit room)
+MAX_ENTRY_PCT = 0.80          # Only enter in first 80% of window (need exit room)
 INTERVALS = [5]               # Only 5-minute windows (faster signal)
 
 # Polymarket fee formula (5m/15m crypto)
