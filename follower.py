@@ -1149,7 +1149,7 @@ def main():
             pm_status = "🟢" if poly.connected else "🔴"
             status = follower.get_status()
 
-            # Show BTC prices
+            # Show BTC + ETH prices
             btc_up = follower.detector.get_current("UP")
             btc_down = follower.detector.get_current("DOWN")
             btc_str = ""
@@ -1158,10 +1158,21 @@ def main():
             if btc_down:
                 btc_str += f"BTC_DOWN={btc_down:.3f}"
 
+            eth_str = ""
+            for epoch, info in follower._windows.items():
+                for side_label in ["up", "down"]:
+                    eth_tok = info.get(f"eth_{side_label}")
+                    if eth_tok:
+                        mid = poly.mid_price(eth_tok)
+                        if mid:
+                            eth_str += f"ETH_{side_label.upper()}={mid:.3f} "
+                break  # only show current window
+
             print(f"\033[2J\033[H", end="")
             print(f"═══ Follower Bot [{mode}] ═══  {now_str} UTC  │  Polymarket {pm_status}")
             print(f"{'─' * 80}")
             print(f"  {btc_str}")
+            print(f"  {eth_str}")
             print(f"  {status}")
             print(f"{'─' * 80}")
             print(f"  Trades: {follower._trade_count} | "
