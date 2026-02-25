@@ -69,7 +69,6 @@ BET_PCT = 0.90                # Bet 90% of balance
 MIN_BTC_MOVE = 0.06           # BTC must move ≥ 6¢ in the lookback window
 MIN_GAP = 0.03                # Follower must still lag by ≥ 3¢ (unexploited edge)
 LOOKBACK_SECS = 10            # Measure moves over this window
-MIN_CONSECUTIVE = 2           # BTC must tick in same direction ≥ 2 times (sustained)
 
 # Leader/follower config
 LEADER = "btc"
@@ -716,28 +715,13 @@ class GapBot:
                 if btc_move is None:
                     continue
 
-                # BTC must show sustained momentum (not oscillation)
-                consec_count, consec_dir = self.tracker.get_consecutive_direction(
-                    f"{LEADER}_{side_label}"
-                )
-
-                # Diagnostic: log significant BTC moves that don't pass all filters
-                if btc_move >= 0.04 and (btc_move < MIN_BTC_MOVE or consec_count < MIN_CONSECUTIVE or consec_dir != 1):
-                    skip_why = []
-                    if btc_move < MIN_BTC_MOVE:
-                        skip_why.append(f"move={btc_move:.3f}<{MIN_BTC_MOVE}")
-                    if consec_count < MIN_CONSECUTIVE:
-                        skip_why.append(f"consec={consec_count}<{MIN_CONSECUTIVE}")
-                    if consec_dir != 1:
-                        skip_why.append(f"dir={consec_dir}")
+                # Diagnostic: log significant BTC moves below threshold
+                if btc_move >= 0.04 and btc_move < MIN_BTC_MOVE:
                     self._log_diagnostic(
-                        f"BTC {side} near-miss: move={btc_move:.3f} consec={consec_count} "
-                        f"dir={consec_dir} — {', '.join(skip_why)}"
+                        f"BTC {side} near-miss: move={btc_move:.3f}<{MIN_BTC_MOVE}"
                     )
 
                 if btc_move < MIN_BTC_MOVE:
-                    continue
-                if consec_count < MIN_CONSECUTIVE or consec_dir != 1:
                     continue
 
                 # Now find the best follower with the largest gap
@@ -1141,7 +1125,7 @@ def main():
     log(f"═══ GapBot ═══ [{mode}]")
     log(f"Strategy: {LEADER.upper()} → {followers_str} gap-based lag trading")
     log(f"Entry: BTC move ≥{MIN_BTC_MOVE}, gap ≥{MIN_GAP}, "
-        f"consecutive ≥{MIN_CONSECUTIVE}, lookback {LOOKBACK_SECS}s")
+        f"lookback {LOOKBACK_SECS}s")
     log(f"Price zone: [{MIN_MID}, {MAX_MID}] | spread ≤{MAX_SPREAD}")
     log(f"Exit: stop={STOP_LOSS}, trail after +{TRAIL_ACTIVATE} "
         f"({TRAIL_PCT:.0%} retr, min {TRAIL_MIN}), TP={TAKE_PROFIT}, "
