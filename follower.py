@@ -58,12 +58,11 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BET_AMOUNT = 8                # USDC per trade
 MIN_BET = 5                   # Polymarket minimum
-MAX_EXPOSURE_PCT = 0.30       # Max 30% of balance at risk
+BET_PCT = 0.90                # Bet 90% of balance, keep 10% buffer
 
 # Spike detection — BTC token price must rise this much this fast
-SPIKE_THRESHOLD = 0.20        # BTC token mid-price jump ≥ 20¢
+SPIKE_THRESHOLD = 0.10        # BTC token mid-price jump ≥ 10¢ (match manual threshold)
 SPIKE_WINDOW = 10             # … within 10 seconds
 MAX_SPIKES_PER_WINDOW = 3     # Max spike entries per 5m window
 
@@ -75,9 +74,9 @@ MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = ba
 TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢
 ETH_TRAIL_STOP = 0.03         # Minimum trail: exit when ETH drops 3¢ from peak
 ETH_TRAIL_PCT = 0.40          # Dynamic trail: allow 40% retracement of gain (keep 60%)
-ETH_TRAIL_ACTIVATION = 0.02   # Trail activates after 2¢ gain (avoid noise)
+MIN_PROFIT_TARGET = 1.0       # Trail only activates after $1+ unrealized profit
 MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
-NO_GAIN_EXIT_SECS = 45        # If no gain after 45s, thesis is wrong — exit early
+NO_GAIN_EXIT_SECS = 30        # If no gain after 30s, thesis is wrong — exit early
 NO_GAIN_MAX_DRAWDOWN = 0.10   # If down 10¢+ with no gain, exit immediately (after grace)
 ENTRY_GRACE_SECS = 8          # Don't check exits for first 8s (settlement)
 TOKEN_COOLDOWN_SECS = 10      # Don't re-buy same token_id within 10s (settlement overlap)
@@ -752,11 +751,11 @@ class Follower:
                         f"SKIP: ETH spread={eth_spread:.3f} > {MAX_ETH_SPREAD}")
                     continue
 
-                # Check balance & bet size (flat, no scaling)
+                # Check balance — go all-in (compounding)
                 balance = get_usdc_balance()
                 if balance is None:
                     continue
-                bet = int(min(BET_AMOUNT, balance * MAX_EXPOSURE_PCT))
+                bet = int(balance * BET_PCT)
                 if bet < MIN_BET:
                     continue
 
@@ -916,28 +915,32 @@ class Follower:
             return
 
         # 2. ETH trailing stop — lock in gains when ETH reverses from peak
+        #    Only activates when unrealized $ profit ≥ MIN_PROFIT_TARGET ($1)
         #    Trail distance = max(ETH_TRAIL_STOP, ETH_TRAIL_PCT * gain)
-        #    So with 40% retracement: up 20¢ → allow 8¢ pullback, up 5¢ → allow 3¢ min
         if hold_secs >= ENTRY_GRACE_SECS:
             eth_peak = pos.get("eth_peak", eth_mid)
             gain_from_entry = eth_peak - entry_mid
-            if gain_from_entry >= ETH_TRAIL_ACTIVATION:
+            shares = pos.get("shares", 0)
+            unrealized_profit = shares * gain_from_entry
+            if unrealized_profit >= MIN_PROFIT_TARGET:
                 trail_distance = max(ETH_TRAIL_STOP, ETH_TRAIL_PCT * gain_from_entry)
                 eth_drop_from_peak = eth_peak - eth_mid
                 if eth_drop_from_peak >= trail_distance:
                     log(f"  📉 ETH TRAIL: {side} dropped {eth_drop_from_peak:.3f} from peak "
                         f"(peak={eth_peak:.3f}, now={eth_mid:.3f}, entry={entry_mid:.3f}, "
-                        f"trail={trail_distance:.3f})")
+                        f"trail={trail_distance:.3f}, profit=${unrealized_profit:.2f})")
                     self._sell_eth("eth_trail")
                     return
 
         # 3. No-momentum exit — if ETH never gained, thesis is wrong
         #    Two triggers (both require trail never activated):
         #    a) After grace period: down 10¢+ from entry → exit immediately
-        #    b) After 45s: still no gain → exit
+        #    b) After 30s: still no gain → exit
         if hold_secs >= ENTRY_GRACE_SECS:
             eth_peak = pos.get("eth_peak", entry_mid)
-            no_gain = eth_peak < entry_mid + ETH_TRAIL_ACTIVATION
+            shares = pos.get("shares", 0)
+            peak_profit = shares * (eth_peak - entry_mid)
+            no_gain = peak_profit < MIN_PROFIT_TARGET
             drawdown = entry_mid - eth_mid
             if no_gain and drawdown >= NO_GAIN_MAX_DRAWDOWN:
                 log(f"  ❌ NO GAIN DRAWDOWN: {side} down {drawdown:.3f} with no gain "
@@ -1118,8 +1121,8 @@ def main():
     mode = "DRY" if DRY_RUN else "LIVE"
     log(f"═══ Follower Bot ═══ [{mode}]")
     log(f"Strategy: BTC spike → buy ETH same side → sell on BTC revert")
-    log(f"Params: BET=${BET_AMOUNT} SPIKE={SPIKE_THRESHOLD:.2f}/{SPIKE_WINDOW}s "
-        f"TRAIL={ETH_TRAIL_STOP}/{ETH_TRAIL_PCT:.0%}retr/{ETH_TRAIL_ACTIVATION} TP={TAKE_PROFIT}")
+    log(f"Params: ALL-IN SPIKE={SPIKE_THRESHOLD:.2f}/{SPIKE_WINDOW}s "
+        f"TRAIL={ETH_TRAIL_STOP}/{ETH_TRAIL_PCT:.0%}retr/min${MIN_PROFIT_TARGET} TP={TAKE_PROFIT}")
     log(f"NoGain: {NO_GAIN_EXIT_SECS}s / drawdown={NO_GAIN_MAX_DRAWDOWN}")
     log(f"Windows: {INTERVALS}m | Max hold: {MAX_HOLD_SECS}s")
     log("")
