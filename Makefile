@@ -94,6 +94,10 @@ sniper_logs_backup:
 	zip -j -9 archives/sniper_logs_$$(date +%Y%m%d_%H%M%S).zip sniper_data.jsonl sniper_trades.json sniper_log.txt
 	rm -f sniper_data.jsonl sniper_trades.json sniper_log.txt
 
+follower_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/follower_logs_$$(date +%Y%m%d_%H%M%S).zip follower_log.txt follower_trades.json
+	rm -f follower_log.txt follower_trades.json
 # git add . and git commit -m "backup logs" and git push"
 git_logs_backup:
 	git add .
