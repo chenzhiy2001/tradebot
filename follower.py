@@ -839,7 +839,11 @@ class Follower:
                 # Use only the NEW shares (total minus pre-buy)
                 new_shares = on_chain_shares - pre_buy_bal
                 log(f"  ✅ Settled: {new_shares:.1f}sh new ({on_chain_shares:.1f} total, {pre_buy_bal:.1f} pre)")
-                actual_shares = new_shares  # use only new shares, not stale leftovers
+                # Cap to FOK amount — on-chain may include stale leftovers
+                if new_shares > actual_shares * 1.5:
+                    log(f"  ⚠ On-chain inflated ({new_shares:.1f} vs FOK {actual_shares:.1f}) — using FOK amount")
+                else:
+                    actual_shares = new_shares
             else:
                 log(f"  ⚠ Settlement timeout ({on_chain_shares:.1f}sh on-chain) "
                     f"— proceeding anyway")
@@ -986,8 +990,15 @@ class Follower:
             self._cooldowns[token_id] = time.time()
             return
 
-        # Use FOK market sell — amount = shares to sell
-        sell_amount = shares
+        # Use actual on-chain balance as sell amount (not recorded shares)
+        # Recorded shares may be inflated from settlement detection
+        on_chain_bal = get_share_balance(token_id)
+        if on_chain_bal is not None and on_chain_bal > 0:
+            sell_amount = on_chain_bal
+            if abs(sell_amount - shares) > 1.0:
+                log(f"  🔄 Adjusted sell: {shares:.1f} → {sell_amount:.1f}sh (on-chain)")
+        else:
+            sell_amount = shares
         max_retries = 3
 
         for attempt in range(max_retries):
