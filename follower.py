@@ -58,9 +58,9 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BET_AMOUNT = 5                # USDC per trade
+BET_AMOUNT = 10               # USDC per trade
 MIN_BET = 5                   # Polymarket minimum
-MAX_BET = 20                  # Cap per trade
+MAX_BET = 30                  # Cap per trade
 MAX_EXPOSURE_PCT = 0.30       # Max 30% of balance at risk
 FILL_WAIT = 3                 # Seconds to wait for buy fill
 MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
