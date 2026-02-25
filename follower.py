@@ -79,7 +79,7 @@ MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
 ENTRY_GRACE_SECS = 8          # Don't check exits for first 8s (settlement)
 
 # Window timing
-MAX_ENTRY_PCT = 0.85          # Enter in first 85% of window (need 45s runway for exit)
+MAX_ENTRY_PCT = 0.70          # Enter in first 70% of window (need 90s+ runway for exit)
 MIN_ENTRY_PCT = 0.0           # No floor — spike detector clear() handles window boundaries
 INTERVALS = [5]               # Only 5-minute windows (faster signal)
 
@@ -294,6 +294,12 @@ class SellWorker:
             # Price out of range (0.999 > max 0.99) → market resolved in our favor
             if 'price' in err_str.lower() and 'max' in err_str.lower():
                 log(f"  🔄✅ Price at max — market resolved in our favor ({side})")
+                with self._lock:
+                    self._active_count -= 1
+                return
+            # "no match" = token expired / order can't be matched
+            if 'no match' in err_str.lower():
+                log(f"  🔄✅ Token expired / no match — stopping retries ({side})")
                 with self._lock:
                     self._active_count -= 1
                 return
@@ -980,6 +986,14 @@ class Follower:
                     log(f"  ✅ Market resolved in our favor — shares will auto-redeem")
                     pnl = shares * 1.0 - pos["cost"]  # Estimate: resolved at $1
                     self._record_trade(pos, 1.0, pnl, reason + "_resolved")
+                    self._position = None
+                    self._cooldowns[side] = time.time()
+                    return
+                # "no match" = token expired / window closed
+                if 'no match' in err_str.lower():
+                    log(f"  ⚠ Token expired / no match — shares may auto-redeem")
+                    # Can't determine price; record as total loss worst-case
+                    self._record_trade(pos, 0.0, -pos["cost"], reason + "_expired")
                     self._position = None
                     self._cooldowns[side] = time.time()
                     return
