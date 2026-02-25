@@ -72,9 +72,12 @@ SPIKE_COOLDOWN = 30           # Don't re-enter same side for 30s after a trade
 
 # Exit conditions
 EXIT_REVERT = 0.10            # Sell ETH when BTC token drops 10¢ from its peak post-entry
-STOP_LOSS = 0.04              # Sell ETH if its price drops 4¢ from entry
+STOP_LOSS = 0.04              # Sell ETH if its price drops 4¢ from entry MID (not ask)
 TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢ from entry (essentially any gain)
 MAX_HOLD_SECS = 120           # Hard time stop: sell after 2 minutes regardless
+ENTRY_GRACE_SECS = 5          # Don't check stop-loss for first 5s (let position settle)
+SELL_RETRY_ATTEMPTS = 3       # Number of sell retry attempts with decreasing price
+SELL_RETRY_STEP = 0.01        # Price decrease per retry step
 
 # Window timing
 MAX_ENTRY_PCT = 0.80          # Only enter in first 80% of window (need exit room)
@@ -464,6 +467,10 @@ class Follower:
         self._win_count = 0
         self._total_pnl = 0.0
         self._lock = threading.Lock()
+        # Leaked-fill prevention (same pattern as sniper.py)
+        self._buy_attempted = False     # True once a buy is placed this cycle
+        self._last_buy_token = None     # token_id of last buy attempt
+        self._last_buy_order_id = None  # order_id of last buy attempt
 
     def update_markets(self, markets):
         """Update tracked windows and subscribe to all tokens."""
@@ -493,6 +500,35 @@ class Follower:
                     mid = self.poly.mid_price(btc_token)
                     if mid is not None:
                         self.detector.update(side, mid)
+
+        # ─── Leaked-fill detection ───
+        # If we placed a buy that was "cancelled", check if it leaked a fill
+        if (self._buy_attempted and self._position is None
+                and self._last_buy_token):
+            leaked = get_share_balance(self._last_buy_token)
+            if leaked is not None and leaked >= MIN_ORDER_SIZE:
+                log(f"  ⚠ LEAKED FILL detected: {leaked:.1f}sh of {self._last_buy_token[:10]}")
+                log(f"    Placing emergency sell at bid to dump leaked shares")
+                bid, _, _ = self.poly.get_price(self._last_buy_token)
+                sell_p = round(bid - 0.01, 2) if bid and bid > 0.02 else 0.01
+                try:
+                    sell_order = OrderArgs(
+                        token_id=self._last_buy_token,
+                        price=sell_p,
+                        size=leaked,
+                        side=SELL,
+                    )
+                    signed = client.create_order(sell_order)
+                    resp = client.post_order(signed, OrderType.GTC)
+                    log(f"    Emergency sell placed @ {sell_p} ({resp})")
+                except Exception as e:
+                    log(f"    ⚠ Emergency sell error: {e}")
+                self._buy_attempted = False
+                self._last_buy_token = None
+                return
+            # No leak — reset flag
+            self._buy_attempted = False
+            self._last_buy_token = None
 
         # ─── Manage open position ───
         if self._position is not None:
@@ -564,10 +600,12 @@ class Follower:
 
         if DRY_RUN:
             log(f"  🧪 DRY RUN — skipping execution")
+            eth_mid = self.poly.mid_price(token_id) or buy_price
             self._position = {
                 "token_id": token_id,
                 "side": side,
                 "entry_price": buy_price,
+                "entry_mid": eth_mid,  # mid at entry for stop-loss comparison
                 "shares": est_shares,
                 "cost": bet + fee_est,
                 "entry_time": time.time(),
@@ -596,27 +634,37 @@ class Follower:
                 return False
 
             log(f"  📝 Order placed (id: {order_id[:8] if order_id else '?'})")
+
+            # Track for leaked-fill detection
+            self._buy_attempted = True
+            self._last_buy_token = token_id
+            self._last_buy_order_id = order_id
+
             time.sleep(FILL_WAIT)
 
-            actual = get_share_balance(token_id)
-
-            # Always cancel buy to prevent additional fills
+            # CANCEL FIRST, then check balance (prevent additional fills)
             try:
                 if order_id:
                     client.cancel(order_id)
             except Exception:
                 pass
+            time.sleep(0.5)  # brief pause for cancel to settle
+
+            actual = get_share_balance(token_id)
 
             if actual is not None and actual >= MIN_ORDER_SIZE:
                 fee = compute_taker_fee(actual, buy_price)
                 actual_cost = round(actual * buy_price + fee, 4)
                 log(f"  ✅ Filled! {actual:.1f}sh, cost ${actual_cost:.2f} (fee ${fee:.2f})")
 
+                # Record ETH mid at entry for fair stop-loss comparison
+                eth_mid_now = self.poly.mid_price(token_id) or buy_price
                 btc_current = self.detector.get_current(side)
                 self._position = {
                     "token_id": token_id,
                     "side": side,
                     "entry_price": buy_price,
+                    "entry_mid": eth_mid_now,  # mid at entry for stop-loss
                     "shares": actual,
                     "cost": actual_cost,
                     "entry_time": time.time(),
@@ -626,9 +674,12 @@ class Follower:
                     "order_id": order_id,
                     "dry_run": False,
                 }
+                self._buy_attempted = False  # position taken, no leak possible
+                self._last_buy_token = None
                 return True
             else:
                 log(f"  ⏳ Not filled after {FILL_WAIT}s — cancelled")
+                # _buy_attempted stays True → leaked-fill check on next tick
                 return False
 
         except Exception as e:
@@ -655,7 +706,9 @@ class Follower:
             return
 
         eth_mid = (eth_bid + (eth_ask or eth_bid)) / 2.0
-        price_change = eth_mid - pos["entry_price"]
+        # Compare mid-to-mid (not mid vs ask) to avoid spread triggering stop-loss
+        entry_mid = pos.get("entry_mid", pos["entry_price"])
+        price_change = eth_mid - entry_mid
 
         # Update BTC peak
         btc_current = self.detector.get_current(side)
@@ -664,10 +717,10 @@ class Follower:
 
         # ─── Exit checks (in priority order) ───
 
-        # 1. Stop loss
-        if price_change <= -STOP_LOSS:
-            log(f"  🛑 STOP LOSS: ETH {side} dropped {price_change:+.3f} from entry "
-                f"(mid={eth_mid:.3f}, entry={pos['entry_price']:.2f})")
+        # 1. Stop loss (with grace period to let position settle)
+        if price_change <= -STOP_LOSS and hold_secs >= ENTRY_GRACE_SECS:
+            log(f"  🛑 STOP LOSS: ETH {side} dropped {price_change:+.3f} from entry_mid "
+                f"(mid={eth_mid:.3f}, entry_mid={entry_mid:.3f})")
             self._sell_eth("stop_loss")
             return
 
@@ -752,36 +805,61 @@ class Follower:
                     f"→ PnL ${pnl:+.2f} ({reason})")
                 self._record_trade(pos, sell_price, pnl, reason)
             else:
-                log(f"  ⚠ Sell didn't fill — trying lower price")
-                # Retry at a lower price (1¢ below bid)
-                retry_price = round(max(0.01, sell_price - 0.01), 2)
+                # ── Must CANCEL first sell before retrying ──
+                log(f"  ⚠ Sell didn't fill — cancelling before retry")
                 try:
-                    sell_order2 = OrderArgs(
-                        token_id=token_id,
-                        price=retry_price,
-                        size=shares,
-                        side=SELL,
-                    )
-                    signed2 = client.create_order(sell_order2)
-                    resp2 = client.post_order(signed2, OrderType.GTC)
-                    order_id2 = resp2.get("orderID", "") if isinstance(resp2, dict) else ""
-                    log(f"  📝 Retry sell @ {retry_price} (id: {order_id2[:8] if order_id2 else '?'})")
+                    if order_id:
+                        client.cancel(order_id)
+                    time.sleep(0.5)  # let cancel settle
+                except Exception as ce:
+                    log(f"    Cancel error: {ce}")
 
-                    time.sleep(3)
-                    remaining2 = get_share_balance(token_id)
-                    sold2 = shares - (remaining2 or 0)
-                    fee2 = compute_taker_fee(sold2, retry_price) if sold2 > 0 else 0
-                    revenue2 = sold2 * retry_price - fee2 if sold2 > 0 else 0
-                    pnl2 = revenue2 - pos["cost"]
-                    if sold2 > 0:
-                        log(f"  💰 Retry sold {sold2:.1f}sh @ {retry_price} → PnL ${pnl2:+.2f}")
-                    else:
-                        pnl2 = -pos["cost"]
-                        log(f"  ⚠ Still not sold — shares stuck. PnL ≈ ${pnl2:+.2f}")
-                    self._record_trade(pos, retry_price, pnl2, reason)
-                except Exception as e:
-                    log(f"  ⚠ Retry sell error: {e}")
-                    self._record_trade(pos, sell_price, -pos["cost"], reason + "_stuck")
+                # Retry loop with decreasing price
+                final_sold = 0
+                final_price = sell_price
+                for attempt in range(SELL_RETRY_ATTEMPTS):
+                    retry_price = round(max(0.01, sell_price - SELL_RETRY_STEP * (attempt + 1)), 2)
+                    log(f"  📝 Retry sell #{attempt+1} @ {retry_price}")
+                    try:
+                        sell_order_r = OrderArgs(
+                            token_id=token_id,
+                            price=retry_price,
+                            size=shares,
+                            side=SELL,
+                        )
+                        signed_r = client.create_order(sell_order_r)
+                        resp_r = client.post_order(signed_r, OrderType.GTC)
+                        order_id_r = resp_r.get("orderID", "") if isinstance(resp_r, dict) else ""
+
+                        time.sleep(2)
+                        remaining_r = get_share_balance(token_id)
+                        sold_r = shares - (remaining_r or 0)
+
+                        if sold_r > 0:
+                            final_sold = sold_r
+                            final_price = retry_price
+                            log(f"  ✅ Retry filled: {sold_r:.1f}sh @ {retry_price}")
+                            break
+                        else:
+                            # Cancel this retry before next attempt
+                            try:
+                                if order_id_r:
+                                    client.cancel(order_id_r)
+                                time.sleep(0.3)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        log(f"    Retry #{attempt+1} error: {e}")
+
+                if final_sold > 0:
+                    fee_r = compute_taker_fee(final_sold, final_price)
+                    revenue_r = final_sold * final_price - fee_r
+                    pnl_r = revenue_r - pos["cost"]
+                    log(f"  💰 Sold {final_sold:.1f}sh @ {final_price} → PnL ${pnl_r:+.2f}")
+                    self._record_trade(pos, final_price, pnl_r, reason)
+                else:
+                    log(f"  ⚠ All sell retries failed — shares stuck")
+                    self._record_trade(pos, 0, -pos["cost"], reason + "_stuck")
 
             # Cancel any remaining open orders for this token
             try:
@@ -850,7 +928,8 @@ class Follower:
             hold = time.time() - pos["entry_time"]
             eth_bid, _, _ = self.poly.get_price(pos["token_id"])
             eth_mid = eth_bid or 0
-            change = eth_mid - pos["entry_price"]
+            entry_mid = pos.get("entry_mid", pos["entry_price"])
+            change = eth_mid - entry_mid
             btc_now = self.detector.get_current(pos["side"])
             btc_drop = (pos["btc_peak"] - btc_now) if btc_now else 0
             return (f"HOLDING ETH {pos['side']} | entry={pos['entry_price']:.2f} "
