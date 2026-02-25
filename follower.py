@@ -10,10 +10,9 @@ Strategy:
   2. Track the BTC token mid-price in a rolling window.
   3. When BTC's UP (or DOWN) token surges by ≥ SPIKE_THRESHOLD in ≤ SPIKE_WINDOW
      seconds, immediately buy the SAME side of ETH at the ask.
-  4. After entry, monitor BTC momentum:
-     - If BTC token price stalls or reverses (drops from peak by ≥ EXIT_REVERT),
-       sell the ETH position at the bid (take profit / cut loss).
-     - Hard stop-loss if ETH price drops by ≥ STOP_LOSS from entry.
+  4. After entry, monitor ETH price:
+     - Track ETH peak price; once it rises above entry, engage trailing stop.
+     - If ETH drops from peak by ≥ ETH_TRAIL_STOP, sell (lock in gains).
      - Hard take-profit if ETH price rises by ≥ TAKE_PROFIT from entry.
      - Time stop: sell after MAX_HOLD_SECS regardless.
   5. Only trade within the first MAX_ENTRY_PCT of each window (need room to exit).
@@ -59,16 +58,13 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-BET_AMOUNT = 8                # USDC per trade (smaller = more frequent)
+BET_AMOUNT = 8                # USDC per trade
 MIN_BET = 5                   # Polymarket minimum
-MAX_BET = 20                  # Cap per trade
 MAX_EXPOSURE_PCT = 0.30       # Max 30% of balance at risk
-MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 
 # Spike detection — BTC token price must rise this much this fast
-SPIKE_THRESHOLD = 0.12        # BTC token mid-price jump ≥ 12¢ (more signals)
+SPIKE_THRESHOLD = 0.12        # BTC token mid-price jump ≥ 12¢
 SPIKE_WINDOW = 5              # … within 5 seconds
-SPIKE_COOLDOWN = 0            # Cooldown between same-side trades (0 = no limit)
 MAX_SPIKES_PER_WINDOW = 3     # Max spike entries per 5m window
 
 # Entry quality filter — only buy tokens already trending in our direction
@@ -76,13 +72,11 @@ MIN_ETH_MID = 0.55            # Only buy ETH token if its mid ≥ 55¢
 MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = bad fills)
 
 # Exit conditions
-EXIT_REVERT = 0.20            # Sell ETH when BTC token drops 20¢ from peak (emergency only)
-STOP_LOSS = 0.06              # Sell ETH if its price drops 6¢ from FILL price
 TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢
-ETH_TRAIL_STOP = 0.025        # Exit when ETH drops 2.5¢ from peak (tight = lock profits fast)
-ETH_TRAIL_ACTIVATION = 0.01   # Trail activates after just 1¢ gain (scalp small profits)
+ETH_TRAIL_STOP = 0.03         # Exit when ETH drops 3¢ from peak
+ETH_TRAIL_ACTIVATION = 0.02   # Trail activates after 2¢ gain (avoid noise)
 MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
-ENTRY_GRACE_SECS = 8          # Don't check stop-loss for first 8s (settlement + spread settle)
+ENTRY_GRACE_SECS = 8          # Don't check exits for first 8s (settlement)
 
 # Window timing
 MAX_ENTRY_PCT = 0.85          # Enter in first 85% of window (need 45s runway for exit)
@@ -189,7 +183,7 @@ class SellWorker:
     """Background thread that retries failed sells until shares are gone."""
 
     RETRY_INTERVAL = 3       # seconds between retries
-    MAX_RETRIES = 60         # give up after ~3 minutes
+    MAX_RETRIES = 20         # give up after ~1 minute
 
     def __init__(self, poly):
         self.poly = poly
@@ -281,6 +275,19 @@ class SellWorker:
                 return
 
         except Exception as e:
+            err_str = str(e)
+            # Market resolved / orderbook gone → shares auto-redeemed, stop retrying
+            if 'No orderbook exists' in err_str or 'orderbook' in err_str.lower():
+                log(f"  🔄✅ Market resolved, shares redeemed ({side})")
+                with self._lock:
+                    self._active_count -= 1
+                return
+            # Price out of range (0.999 > max 0.99) → market resolved in our favor
+            if 'price' in err_str.lower() and 'max' in err_str.lower():
+                log(f"  🔄✅ Price at max — market resolved in our favor ({side})")
+                with self._lock:
+                    self._active_count -= 1
+                return
             log(f"  🔄⚠ Background sell error (attempt {attempts+1}): {e}")
 
         # Re-queue for retry
@@ -681,11 +688,6 @@ class Follower:
                 continue  # Too early — prices still initializing
 
             for side in ["UP", "DOWN"]:
-                # Check cooldown
-                cd = self._cooldowns.get(side, 0)
-                if now - cd < SPIKE_COOLDOWN:
-                    continue
-
                 is_spike, btc_price, change = self.detector.check_spike(side)
                 if not is_spike:
                     continue
@@ -720,15 +722,11 @@ class Follower:
                         f"SKIP: ETH spread={eth_spread:.3f} > {MAX_ETH_SPREAD}")
                     continue
 
-                # Check balance & scale bet by entry price
+                # Check balance & bet size (flat, no scaling)
                 balance = get_usdc_balance()
                 if balance is None:
                     continue
-                # Scale bet by entry price — higher = more conviction
-                # 0.55 → $8, 0.70 → $11, 0.85+ → $16
-                price_scale = min(2.0, max(1.0, (eth_mid - 0.40) / 0.30 + 0.5))
-                base_bet = BET_AMOUNT * price_scale
-                bet = max(MIN_BET, min(MAX_BET, base_bet, balance * MAX_EXPOSURE_PCT))
+                bet = min(BET_AMOUNT, balance * MAX_EXPOSURE_PCT)
                 if bet < MIN_BET:
                     continue
 
@@ -872,21 +870,14 @@ class Follower:
 
         # ─── Exit checks (in priority order) ───
 
-        # 1. Stop loss (with grace period to let position settle)
-        if price_change <= -STOP_LOSS and hold_secs >= ENTRY_GRACE_SECS:
-            log(f"  🛑 STOP LOSS: ETH {side} dropped {price_change:+.3f} from entry_mid "
-                f"(mid={eth_mid:.3f}, entry_mid={entry_mid:.3f})")
-            self._sell_eth("stop_loss")
-            return
-
-        # 2. Take profit
+        # 1. Take profit
         if price_change >= TAKE_PROFIT:
             log(f"  🎉 TAKE PROFIT: ETH {side} gained {price_change:+.3f} "
                 f"(mid={eth_mid:.3f}, entry={pos['entry_price']:.2f})")
             self._sell_eth("take_profit")
             return
 
-        # 3. ETH trailing stop — lock in gains when ETH reverses from peak
+        # 2. ETH trailing stop — lock in gains when ETH reverses from peak
         if hold_secs >= ENTRY_GRACE_SECS:
             eth_peak = pos.get("eth_peak", eth_mid)
             if eth_peak > entry_mid + ETH_TRAIL_ACTIVATION:
@@ -897,16 +888,7 @@ class Follower:
                     self._sell_eth("eth_trail")
                     return
 
-        # 4. BTC momentum reversal — BTC token dropped from peak (with grace period)
-        if btc_current is not None and hold_secs >= ENTRY_GRACE_SECS:
-            btc_drop = pos["btc_peak"] - btc_current
-            if btc_drop >= EXIT_REVERT:
-                log(f"  📉 BTC REVERT: {side} dropped {btc_drop:.3f} from peak "
-                    f"(peak={pos['btc_peak']:.3f}, now={btc_current:.3f})")
-                self._sell_eth("btc_revert")
-                return
-
-        # 5. Time stop
+        # 3. Time stop
         if hold_secs > MAX_HOLD_SECS:
             log(f"  ⏰ TIME STOP: held {hold_secs:.0f}s (ETH change={price_change:+.3f})")
             self._sell_eth("time_stop")
@@ -975,6 +957,15 @@ class Follower:
                 time.sleep(0.5)
 
             except Exception as e:
+                err_str = str(e)
+                # Price at max (0.999 > 0.99) = market resolved in our favor
+                if 'price' in err_str.lower() and 'max' in err_str.lower():
+                    log(f"  ✅ Market resolved in our favor — shares will auto-redeem")
+                    pnl = shares * 1.0 - pos["cost"]  # Estimate: resolved at $1
+                    self._record_trade(pos, 1.0, pnl, reason + "_resolved")
+                    self._position = None
+                    self._cooldowns[side] = time.time()
+                    return
                 log(f"  ⚠ Sell error (attempt {attempt+1}): {e}")
                 time.sleep(0.5)
 
@@ -1052,8 +1043,7 @@ def main():
     log(f"═══ Follower Bot ═══ [{mode}]")
     log(f"Strategy: BTC spike → buy ETH same side → sell on BTC revert")
     log(f"Params: BET=${BET_AMOUNT} SPIKE={SPIKE_THRESHOLD:.2f}/{SPIKE_WINDOW}s "
-        f"EXIT_REVERT={EXIT_REVERT} SL={STOP_LOSS} TP={TAKE_PROFIT} "
-        f"TRAIL={ETH_TRAIL_STOP}/{ETH_TRAIL_ACTIVATION}")
+        f"TRAIL={ETH_TRAIL_STOP}/{ETH_TRAIL_ACTIVATION} TP={TAKE_PROFIT}")
     log(f"Windows: {INTERVALS}m | Max hold: {MAX_HOLD_SECS}s")
     log("")
 
