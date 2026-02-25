@@ -660,6 +660,7 @@ class Follower:
         self._lock = threading.Lock()
         self._window_trade_count = {}  # epoch -> count of trades in this window
         self._sell_worker = SellWorker(poly)
+        self._buy_error_until = 0  # Cooldown after buy errors
 
     def update_markets(self, markets):
         """Update tracked windows and subscribe to all tokens."""
@@ -788,6 +789,10 @@ class Follower:
     def _buy_eth(self, token_id, side, bet, epoch, window_info):
         """FOK market buy on ETH token. Returns True if filled."""
 
+        # Skip if in buy-error cooldown
+        if time.time() < self._buy_error_until:
+            return False
+
         log(f"  💰 Buying ETH {side}: ${bet:.0f} FOK market order")
 
         if DRY_RUN:
@@ -811,6 +816,13 @@ class Follower:
             return True
 
         try:
+            # Refresh USDC balance/allowance cache on the exchange
+            client.update_balance_allowance(
+                params=BalanceAllowanceParams(
+                    asset_type=AssetType.COLLATERAL, token_id="", signature_type=1
+                )
+            )
+
             market_order = MarketOrderArgs(
                 token_id=token_id,
                 amount=bet,
@@ -881,6 +893,8 @@ class Follower:
 
         except Exception as e:
             log(f"  ⚠ Buy error: {e}")
+            # Cooldown after buy failure to avoid spamming
+            self._buy_error_until = time.time() + 30
             return False
 
     def _manage_position(self):
