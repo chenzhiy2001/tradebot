@@ -85,8 +85,8 @@ MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
 ENTRY_GRACE_SECS = 8          # Don't check stop-loss for first 8s (settlement + spread settle)
 
 # Window timing
-MAX_ENTRY_PCT = 0.65          # Only enter in first 65% of window (need more runway)
-MIN_ENTRY_PCT = 0.10          # Don't enter in first 10% (prices still initializing)
+MAX_ENTRY_PCT = 0.85          # Enter in first 85% of window (need 45s runway for exit)
+MIN_ENTRY_PCT = 0.0           # No floor — spike detector clear() handles window boundaries
 INTERVALS = [5]               # Only 5-minute windows (faster signal)
 
 # Polymarket fee formula (5m/15m crypto)
