@@ -592,13 +592,13 @@ class Follower:
                 log(f"  ⚠ Buy rejected: {resp}")
                 return False
 
-            if making <= 0:
+            if taking <= 0:
                 log(f"  ⚠ Buy got 0 shares: {resp}")
                 return False
 
-            # FOK fills instantly — making = shares received, taking = USDC spent
-            actual_shares = making
-            actual_cost = taking
+            # FOK: makingAmount = USDC spent, takingAmount = shares received
+            actual_shares = taking
+            actual_cost = making
             fill_price = round(actual_cost / actual_shares, 4) if actual_shares > 0 else 0
 
             log(f"  ✅ FOK filled! {actual_shares:.1f}sh @ ~{fill_price:.3f} "
@@ -711,8 +711,8 @@ class Follower:
             self._cooldowns[side] = time.time()
             return
 
-        # Use FOK market sell — amount in USDC
-        sell_amount = round(shares * sell_price, 4)
+        # Use FOK market sell — amount = shares to sell
+        sell_amount = shares
         max_retries = 3
 
         for attempt in range(max_retries):
@@ -744,10 +744,8 @@ class Follower:
                     self._cooldowns[side] = time.time()
                     return
 
-                # FOK rejected — lower price and retry
+                # FOK rejected — retry (book may have changed)
                 log(f"  ⚠ Sell FOK rejected (attempt {attempt+1}): {resp}")
-                sell_price = round(max(0.01, sell_price - 0.02), 2)
-                sell_amount = round(shares * sell_price, 4)
                 time.sleep(0.5)
 
             except Exception as e:
