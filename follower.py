@@ -66,17 +66,20 @@ MAX_EXPOSURE_PCT = 0.30       # Max 30% of balance at risk
 MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 
 # Spike detection — BTC token price must rise this much this fast
-SPIKE_THRESHOLD = 0.10        # BTC token mid-price jump ≥ 10¢
+SPIKE_THRESHOLD = 0.15        # BTC token mid-price jump ≥ 15¢ (stronger signal)
 SPIKE_WINDOW = 5              # … within 5 seconds
 SPIKE_COOLDOWN = 0            # Cooldown between same-side trades (0 = no limit)
 MAX_SPIKES_PER_WINDOW = 1000  # Max spike entries per 5m window
 
+# Entry quality filter — only buy tokens already trending in our direction
+MIN_ETH_MID = 0.50            # Only buy ETH token if its mid ≥ 50¢ (>50% implied prob)
+
 # Exit conditions
-EXIT_REVERT = 0.10            # Sell ETH when BTC token drops 10¢ from its peak post-entry
-STOP_LOSS = 0.04              # Sell ETH if its price drops 4¢ from entry MID (not ask)
+EXIT_REVERT = 0.15            # Sell ETH when BTC token drops 15¢ from peak (wider = hold longer)
+STOP_LOSS = 0.08              # Sell ETH if its price drops 8¢ from entry MID (wider for settlement)
 TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢
 MAX_HOLD_SECS = 120           # Hard time stop: sell after 2 minutes regardless
-ENTRY_GRACE_SECS = 3          # Don't check stop-loss for first 3s (let position settle)
+ENTRY_GRACE_SECS = 8          # Don't check stop-loss for first 8s (settlement + spread settle)
 
 # Window timing
 MAX_ENTRY_PCT = 0.80          # Only enter in first 80% of window
@@ -672,6 +675,13 @@ class Follower:
                 if not eth_ask or eth_ask <= 0 or (eth_age and eth_age > 5):
                     continue
                 if not eth_bid or eth_bid <= 0:
+                    continue
+
+                # Only trade tokens already trending in our direction
+                eth_mid = (eth_bid + eth_ask) / 2
+                if eth_mid < MIN_ETH_MID:
+                    log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} — "
+                        f"SKIP: ETH {side} mid={eth_mid:.2f} < {MIN_ETH_MID}")
                     continue
 
                 # Check balance
