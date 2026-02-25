@@ -72,21 +72,17 @@ SPIKE_COOLDOWN = 0            # Cooldown between same-side trades (0 = no limit)
 MAX_SPIKES_PER_WINDOW = 3     # Max spike entries per 5m window
 
 # Entry quality filter — only buy tokens already trending in our direction
-MIN_ETH_MID = 0.48            # Only buy ETH token if its mid ≥ 48¢ (was 0.55, blocked all DOWN entries)
-MAX_ETH_MID = 0.90            # Don't buy ETH token if mid ≥ 90¢ (no upside, huge downside)
+MIN_ETH_MID = 0.55            # Only buy ETH token if its mid ≥ 55¢
 MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = bad fills)
-MAX_ETH_ALREADY_MOVED = 0.08  # Skip if ETH already moved >8¢ in last 15s (buying the top)
-BTC_REVERT_ON_SETTLE = 0.08   # If BTC drops >8¢ from spike peak during settlement, bail out
 
 # Exit conditions
 EXIT_REVERT = 0.20            # Sell ETH when BTC token drops 20¢ from peak (emergency only)
 STOP_LOSS = 0.06              # Sell ETH if its price drops 6¢ from FILL price
-EMERGENCY_STOP = 0.15         # INSTANT exit if price drops 15¢ (no grace period)
 TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢
 ETH_TRAIL_STOP = 0.025        # Exit when ETH drops 2.5¢ from peak (tight = lock profits fast)
 ETH_TRAIL_ACTIVATION = 0.01   # Trail activates after just 1¢ gain (scalp small profits)
 MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
-ENTRY_GRACE_SECS = 4          # Don't check stop-loss for first 4s (settlement only)
+ENTRY_GRACE_SECS = 8          # Don't check stop-loss for first 8s (settlement + spread settle)
 
 # Window timing
 MAX_ENTRY_PCT = 0.85          # Enter in first 85% of window (need 45s runway for exit)
@@ -522,16 +518,11 @@ class SpikeDetector:
         # Rolling price history: deque of (timestamp, mid_price)
         self._history_up = deque(maxlen=200)
         self._history_down = deque(maxlen=200)
-        # ETH price history for lag detection
-        self._eth_history_up = deque(maxlen=200)
-        self._eth_history_down = deque(maxlen=200)
 
     def clear(self):
         """Clear all history. Call when window tokens change."""
         self._history_up.clear()
         self._history_down.clear()
-        self._eth_history_up.clear()
-        self._eth_history_down.clear()
 
     def update(self, side, mid_price):
         """Record a new mid-price tick for BTC UP or DOWN token."""
@@ -604,34 +595,6 @@ class SpikeDetector:
                 return price
         return None
 
-    def update_eth(self, side, mid_price):
-        """Record a new ETH mid-price tick."""
-        now = time.time()
-        if side == "UP":
-            self._eth_history_up.append((now, mid_price))
-        else:
-            self._eth_history_down.append((now, mid_price))
-
-    def eth_recent_move(self, side, window=15.0):
-        """How much ETH moved in the last `window` seconds.
-        Returns (change, min_price, current_price) or (0, None, None).
-        Uses MIN price in window (not oldest) so rolling window can't hide big moves."""
-        history = self._eth_history_up if side == "UP" else self._eth_history_down
-        if len(history) < 2:
-            return 0, None, None
-        now = time.time()
-        current_ts, current_price = history[-1]
-        if now - current_ts > 2.0:
-            return 0, None, None
-        min_price = None
-        for ts, price in history:
-            if now - ts <= window:
-                if min_price is None or price < min_price:
-                    min_price = price
-        if min_price is None:
-            return 0, None, None
-        return current_price - min_price, min_price, current_price
-
 
 # =========================================================================
 # FOLLOWER — main trading engine
@@ -697,12 +660,6 @@ class Follower:
                     mid = self.poly.mid_price(btc_token)
                     if mid is not None:
                         self.detector.update(side, mid)
-                # Also track ETH prices for lag detection
-                eth_token = info.get(f"eth_{side.lower()}")
-                if eth_token:
-                    eth_mid = self.poly.mid_price(eth_token)
-                    if eth_mid is not None:
-                        self.detector.update_eth(side, eth_mid)
 
         # ─── Manage open position ───
         if self._position is not None:
@@ -756,24 +713,11 @@ class Follower:
                         f"SKIP: ETH {side} mid={eth_mid:.2f} < {MIN_ETH_MID}")
                     continue
 
-                # Don't buy near certainty — no upside left
-                if eth_mid >= MAX_ETH_MID:
-                    log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} — "
-                        f"SKIP: ETH {side} mid={eth_mid:.2f} >= {MAX_ETH_MID} (no upside)")
-                    continue
-
                 # Skip thin books — wide spread means bad fills
                 eth_spread = eth_ask - eth_bid
                 if eth_spread > MAX_ETH_SPREAD:
                     log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} — "
                         f"SKIP: ETH spread={eth_spread:.3f} > {MAX_ETH_SPREAD}")
-                    continue
-
-                # Skip if ETH already priced in the BTC spike (buying the top)
-                eth_move, _, _ = self.detector.eth_recent_move(side)
-                if eth_move > MAX_ETH_ALREADY_MOVED:
-                    log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} — "
-                        f"SKIP: ETH already moved +{eth_move:.3f} (>{MAX_ETH_ALREADY_MOVED})")
                     continue
 
                 # Check balance & scale bet by entry price
@@ -870,34 +814,6 @@ class Follower:
 
             eth_mid_now = self.poly.mid_price(token_id) or fill_price
             btc_current = self.detector.get_current(side)
-
-            # Post-settlement BTC check: if BTC already reverted during
-            # settlement, bail out immediately — the spike was exhausted
-            btc_at_spike = self.detector.get_peak_since(side, time.time() - 10)
-            if btc_current is not None and btc_at_spike is not None:
-                btc_drop = btc_at_spike - btc_current
-                if btc_drop >= BTC_REVERT_ON_SETTLE:
-                    log(f"  ⚠ BTC reverted {btc_drop:.3f} during settlement "
-                        f"(peak={btc_at_spike:.3f}, now={btc_current:.3f}) — bailing out")
-                    # Sell immediately
-                    self._position = {
-                        "token_id": token_id,
-                        "side": side,
-                        "entry_price": fill_price,
-                        "entry_mid": fill_price,
-                        "shares": actual_shares,
-                        "cost": actual_cost,
-                        "entry_time": time.time(),
-                        "epoch": epoch,
-                        "btc_token": window_info.get(f"btc_{side.lower()}"),
-                        "btc_peak": btc_at_spike,
-                        "eth_peak": fill_price,
-                        "order_id": order_id,
-                        "dry_run": False,
-                    }
-                    self._sell_eth("btc_bail")
-                    return True  # counted as a trade
-
             # Use fill_price as entry_mid (not post-settlement WS mid)
             # The WS mid can inflate during settlement, causing premature stop-loss
             self._position = {
@@ -956,14 +872,7 @@ class Follower:
 
         # ─── Exit checks (in priority order) ───
 
-        # 0. EMERGENCY STOP — no grace period, instant exit on catastrophic drop
-        if price_change <= -EMERGENCY_STOP:
-            log(f"  🚨 EMERGENCY STOP: ETH {side} crashed {price_change:+.3f} from entry "
-                f"(mid={eth_mid:.3f}, entry_mid={entry_mid:.3f})")
-            self._sell_eth("emergency_stop")
-            return
-
-        # 1. Stop loss (with short grace period for settlement)
+        # 1. Stop loss (with grace period to let position settle)
         if price_change <= -STOP_LOSS and hold_secs >= ENTRY_GRACE_SECS:
             log(f"  🛑 STOP LOSS: ETH {side} dropped {price_change:+.3f} from entry_mid "
                 f"(mid={eth_mid:.3f}, entry_mid={entry_mid:.3f})")
