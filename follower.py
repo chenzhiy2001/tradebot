@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Follower Bot — BTC-leads-ETH momentum trading on Polymarket.
+Follower Bot — BTC-leads momentum trading on Polymarket.
 
 Strategy:
-  BTC and ETH crypto up/down markets share the same 5m/15m windows.
-  BTC prices move first; ETH follows with a lag.
+  BTC and other crypto up/down markets share the same 5m/15m windows.
+  BTC prices move first; other cryptos (ETH, SOL, XRP) follow with a lag.
 
-  1. Stream real-time Polymarket order-book data for both BTC and ETH tokens.
+  1. Stream real-time Polymarket order-book data for BTC and follower tokens.
   2. Track the BTC token mid-price in a rolling window.
   3. When BTC's UP (or DOWN) token surges by ≥ SPIKE_THRESHOLD in ≤ SPIKE_WINDOW
-     seconds, immediately buy the SAME side of ETH at the ask.
-  4. After entry, monitor ETH price:
-     - Track ETH peak price; once it rises above entry, engage trailing stop.
-     - If ETH drops from peak by ≥ ETH_TRAIL_STOP, sell (lock in gains).
-     - Hard take-profit if ETH price rises by ≥ TAKE_PROFIT from entry.
+     seconds, immediately buy the SAME side of the best follower crypto at the ask.
+  4. After entry, monitor follower price:
+     - Track peak price; once it rises above entry, engage trailing stop.
+     - If it drops from peak by ≥ trail distance, sell (lock in gains).
+     - Hard take-profit if price rises by ≥ TAKE_PROFIT from entry.
      - Time stop: sell after MAX_HOLD_SECS regardless.
   5. Only trade within the first MAX_ENTRY_PCT of each window (need room to exit).
 
@@ -21,7 +21,7 @@ Exits:
   Sell at best_bid (market sell) — NOT at $0.99 like sniper.py.
   This is intra-window momentum, not hold-to-resolution.
 
-Pairs: BTC leads → ETH follows (same window, same side).
+Pairs: BTC leads → ETH/SOL/XRP follow (same window, same side).
 """
 
 import os
@@ -67,14 +67,18 @@ SPIKE_THRESHOLD = 0.10        # BTC token mid-price jump ≥ 10¢ (match manual 
 SPIKE_WINDOW = 10             # … within 10 seconds
 MAX_SPIKES_PER_WINDOW = 3     # Max spike entries per 5m window
 
+# Leader/follower crypto configuration
+LEADER = "btc"                # Leader crypto (spike detection)
+FOLLOWERS = ["eth", "sol", "xrp"]  # Follower cryptos (buy on leader spike)
+
 # Entry quality filter — avoid very cheap tokens that can go to zero
-MIN_ETH_MID = 0.30            # Only buy ETH token if its mid ≥ 30¢ (avoid cheap wipeouts)
-MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = bad fills)
+MIN_FOLLOWER_MID = 0.30       # Only buy follower token if its mid ≥ 30¢
+MAX_FOLLOWER_SPREAD = 0.06    # Skip if bid-ask spread > 6¢ (thin book = bad fills)
 
 # Exit conditions
 TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢
-ETH_TRAIL_STOP = 0.03         # Minimum trail: exit when ETH drops 3¢ from peak
-ETH_TRAIL_PCT = 0.40          # Dynamic trail: allow 40% retracement of gain (keep 60%)
+TRAIL_STOP = 0.03             # Minimum trail: exit when price drops 3¢ from peak
+TRAIL_PCT = 0.40              # Dynamic trail: allow 40% retracement of gain (keep 60%)
 MIN_PROFIT_TARGET = 1.0       # Trail only activates after $1+ unrealized profit
 MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
 NO_GAIN_EXIT_SECS = 30        # If no gain after 30s, thesis is wrong — exit early
@@ -491,8 +495,9 @@ class PolymarketFeed:
 # MARKET DISCOVERY
 # =========================================================================
 def discover_markets():
-    """Fetch current active BTC and ETH 5m markets from Polymarket."""
-    result = {}  # epoch -> {btc_up, btc_down, eth_up, eth_down, start, end, interval}
+    """Fetch current active BTC and follower crypto 5m markets from Polymarket."""
+    all_cryptos = [LEADER] + FOLLOWERS
+    result = {}  # epoch -> {btc_up, btc_down, eth_up, eth_down, sol_up, ...}
     now = datetime.now(timezone.utc)
 
     for interval in INTERVALS:
@@ -500,7 +505,7 @@ def discover_markets():
         window_start = now.replace(minute=aligned, second=0, microsecond=0)
         epoch = int(window_start.timestamp())
 
-        for crypto in ["btc", "eth"]:
+        for crypto in all_cryptos:
             slug = f"{crypto}-updown-{interval}m-{epoch}"
             try:
                 resp = requests.get(f"{GAMMA_API}/events/slug/{slug}", timeout=10)
@@ -529,12 +534,18 @@ def discover_markets():
             except Exception:
                 pass
 
-    # Only return windows where we have BOTH btc and eth tokens
+    # Need leader tokens + at least one follower
+    leader_keys = [f"{LEADER}_up", f"{LEADER}_down"]
     complete = {}
     for epoch, info in result.items():
-        if all(k in info for k in ["btc_up", "btc_down", "eth_up", "eth_down"]):
-            if now < info["end"]:  # not expired
-                complete[epoch] = info
+        if not all(k in info for k in leader_keys):
+            continue
+        # Need at least one follower
+        has_follower = any(
+            f"{f}_up" in info and f"{f}_down" in info for f in FOLLOWERS
+        )
+        if has_follower and now < info["end"]:
+            complete[epoch] = info
     return complete
 
 
@@ -632,7 +643,7 @@ class SpikeDetector:
 # FOLLOWER — main trading engine
 # =========================================================================
 class Follower:
-    """Monitor BTC spikes, trade ETH tokens."""
+    """Monitor BTC spikes, trade follower crypto tokens."""
 
     def __init__(self, poly):
         self.poly = poly
@@ -653,12 +664,12 @@ class Follower:
         # Detect if BTC tokens changed (new window) → clear spike history
         old_btc = set()
         for info in self._windows.values():
-            for k in ["btc_up", "btc_down"]:
+            for k in [f"{LEADER}_up", f"{LEADER}_down"]:
                 if k in info:
                     old_btc.add(info[k])
         new_btc = set()
         for info in markets.values():
-            for k in ["btc_up", "btc_down"]:
+            for k in [f"{LEADER}_up", f"{LEADER}_down"]:
                 if k in info:
                     new_btc.add(info[k])
         if new_btc != old_btc:
@@ -669,8 +680,8 @@ class Follower:
         self._windows = markets
         all_tokens = []
         for epoch, info in markets.items():
-            for k in ["btc_up", "btc_down", "eth_up", "eth_down"]:
-                if k in info:
+            for k in info:
+                if k.endswith("_up") or k.endswith("_down"):
                     all_tokens.append(info[k])
         if all_tokens:
             self.poly.subscribe(all_tokens)
@@ -680,16 +691,16 @@ class Follower:
         now = time.time()
         now_utc = datetime.now(timezone.utc)
 
-        # ─── Update BTC price tracking ───
+        # ─── Update leader price tracking ───
         for epoch, info in list(self._windows.items()):
             # Skip expired windows
             if now_utc >= info["end"]:
                 continue
 
             for side in ["UP", "DOWN"]:
-                btc_token = info.get(f"btc_{side.lower()}")
-                if btc_token:
-                    mid = self.poly.mid_price(btc_token)
+                leader_token = info.get(f"{LEADER}_{side.lower()}")
+                if leader_token:
+                    mid = self.poly.mid_price(leader_token)
                     if mid is not None:
                         self.detector.update(side, mid)
 
@@ -698,7 +709,7 @@ class Follower:
             self._manage_position()
             return  # Don't open new positions while one is active
 
-        # ─── Scan for BTC spikes → enter ETH ───
+        # ─── Scan for leader spikes → enter best follower ───
         for epoch, info in list(self._windows.items()):
             if now_utc >= info["end"]:
                 continue
@@ -717,39 +728,55 @@ class Follower:
                 if not is_spike:
                     continue
 
-                # BTC spike detected! Check window trade limit
+                # Leader spike detected! Check window trade limit
                 wnd_trades = self._window_trade_count.get(epoch, 0)
                 if wnd_trades >= MAX_SPIKES_PER_WINDOW:
                     continue  # Already traded enough in this window
 
-                # Check ETH token
-                eth_token = info.get(f"eth_{side.lower()}")
-                if not eth_token:
-                    continue
+                # Find the best follower crypto to buy
+                # Pick the first one with valid price/spread
+                best_token = None
+                best_crypto = None
+                best_mid = None
+                skip_reasons = []
 
-                # Skip if we just sold this same token (settlement overlap)
-                last_sold_time = self._cooldowns.get(eth_token, 0)
-                if now - last_sold_time < TOKEN_COOLDOWN_SECS:
-                    continue
+                for crypto in FOLLOWERS:
+                    token = info.get(f"{crypto}_{side.lower()}")
+                    if not token:
+                        continue
 
-                eth_bid, eth_ask, eth_age = self.poly.get_price(eth_token)
-                if not eth_ask or eth_ask <= 0 or (eth_age and eth_age > 5):
-                    continue
-                if not eth_bid or eth_bid <= 0:
-                    continue
+                    # Skip if we just sold this same token (settlement overlap)
+                    last_sold_time = self._cooldowns.get(token, 0)
+                    if now - last_sold_time < TOKEN_COOLDOWN_SECS:
+                        skip_reasons.append(f"{crypto.upper()}: cooldown")
+                        continue
 
-                # Only trade tokens already trending in our direction
-                eth_mid = (eth_bid + eth_ask) / 2
-                if eth_mid < MIN_ETH_MID:
-                    log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} — "
-                        f"SKIP: ETH {side} mid={eth_mid:.2f} < {MIN_ETH_MID}")
-                    continue
+                    bid, ask, age = self.poly.get_price(token)
+                    if not ask or ask <= 0 or (age and age > 5):
+                        continue
+                    if not bid or bid <= 0:
+                        continue
 
-                # Skip thin books — wide spread means bad fills
-                eth_spread = eth_ask - eth_bid
-                if eth_spread > MAX_ETH_SPREAD:
-                    log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} — "
-                        f"SKIP: ETH spread={eth_spread:.3f} > {MAX_ETH_SPREAD}")
+                    mid = (bid + ask) / 2
+                    if mid < MIN_FOLLOWER_MID:
+                        skip_reasons.append(f"{crypto.upper()} mid={mid:.2f}<{MIN_FOLLOWER_MID}")
+                        continue
+
+                    spread = ask - bid
+                    if spread > MAX_FOLLOWER_SPREAD:
+                        skip_reasons.append(f"{crypto.upper()} spread={spread:.3f}>{MAX_FOLLOWER_SPREAD}")
+                        continue
+
+                    # Valid candidate — take the first good one
+                    best_token = token
+                    best_crypto = crypto
+                    best_mid = mid
+                    break
+
+                if not best_token:
+                    if skip_reasons:
+                        log(f"  ⚡ {LEADER.upper()} {side} SPIKE: +{change:.3f} — "
+                            f"SKIP: {', '.join(skip_reasons)}")
                     continue
 
                 # Check balance — go all-in (compounding)
@@ -760,39 +787,41 @@ class Follower:
                 if bet < MIN_BET:
                     continue
 
-                log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} in {SPIKE_WINDOW}s "
+                log(f"  ⚡ {LEADER.upper()} {side} SPIKE: +{change:.3f} in {SPIKE_WINDOW}s "
                     f"(btc_mid={btc_price:.3f})")
-                log(f"  🎯 Buying ETH {side} @ market | "
+                log(f"  🎯 Buying {best_crypto.upper()} {side} @ market | "
                     f"bet=${bet:.0f} | window {pct:.0%} elapsed")
 
-                success = self._buy_eth(
-                    eth_token, side, bet, epoch, info
+                success = self._buy_follower(
+                    best_token, best_crypto, side, bet, epoch, info
                 )
                 if success:
                     self._window_trade_count[epoch] = wnd_trades + 1
                     return  # Only one position at a time
 
-    def _buy_eth(self, token_id, side, bet, epoch, window_info):
-        """FOK market buy on ETH token. Returns True if filled."""
+    def _buy_follower(self, token_id, crypto, side, bet, epoch, window_info):
+        """FOK market buy on follower token. Returns True if filled."""
 
-        log(f"  💰 Buying ETH {side}: ${bet:.0f} FOK market order")
+        crypto_label = crypto.upper()
+        log(f"  💰 Buying {crypto_label} {side}: ${bet:.0f} FOK market order")
 
         if DRY_RUN:
-            eth_mid = self.poly.mid_price(token_id) or 0.50
-            est_shares = bet / eth_mid if eth_mid > 0 else 0
-            log(f"  🧪 DRY RUN — ~{est_shares:.0f}sh @ ~{eth_mid:.2f}")
+            mid = self.poly.mid_price(token_id) or 0.50
+            est_shares = bet / mid if mid > 0 else 0
+            log(f"  🧪 DRY RUN — ~{est_shares:.0f}sh @ ~{mid:.2f}")
             self._position = {
                 "token_id": token_id,
+                "crypto": crypto,
                 "side": side,
-                "entry_price": eth_mid,
-                "entry_mid": eth_mid,
+                "entry_price": mid,
+                "entry_mid": mid,
                 "shares": est_shares,
                 "cost": bet,
                 "entry_time": time.time(),
                 "epoch": epoch,
-                "btc_token": window_info.get(f"btc_{side.lower()}"),
+                "btc_token": window_info.get(f"{LEADER}_{side.lower()}"),
                 "btc_peak": self.detector.get_current(side) or 0,
-                "eth_peak": eth_mid,
+                "peak": mid,
                 "dry_run": True,
             }
             return True
@@ -855,6 +884,7 @@ class Follower:
             # The WS mid can inflate during settlement, causing premature stop-loss
             self._position = {
                 "token_id": token_id,
+                "crypto": crypto,
                 "side": side,
                 "entry_price": fill_price,
                 "entry_mid": fill_price,
@@ -862,9 +892,9 @@ class Follower:
                 "cost": actual_cost,
                 "entry_time": time.time(),
                 "epoch": epoch,
-                "btc_token": window_info.get(f"btc_{side.lower()}"),
+                "btc_token": window_info.get(f"{LEADER}_{side.lower()}"),
                 "btc_peak": btc_current or fill_price,
-                "eth_peak": fill_price,
+                "peak": fill_price,
                 "order_id": order_id,
                 "dry_run": False,
             }
@@ -875,7 +905,7 @@ class Follower:
             return False
 
     def _manage_position(self):
-        """Check exit conditions for the open ETH position."""
+        """Check exit conditions for the open position."""
         pos = self._position
         if pos is None:
             return
@@ -883,90 +913,91 @@ class Follower:
         now = time.time()
         hold_secs = now - pos["entry_time"]
         side = pos["side"]
+        crypto_label = pos.get("crypto", "eth").upper()
 
-        # Get current ETH price
-        eth_bid, eth_ask, eth_age = self.poly.get_price(pos["token_id"])
-        if not eth_bid or eth_bid <= 0:
+        # Get current follower price
+        bid, ask, age = self.poly.get_price(pos["token_id"])
+        if not bid or bid <= 0:
             # No price data — keep holding unless time expired
             if hold_secs > MAX_HOLD_SECS:
-                log(f"  ⏰ TIME STOP: held {hold_secs:.0f}s, no ETH price — forcing exit")
-                self._sell_eth("time_stop_no_price")
+                log(f"  ⏰ TIME STOP: held {hold_secs:.0f}s, no {crypto_label} price — forcing exit")
+                self._sell_position("time_stop_no_price")
             return
 
-        eth_mid = (eth_bid + (eth_ask or eth_bid)) / 2.0
+        mid = (bid + (ask or bid)) / 2.0
         # Compare mid-to-mid (not mid vs ask) to avoid spread triggering stop-loss
         entry_mid = pos.get("entry_mid", pos["entry_price"])
-        price_change = eth_mid - entry_mid
+        price_change = mid - entry_mid
 
         # Update BTC peak
         btc_current = self.detector.get_current(side)
         if btc_current is not None and btc_current > pos["btc_peak"]:
             pos["btc_peak"] = btc_current
 
-        # Update ETH peak (for trailing stop) — only after grace period
+        # Update peak (for trailing stop) — only after grace period
         # During grace (settlement), prices are noisy; tracking peak there
         # causes trail to fire immediately when grace ends
         if hold_secs >= ENTRY_GRACE_SECS:
-            if eth_mid > pos.get("eth_peak", 0):
-                pos["eth_peak"] = eth_mid
+            if mid > pos.get("peak", 0):
+                pos["peak"] = mid
 
         # ─── Exit checks (in priority order) ───
 
         # 1. Take profit
         if price_change >= TAKE_PROFIT:
-            log(f"  🎉 TAKE PROFIT: ETH {side} gained {price_change:+.3f} "
-                f"(mid={eth_mid:.3f}, entry={pos['entry_price']:.2f})")
-            self._sell_eth("take_profit")
+            log(f"  🎉 TAKE PROFIT: {crypto_label} {side} gained {price_change:+.3f} "
+                f"(mid={mid:.3f}, entry={pos['entry_price']:.2f})")
+            self._sell_position("take_profit")
             return
 
-        # 2. ETH trailing stop — lock in gains when ETH reverses from peak
+        # 2. Trailing stop — lock in gains when price reverses from peak
         #    Only activates when unrealized $ profit ≥ MIN_PROFIT_TARGET ($1)
-        #    Trail distance = max(ETH_TRAIL_STOP, ETH_TRAIL_PCT * gain)
+        #    Trail distance = max(TRAIL_STOP, TRAIL_PCT * gain)
         if hold_secs >= ENTRY_GRACE_SECS:
-            eth_peak = pos.get("eth_peak", eth_mid)
-            gain_from_entry = eth_peak - entry_mid
+            peak = pos.get("peak", mid)
+            gain_from_entry = peak - entry_mid
             shares = pos.get("shares", 0)
             unrealized_profit = shares * gain_from_entry
             if unrealized_profit >= MIN_PROFIT_TARGET:
-                trail_distance = max(ETH_TRAIL_STOP, ETH_TRAIL_PCT * gain_from_entry)
-                eth_drop_from_peak = eth_peak - eth_mid
-                if eth_drop_from_peak >= trail_distance:
-                    log(f"  📉 ETH TRAIL: {side} dropped {eth_drop_from_peak:.3f} from peak "
-                        f"(peak={eth_peak:.3f}, now={eth_mid:.3f}, entry={entry_mid:.3f}, "
+                trail_distance = max(TRAIL_STOP, TRAIL_PCT * gain_from_entry)
+                drop_from_peak = peak - mid
+                if drop_from_peak >= trail_distance:
+                    log(f"  📉 TRAIL: {crypto_label} {side} dropped {drop_from_peak:.3f} from peak "
+                        f"(peak={peak:.3f}, now={mid:.3f}, entry={entry_mid:.3f}, "
                         f"trail={trail_distance:.3f}, profit=${unrealized_profit:.2f})")
-                    self._sell_eth("eth_trail")
+                    self._sell_position("trail")
                     return
 
-        # 3. No-momentum exit — if ETH never gained, thesis is wrong
+        # 3. No-momentum exit — if never gained, thesis is wrong
         #    Two triggers (both require trail never activated):
         #    a) After grace period: down 10¢+ from entry → exit immediately
         #    b) After 30s: still no gain → exit
         if hold_secs >= ENTRY_GRACE_SECS:
-            eth_peak = pos.get("eth_peak", entry_mid)
+            peak = pos.get("peak", entry_mid)
             shares = pos.get("shares", 0)
-            peak_profit = shares * (eth_peak - entry_mid)
+            peak_profit = shares * (peak - entry_mid)
             no_gain = peak_profit < MIN_PROFIT_TARGET
-            drawdown = entry_mid - eth_mid
+            drawdown = entry_mid - mid
             if no_gain and drawdown >= NO_GAIN_MAX_DRAWDOWN:
-                log(f"  ❌ NO GAIN DRAWDOWN: {side} down {drawdown:.3f} with no gain "
-                    f"(entry={entry_mid:.3f}, now={eth_mid:.3f}, peak={eth_peak:.3f})")
-                self._sell_eth("no_gain")
+                log(f"  ❌ NO GAIN DRAWDOWN: {crypto_label} {side} down {drawdown:.3f} with no gain "
+                    f"(entry={entry_mid:.3f}, now={mid:.3f}, peak={peak:.3f})")
+                self._sell_position("no_gain")
                 return
             if hold_secs >= NO_GAIN_EXIT_SECS and no_gain:
-                log(f"  ❌ NO GAIN: {side} held {hold_secs:.0f}s, peak only "
-                    f"{eth_peak - entry_mid:+.3f} above entry "
-                    f"(entry={entry_mid:.3f}, now={eth_mid:.3f})")
-                self._sell_eth("no_gain")
+                log(f"  ❌ NO GAIN: {crypto_label} {side} held {hold_secs:.0f}s, peak only "
+                    f"{peak - entry_mid:+.3f} above entry "
+                    f"(entry={entry_mid:.3f}, now={mid:.3f})")
+                self._sell_position("no_gain")
                 return
 
         # 4. Time stop
         if hold_secs > MAX_HOLD_SECS:
-            log(f"  ⏰ TIME STOP: held {hold_secs:.0f}s (ETH change={price_change:+.3f})")
-            self._sell_eth("time_stop")
+            log(f"  ⏰ TIME STOP: {crypto_label} {side} held {hold_secs:.0f}s (change={price_change:+.3f})")
+            self._sell_position("time_stop")
             return
 
-    def _sell_eth(self, reason):
-        """FOK market sell of ETH position."""
+    def _sell_position(self, reason):
+        """FOK market sell of open position."""
         pos = self._position
         if pos is None:
             return
@@ -974,11 +1005,12 @@ class Follower:
         token_id = pos["token_id"]
         shares = pos["shares"]
         side = pos["side"]
+        crypto_label = pos.get("crypto", "eth").upper()
 
-        eth_bid, _, _ = self.poly.get_price(token_id)
-        sell_price = round(eth_bid, 2) if eth_bid and eth_bid > 0 else 0.01
+        bid, _, _ = self.poly.get_price(token_id)
+        sell_price = round(bid, 2) if bid and bid > 0 else 0.01
 
-        log(f"  📤 Selling ETH {side}: {shares:.1f}sh @ ~{sell_price:.2f} FOK ({reason})")
+        log(f"  📤 Selling {crypto_label} {side}: {shares:.1f}sh @ ~{sell_price:.2f} FOK ({reason})")
 
         if pos.get("dry_run"):
             fee = compute_taker_fee(shares, sell_price)
@@ -1076,6 +1108,7 @@ class Follower:
 
         entry = {
             "time": datetime.now(timezone.utc).isoformat(),
+            "crypto": pos.get("crypto", "eth"),
             "side": pos["side"],
             "entry_price": pos["entry_price"],
             "exit_price": sell_price,
@@ -1115,7 +1148,8 @@ class Follower:
             change = eth_mid - entry_mid
             btc_now = self.detector.get_current(pos["side"])
             btc_drop = (pos["btc_peak"] - btc_now) if btc_now else 0
-            return (f"HOLDING ETH {pos['side']} | entry={pos['entry_price']:.2f} "
+            crypto_label = pos.get('crypto', 'ETH').upper()
+            return (f"HOLDING {crypto_label} {pos['side']} | entry={pos['entry_price']:.2f} "
                     f"now={eth_mid:.3f} Δ{change:+.3f} | "
                     f"BTC peak={pos['btc_peak']:.3f} drop={btc_drop:.3f} | "
                     f"hold={hold:.0f}s/{MAX_HOLD_SECS}s")
@@ -1132,9 +1166,10 @@ class Follower:
 def main():
     mode = "DRY" if DRY_RUN else "LIVE"
     log(f"═══ Follower Bot ═══ [{mode}]")
-    log(f"Strategy: BTC spike → buy ETH same side → sell on BTC revert")
+    followers_str = ','.join(f.upper() for f in FOLLOWERS)
+    log(f"Strategy: {LEADER.upper()} spike → buy {followers_str} same side → sell on revert")
     log(f"Params: ALL-IN SPIKE={SPIKE_THRESHOLD:.2f}/{SPIKE_WINDOW}s "
-        f"TRAIL={ETH_TRAIL_STOP}/{ETH_TRAIL_PCT:.0%}retr/min${MIN_PROFIT_TARGET} TP={TAKE_PROFIT}")
+        f"TRAIL={TRAIL_STOP}/{TRAIL_PCT:.0%}retr/min${MIN_PROFIT_TARGET} TP={TAKE_PROFIT}")
     log(f"NoGain: {NO_GAIN_EXIT_SECS}s / drawdown={NO_GAIN_MAX_DRAWDOWN}")
     log(f"Windows: {INTERVALS}m | Max hold: {MAX_HOLD_SECS}s")
     log("")
@@ -1181,30 +1216,31 @@ def main():
             pm_status = "🟢" if poly.connected else "🔴"
             status = follower.get_status()
 
-            # Show BTC + ETH prices
+            # Show leader + follower prices
             btc_up = follower.detector.get_current("UP")
             btc_down = follower.detector.get_current("DOWN")
-            btc_str = ""
+            leader_str = ""
             if btc_up:
-                btc_str += f"BTC_UP={btc_up:.3f} "
+                leader_str += f"{LEADER.upper()}_UP={btc_up:.3f} "
             if btc_down:
-                btc_str += f"BTC_DOWN={btc_down:.3f}"
+                leader_str += f"{LEADER.upper()}_DOWN={btc_down:.3f}"
 
-            eth_str = ""
+            follower_str = ""
             for epoch, info in follower._windows.items():
-                for side_label in ["up", "down"]:
-                    eth_tok = info.get(f"eth_{side_label}")
-                    if eth_tok:
-                        mid = poly.mid_price(eth_tok)
-                        if mid:
-                            eth_str += f"ETH_{side_label.upper()}={mid:.3f} "
+                for crypto in FOLLOWERS:
+                    for side_label in ["up", "down"]:
+                        tok = info.get(f"{crypto}_{side_label}")
+                        if tok:
+                            mid = poly.mid_price(tok)
+                            if mid:
+                                follower_str += f"{crypto.upper()}_{side_label.upper()}={mid:.3f} "
                 break  # only show current window
 
             print(f"\033[2J\033[H", end="")
             print(f"═══ Follower Bot [{mode}] ═══  {now_str} UTC  │  Polymarket {pm_status}")
             print(f"{'─' * 80}")
-            print(f"  {btc_str}")
-            print(f"  {eth_str}")
+            print(f"  {leader_str}")
+            print(f"  {follower_str}")
             print(f"  {status}")
             print(f"{'─' * 80}")
             print(f"  Trades: {follower._trade_count} | "
@@ -1220,7 +1256,7 @@ def main():
             # If we have an open position, try to close it
             if follower._position and not follower._position.get("dry_run"):
                 log("  Closing open position...")
-                follower._sell_eth("shutdown")
+                follower._sell_position("shutdown")
             # Wait for background sell worker to finish
             if follower._sell_worker.pending > 0:
                 log(f"  Draining {follower._sell_worker.pending} background sell(s)...")
