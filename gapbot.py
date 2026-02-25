@@ -66,19 +66,19 @@ MAX_BET = 50
 BET_PCT = 0.90                # Bet 90% of balance
 
 # Gap detection — the core edge
-MIN_BTC_MOVE = 0.08           # BTC must move ≥ 8¢ in the lookback window
-MIN_GAP = 0.04                # Follower must still lag by ≥ 4¢ (unexploited edge)
-LOOKBACK_SECS = 8             # Measure moves over this window
-MIN_CONSECUTIVE = 3           # BTC must tick in same direction ≥ 3 times (sustained)
+MIN_BTC_MOVE = 0.06           # BTC must move ≥ 6¢ in the lookback window
+MIN_GAP = 0.03                # Follower must still lag by ≥ 3¢ (unexploited edge)
+LOOKBACK_SECS = 10            # Measure moves over this window
+MIN_CONSECUTIVE = 2           # BTC must tick in same direction ≥ 2 times (sustained)
 
 # Leader/follower config
 LEADER = "btc"
 FOLLOWERS = ["eth", "sol", "xrp"]
 
 # Entry quality filters
-MIN_MID = 0.30                # Only buy if follower mid ≥ 30¢
-MAX_MID = 0.55                # Only buy if follower mid ≤ 55¢ (favorable zone)
-MAX_SPREAD = 0.05             # Skip if spread > 5¢
+MIN_MID = 0.25                # Only buy if follower mid ≥ 25¢
+MAX_MID = 0.65                # Only buy if follower mid ≤ 65¢ (favorable zone)
+MAX_SPREAD = 0.06             # Skip if spread > 6¢
 MAX_TRADES_PER_WINDOW = 3
 
 # Exit conditions
@@ -713,18 +713,31 @@ class GapBot:
                 btc_move, btc_now = self.tracker.get_move(
                     f"{LEADER}_{side_label}", LOOKBACK_SECS
                 )
-                if btc_move is None or btc_move < MIN_BTC_MOVE:
+                if btc_move is None:
                     continue
 
                 # BTC must show sustained momentum (not oscillation)
                 consec_count, consec_dir = self.tracker.get_consecutive_direction(
                     f"{LEADER}_{side_label}"
                 )
+
+                # Diagnostic: log significant BTC moves that don't pass all filters
+                if btc_move >= 0.04 and (btc_move < MIN_BTC_MOVE or consec_count < MIN_CONSECUTIVE or consec_dir != 1):
+                    skip_why = []
+                    if btc_move < MIN_BTC_MOVE:
+                        skip_why.append(f"move={btc_move:.3f}<{MIN_BTC_MOVE}")
+                    if consec_count < MIN_CONSECUTIVE:
+                        skip_why.append(f"consec={consec_count}<{MIN_CONSECUTIVE}")
+                    if consec_dir != 1:
+                        skip_why.append(f"dir={consec_dir}")
+                    self._log_diagnostic(
+                        f"BTC {side} near-miss: move={btc_move:.3f} consec={consec_count} "
+                        f"dir={consec_dir} — {', '.join(skip_why)}"
+                    )
+
+                if btc_move < MIN_BTC_MOVE:
+                    continue
                 if consec_count < MIN_CONSECUTIVE or consec_dir != 1:
-                    # direction != +1 means price going DOWN, not UP
-                    # (we always measure "up" movement for the UP token,
-                    #  and "up" movement for the DOWN token — both should be +1
-                    #  since we're looking at the token price, not the underlying)
                     continue
 
                 # Now find the best follower with the largest gap
@@ -747,6 +760,14 @@ class GapBot:
 
                     # The gap: how much follower HASN'T caught up
                     gap = btc_move - fol_move
+
+                    # Diagnostic: log gaps that are close but not enough
+                    if gap > 0.01 and gap < MIN_GAP:
+                        self._log_diagnostic(
+                            f"  {crypto.upper()} {side} gap={gap:.3f} < {MIN_GAP} "
+                            f"(btc={btc_move:.3f}, fol={fol_move:.3f})"
+                        )
+
                     if gap < MIN_GAP:
                         continue
 
@@ -1080,6 +1101,17 @@ class GapBot:
         log(f"  📊 Trade #{self._trade_count}: {result} ${pnl:+.2f} | "
             f"session {self._win_count}/{self._trade_count} | "
             f"cumulative ${self._total_pnl:+.2f}")
+
+    def _log_diagnostic(self, msg):
+        """Throttled diagnostic logging — max once per 5 seconds per msg prefix."""
+        now = time.time()
+        if not hasattr(self, '_diag_log_times'):
+            self._diag_log_times = {}
+        # Use first 30 chars as key to avoid flooding
+        key = msg[:30]
+        if now - self._diag_log_times.get(key, 0) >= 5.0:
+            self._diag_log_times[key] = now
+            log(f"  🔍 {msg}")
 
     def get_status(self):
         if self._position:
