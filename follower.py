@@ -816,13 +816,6 @@ class Follower:
             return True
 
         try:
-            # Refresh USDC balance/allowance cache on the exchange
-            client.update_balance_allowance(
-                params=BalanceAllowanceParams(
-                    asset_type=AssetType.COLLATERAL, token_id="", signature_type=1
-                )
-            )
-
             market_order = MarketOrderArgs(
                 token_id=token_id,
                 amount=bet,
