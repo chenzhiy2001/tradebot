@@ -756,7 +756,7 @@ class Follower:
                 balance = get_usdc_balance()
                 if balance is None:
                     continue
-                bet = min(BET_AMOUNT, balance * MAX_EXPOSURE_PCT)
+                bet = int(min(BET_AMOUNT, balance * MAX_EXPOSURE_PCT))
                 if bet < MIN_BET:
                     continue
 
