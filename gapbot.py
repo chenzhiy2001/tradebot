@@ -83,9 +83,9 @@ MAX_TRADES_PER_WINDOW = 3
 
 # Exit conditions
 STOP_LOSS = 0.05              # Hard stop: exit if down 5¢ from entry (no grace)
-TRAIL_ACTIVATE = 0.04         # Start trailing after 4¢ gain
+TRAIL_ACTIVATE = 0.08         # Start trailing after 8¢ gain (don't lock in tiny profits)
 TRAIL_PCT = 0.40              # Trail: allow 40% retracement (keep 60%)
-TRAIL_MIN = 0.02              # Minimum trail distance: 2¢
+TRAIL_MIN = 0.03              # Minimum trail distance: 3¢
 TAKE_PROFIT = 0.95            # Hard TP
 MAX_HOLD_SECS = 60            # Shorter hold — edge decays fast
 SETTLEMENT_SECS = 5           # Wait this long after buy before checking exits
