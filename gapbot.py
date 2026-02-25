@@ -68,6 +68,7 @@ BET_PCT = 0.90                # Bet 90% of balance
 # Gap detection — the core edge
 MIN_BTC_MOVE = 0.06           # BTC must move ≥ 6¢ in the lookback window
 MIN_GAP = 0.03                # Follower must still lag by ≥ 3¢ (unexploited edge)
+MIN_FOL_MOVE = 0.02           # Follower must already be moving ≥ 2¢ same direction (confirms it IS following)
 LOOKBACK_SECS = 10            # Measure moves over this window
 
 # Leader/follower config
@@ -742,6 +743,17 @@ class GapBot:
                     if fol_move is None or fol_now is None:
                         continue
 
+                    # Follower must already be moving in the same direction
+                    # This confirms the lag is real (follower IS following, just slower)
+                    # Without this, we'd enter when the follower isn't moving at all
+                    if fol_move < MIN_FOL_MOVE:
+                        if fol_move >= 0 and btc_move >= MIN_BTC_MOVE:
+                            self._log_diagnostic(
+                                f"  {crypto.upper()} {side} fol_move={fol_move:.3f}<{MIN_FOL_MOVE} "
+                                f"(btc={btc_move:.3f}, gap={btc_move - fol_move:.3f})"
+                            )
+                        continue
+
                     # The gap: how much follower HASN'T caught up
                     gap = btc_move - fol_move
 
@@ -1125,7 +1137,7 @@ def main():
     log(f"═══ GapBot ═══ [{mode}]")
     log(f"Strategy: {LEADER.upper()} → {followers_str} gap-based lag trading")
     log(f"Entry: BTC move ≥{MIN_BTC_MOVE}, gap ≥{MIN_GAP}, "
-        f"lookback {LOOKBACK_SECS}s")
+        f"fol move ≥{MIN_FOL_MOVE}, lookback {LOOKBACK_SECS}s")
     log(f"Price zone: [{MIN_MID}, {MAX_MID}] | spread ≤{MAX_SPREAD}")
     log(f"Exit: stop={STOP_LOSS}, trail after +{TRAIL_ACTIVATE} "
         f"({TRAIL_PCT:.0%} retr, min {TRAIL_MIN}), TP={TAKE_PROFIT}, "
