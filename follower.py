@@ -72,7 +72,8 @@ SPIKE_COOLDOWN = 0            # Cooldown between same-side trades (0 = no limit)
 MAX_SPIKES_PER_WINDOW = 2     # Max spike entries per 5m window (avoid whipsaw)
 
 # Entry quality filter — only buy tokens already trending in our direction
-MIN_ETH_MID = 0.50            # Only buy ETH token if its mid ≥ 50¢ (>50% implied prob)
+MIN_ETH_MID = 0.65            # Only buy ETH token if its mid ≥ 65¢ (data: 7W/11T +$4.29)
+MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = bad fills)
 
 # Exit conditions
 EXIT_REVERT = 0.20            # Sell ETH when BTC token drops 20¢ from peak (emergency only)
@@ -712,11 +713,22 @@ class Follower:
                         f"SKIP: ETH {side} mid={eth_mid:.2f} < {MIN_ETH_MID}")
                     continue
 
-                # Check balance
+                # Skip thin books — wide spread means bad fills
+                eth_spread = eth_ask - eth_bid
+                if eth_spread > MAX_ETH_SPREAD:
+                    log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} — "
+                        f"SKIP: ETH spread={eth_spread:.3f} > {MAX_ETH_SPREAD}")
+                    continue
+
+                # Check balance & scale bet by entry price
                 balance = get_usdc_balance()
                 if balance is None:
                     continue
-                bet = min(BET_AMOUNT, balance * MAX_EXPOSURE_PCT)
+                # Higher entry price = more conviction = bigger bet
+                # 0.65 → $10, 0.80 → $15, 0.90+ → $20
+                price_scale = min(2.0, max(1.0, (eth_mid - 0.50) / 0.30 + 0.5))
+                base_bet = BET_AMOUNT * price_scale
+                bet = max(MIN_BET, min(MAX_BET, base_bet, balance * MAX_EXPOSURE_PCT))
                 if bet < MIN_BET:
                     continue
 
