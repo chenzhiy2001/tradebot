@@ -68,7 +68,7 @@ SPIKE_WINDOW = 5              # … within 5 seconds
 MAX_SPIKES_PER_WINDOW = 3     # Max spike entries per 5m window
 
 # Entry quality filter — avoid very cheap tokens that can go to zero
-MIN_ETH_MID = 0.35            # Only buy ETH token if its mid ≥ 35¢ (avoid sub-30¢ wipeouts)
+MIN_ETH_MID = 0.30            # Only buy ETH token if its mid ≥ 30¢ (avoid cheap wipeouts)
 MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = bad fills)
 
 # Exit conditions
