@@ -66,23 +66,25 @@ MAX_EXPOSURE_PCT = 0.30       # Max 30% of balance at risk
 MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 
 # Spike detection — BTC token price must rise this much this fast
-SPIKE_THRESHOLD = 0.15        # BTC token mid-price jump ≥ 15¢ (stronger signal)
+SPIKE_THRESHOLD = 0.18        # BTC token mid-price jump ≥ 18¢ (very strong signal only)
 SPIKE_WINDOW = 5              # … within 5 seconds
 SPIKE_COOLDOWN = 0            # Cooldown between same-side trades (0 = no limit)
-MAX_SPIKES_PER_WINDOW = 1000  # Max spike entries per 5m window
+MAX_SPIKES_PER_WINDOW = 2     # Max spike entries per 5m window (avoid whipsaw)
 
 # Entry quality filter — only buy tokens already trending in our direction
-MIN_ETH_MID = 0.01            # Only buy ETH token if its mid ≥ 1¢ (>1% implied prob)
+MIN_ETH_MID = 0.50            # Only buy ETH token if its mid ≥ 50¢ (>50% implied prob)
 
 # Exit conditions
-EXIT_REVERT = 0.15            # Sell ETH when BTC token drops 15¢ from peak (wider = hold longer)
-STOP_LOSS = 0.08              # Sell ETH if its price drops 8¢ from entry MID (wider for settlement)
+EXIT_REVERT = 0.20            # Sell ETH when BTC token drops 20¢ from peak (emergency only)
+STOP_LOSS = 0.08              # Sell ETH if its price drops 8¢ from entry MID
 TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢
+ETH_TRAIL_STOP = 0.04         # Exit when ETH drops 4¢ from its post-entry peak
+ETH_TRAIL_ACTIVATION = 0.02   # Only trail after ETH peaks 2¢ above entry mid
 MAX_HOLD_SECS = 120           # Hard time stop: sell after 2 minutes regardless
 ENTRY_GRACE_SECS = 8          # Don't check stop-loss for first 8s (settlement + spread settle)
 
 # Window timing
-MAX_ENTRY_PCT = 0.80          # Only enter in first 80% of window
+MAX_ENTRY_PCT = 0.65          # Only enter in first 65% of window (need more runway)
 INTERVALS = [5]               # Only 5-minute windows (faster signal)
 
 # Polymarket fee formula (5m/15m crypto)
@@ -724,6 +726,7 @@ class Follower:
                 "epoch": epoch,
                 "btc_token": window_info.get(f"btc_{side.lower()}"),
                 "btc_peak": self.detector.get_current(side) or 0,
+                "eth_peak": eth_mid,
                 "dry_run": True,
             }
             return True
@@ -784,6 +787,7 @@ class Follower:
                 "epoch": epoch,
                 "btc_token": window_info.get(f"btc_{side.lower()}"),
                 "btc_peak": btc_current or fill_price,
+                "eth_peak": eth_mid_now,
                 "order_id": order_id,
                 "dry_run": False,
             }
@@ -822,6 +826,10 @@ class Follower:
         if btc_current is not None and btc_current > pos["btc_peak"]:
             pos["btc_peak"] = btc_current
 
+        # Update ETH peak (for trailing stop)
+        if eth_mid > pos.get("eth_peak", 0):
+            pos["eth_peak"] = eth_mid
+
         # ─── Exit checks (in priority order) ───
 
         # 1. Stop loss (with grace period to let position settle)
@@ -838,8 +846,19 @@ class Follower:
             self._sell_eth("take_profit")
             return
 
-        # 3. BTC momentum reversal — BTC token dropped from peak
-        if btc_current is not None:
+        # 3. ETH trailing stop — lock in gains when ETH reverses from peak
+        if hold_secs >= ENTRY_GRACE_SECS:
+            eth_peak = pos.get("eth_peak", eth_mid)
+            if eth_peak > entry_mid + ETH_TRAIL_ACTIVATION:
+                eth_drop_from_peak = eth_peak - eth_mid
+                if eth_drop_from_peak >= ETH_TRAIL_STOP:
+                    log(f"  📉 ETH TRAIL: {side} dropped {eth_drop_from_peak:.3f} from peak "
+                        f"(peak={eth_peak:.3f}, now={eth_mid:.3f}, entry={entry_mid:.3f})")
+                    self._sell_eth("eth_trail")
+                    return
+
+        # 4. BTC momentum reversal — BTC token dropped from peak (with grace period)
+        if btc_current is not None and hold_secs >= ENTRY_GRACE_SECS:
             btc_drop = pos["btc_peak"] - btc_current
             if btc_drop >= EXIT_REVERT:
                 log(f"  📉 BTC REVERT: {side} dropped {btc_drop:.3f} from peak "
@@ -847,7 +866,7 @@ class Follower:
                 self._sell_eth("btc_revert")
                 return
 
-        # 4. Time stop
+        # 5. Time stop
         if hold_secs > MAX_HOLD_SECS:
             log(f"  ⏰ TIME STOP: held {hold_secs:.0f}s (ETH change={price_change:+.3f})")
             self._sell_eth("time_stop")
@@ -993,7 +1012,8 @@ def main():
     log(f"═══ Follower Bot ═══ [{mode}]")
     log(f"Strategy: BTC spike → buy ETH same side → sell on BTC revert")
     log(f"Params: BET=${BET_AMOUNT} SPIKE={SPIKE_THRESHOLD:.2f}/{SPIKE_WINDOW}s "
-        f"EXIT_REVERT={EXIT_REVERT} SL={STOP_LOSS} TP={TAKE_PROFIT}")
+        f"EXIT_REVERT={EXIT_REVERT} SL={STOP_LOSS} TP={TAKE_PROFIT} "
+        f"TRAIL={ETH_TRAIL_STOP}/{ETH_TRAIL_ACTIVATION}")
     log(f"Windows: {INTERVALS}m | Max hold: {MAX_HOLD_SECS}s")
     log("")
 
