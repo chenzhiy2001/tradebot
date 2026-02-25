@@ -67,8 +67,8 @@ SPIKE_THRESHOLD = 0.12        # BTC token mid-price jump ≥ 12¢
 SPIKE_WINDOW = 5              # … within 5 seconds
 MAX_SPIKES_PER_WINDOW = 3     # Max spike entries per 5m window
 
-# Entry quality filter — only buy tokens already trending in our direction
-MIN_ETH_MID = 0.55            # Only buy ETH token if its mid ≥ 55¢
+# Entry quality filter — avoid near-zero noise tokens, but allow lower-priced momentum
+MIN_ETH_MID = 0.20            # Only buy ETH token if its mid ≥ 20¢ (cheap tokens move more)
 MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = bad fills)
 
 # Exit conditions
