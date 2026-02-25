@@ -89,7 +89,7 @@ LEAK_CHECK_INTERVAL = 5       # Check for leaked fills every 5 seconds
 LEAK_CHECK_COUNT = 3          # Check this many times before clearing a potential leak
 
 # Window timing
-MAX_ENTRY_PCT = 0.65          # Only enter in first 65% of window (was 80%)
+MAX_ENTRY_PCT = 0.80          # Only enter in first 80% of window (was 65%)
 INTERVALS = [5]               # Only 5-minute windows (faster signal)
 
 # Polymarket fee formula (5m/15m crypto)
