@@ -790,14 +790,14 @@ class Follower:
             else:
                 log(f"  ⚠ Sell order failed: {resp}")
 
-            # Wait briefly for fill
-            time.sleep(2)
+            # Wait for fill — need enough time for balance API to update
+            time.sleep(4)
 
-            # Check remaining shares
+            # Check remaining shares (may be stale — we verify multiple times)
             remaining = get_share_balance(token_id)
             sold = shares - (remaining or 0)
 
-            if sold > 0:
+            if sold > 0.5:
                 fee = compute_taker_fee(sold, sell_price)
                 revenue = sold * sell_price - fee
                 pnl = revenue - pos["cost"]
@@ -805,61 +805,95 @@ class Follower:
                     f"→ PnL ${pnl:+.2f} ({reason})")
                 self._record_trade(pos, sell_price, pnl, reason)
             else:
-                # ── Must CANCEL first sell before retrying ──
-                log(f"  ⚠ Sell didn't fill — cancelling before retry")
+                # Balance API might be stale — cancel first sell, re-check balance
+                log(f"  ⚠ Sell may not have filled (remaining={remaining}) — cancelling")
                 try:
                     if order_id:
                         client.cancel(order_id)
-                    time.sleep(0.5)  # let cancel settle
                 except Exception as ce:
                     log(f"    Cancel error: {ce}")
 
-                # Retry loop with decreasing price
-                final_sold = 0
-                final_price = sell_price
-                for attempt in range(SELL_RETRY_ATTEMPTS):
-                    retry_price = round(max(0.01, sell_price - SELL_RETRY_STEP * (attempt + 1)), 2)
-                    log(f"  📝 Retry sell #{attempt+1} @ {retry_price}")
-                    try:
-                        sell_order_r = OrderArgs(
-                            token_id=token_id,
-                            price=retry_price,
-                            size=shares,
-                            side=SELL,
-                        )
-                        signed_r = client.create_order(sell_order_r)
-                        resp_r = client.post_order(signed_r, OrderType.GTC)
-                        order_id_r = resp_r.get("orderID", "") if isinstance(resp_r, dict) else ""
+                # Wait and re-check balance to catch stale API
+                time.sleep(2)
+                remaining2 = get_share_balance(token_id)
+                sold2 = shares - (remaining2 or 0)
 
-                        time.sleep(2)
-                        remaining_r = get_share_balance(token_id)
-                        sold_r = shares - (remaining_r or 0)
-
-                        if sold_r > 0:
-                            final_sold = sold_r
-                            final_price = retry_price
-                            log(f"  ✅ Retry filled: {sold_r:.1f}sh @ {retry_price}")
-                            break
-                        else:
-                            # Cancel this retry before next attempt
-                            try:
-                                if order_id_r:
-                                    client.cancel(order_id_r)
-                                time.sleep(0.3)
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        log(f"    Retry #{attempt+1} error: {e}")
-
-                if final_sold > 0:
-                    fee_r = compute_taker_fee(final_sold, final_price)
-                    revenue_r = final_sold * final_price - fee_r
-                    pnl_r = revenue_r - pos["cost"]
-                    log(f"  💰 Sold {final_sold:.1f}sh @ {final_price} → PnL ${pnl_r:+.2f}")
-                    self._record_trade(pos, final_price, pnl_r, reason)
+                if sold2 > 0.5:
+                    # The sell DID fill — balance just was stale on first check
+                    fee = compute_taker_fee(sold2, sell_price)
+                    revenue = sold2 * sell_price - fee
+                    pnl = revenue - pos["cost"]
+                    log(f"  💰 Sell DID fill (stale balance): {sold2:.1f}sh @ {sell_price:.2f} "
+                        f"→ PnL ${pnl:+.2f} ({reason})")
+                    self._record_trade(pos, sell_price, pnl, reason)
+                elif remaining2 is not None and remaining2 < 1.0:
+                    # Shares are basically gone — sell filled but balance shows ~0
+                    fee = compute_taker_fee(shares, sell_price)
+                    revenue = shares * sell_price - fee
+                    pnl = revenue - pos["cost"]
+                    log(f"  💰 Sell confirmed (shares gone): {shares:.1f}sh @ {sell_price:.2f} "
+                        f"→ PnL ${pnl:+.2f} ({reason})")
+                    self._record_trade(pos, sell_price, pnl, reason)
                 else:
-                    log(f"  ⚠ All sell retries failed — shares stuck")
-                    self._record_trade(pos, 0, -pos["cost"], reason + "_stuck")
+                    # Genuinely not filled — retry with decreasing price
+                    log(f"  ⚠ Sell confirmed NOT filled (remaining={remaining2:.1f}) — retrying")
+                    final_sold = 0
+                    final_price = sell_price
+                    balance_error_count = 0
+
+                    for attempt in range(SELL_RETRY_ATTEMPTS):
+                        retry_price = round(max(0.01, sell_price - SELL_RETRY_STEP * (attempt + 1)), 2)
+                        log(f"  📝 Retry sell #{attempt+1} @ {retry_price}")
+                        try:
+                            sell_order_r = OrderArgs(
+                                token_id=token_id,
+                                price=retry_price,
+                                size=shares,
+                                side=SELL,
+                            )
+                            signed_r = client.create_order(sell_order_r)
+                            resp_r = client.post_order(signed_r, OrderType.GTC)
+                            order_id_r = resp_r.get("orderID", "") if isinstance(resp_r, dict) else ""
+
+                            time.sleep(3)
+                            remaining_r = get_share_balance(token_id)
+                            sold_r = shares - (remaining_r or 0)
+
+                            if sold_r > 0.5:
+                                final_sold = sold_r
+                                final_price = retry_price
+                                log(f"  ✅ Retry filled: {sold_r:.1f}sh @ {retry_price}")
+                                break
+                            else:
+                                try:
+                                    if order_id_r:
+                                        client.cancel(order_id_r)
+                                    time.sleep(0.3)
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            err_str = str(e)
+                            log(f"    Retry #{attempt+1} error: {e}")
+                            # "not enough balance / allowance" means shares are
+                            # already gone — the ORIGINAL sell filled after all!
+                            if "not enough balance" in err_str or "allowance" in err_str:
+                                balance_error_count += 1
+                                if balance_error_count >= 2:
+                                    log(f"  💰 Shares confirmed GONE (balance errors) "
+                                        f"— original sell @ {sell_price} likely filled")
+                                    final_sold = shares
+                                    final_price = sell_price
+                                    break
+
+                    if final_sold > 0.5:
+                        fee_r = compute_taker_fee(final_sold, final_price)
+                        revenue_r = final_sold * final_price - fee_r
+                        pnl_r = revenue_r - pos["cost"]
+                        log(f"  💰 Sold {final_sold:.1f}sh @ {final_price} → PnL ${pnl_r:+.2f}")
+                        self._record_trade(pos, final_price, pnl_r, reason)
+                    else:
+                        log(f"  ⚠ All sell retries failed — shares stuck")
+                        self._record_trade(pos, 0, -pos["cost"], reason + "_stuck")
 
             # Cancel any remaining open orders for this token
             try:
