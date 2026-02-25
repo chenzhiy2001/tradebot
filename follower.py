@@ -68,8 +68,8 @@ MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 # Spike detection — BTC token price must rise this much this fast
 SPIKE_THRESHOLD = 0.10        # BTC token mid-price jump ≥ 10¢
 SPIKE_WINDOW = 5              # … within 5 seconds (was 2s - too tight)
-SPIKE_COOLDOWN = 60           # Don't re-enter same side for 60s (was 30s)
-MAX_SPIKES_PER_WINDOW = 2     # Max spike entries per 5m window (prevent churn)
+SPIKE_COOLDOWN = 0           # Don't re-enter same side for 60s (was 30s)
+MAX_SPIKES_PER_WINDOW = 1000     # Max spike entries per 5m window (prevent churn)
 
 # Entry quality — verify BTC is still spiking after fill
 POST_FILL_BTC_CHECK = True    # After fill, verify BTC still above spike threshold
