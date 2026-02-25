@@ -66,9 +66,14 @@ FILL_WAIT = 3                 # Seconds to wait for buy fill
 MIN_ORDER_SIZE = 5            # Polymarket minimum order size in shares
 
 # Spike detection — BTC token price must rise this much this fast
-SPIKE_THRESHOLD = 0.10        # BTC token mid-price jump ≥ 4¢ (e.g. 0.50 → 0.54)
-SPIKE_WINDOW = 2             # … within 2 seconds
-SPIKE_COOLDOWN = 30           # Don't re-enter same side for 30s after a trade
+SPIKE_THRESHOLD = 0.10        # BTC token mid-price jump ≥ 10¢
+SPIKE_WINDOW = 5              # … within 5 seconds (was 2s - too tight)
+SPIKE_COOLDOWN = 60           # Don't re-enter same side for 60s (was 30s)
+MAX_SPIKES_PER_WINDOW = 2     # Max spike entries per 5m window (prevent churn)
+
+# Entry quality — verify BTC is still spiking after fill
+POST_FILL_BTC_CHECK = True    # After fill, verify BTC still above spike threshold
+BUY_PRICE_OFFSET = 0.01       # Buy at mid + 1¢ instead of ask (better entry)
 
 # Exit conditions
 EXIT_REVERT = 0.10            # Sell ETH when BTC token drops 10¢ from its peak post-entry
@@ -79,8 +84,12 @@ ENTRY_GRACE_SECS = 5          # Don't check stop-loss for first 5s (let position
 SELL_RETRY_ATTEMPTS = 3       # Number of sell retry attempts with decreasing price
 SELL_RETRY_STEP = 0.01        # Price decrease per retry step
 
+# Leaked fill scanning
+LEAK_CHECK_INTERVAL = 5       # Check for leaked fills every 5 seconds
+LEAK_CHECK_COUNT = 3          # Check this many times before clearing a potential leak
+
 # Window timing
-MAX_ENTRY_PCT = 0.80          # Only enter in first 80% of window (need exit room)
+MAX_ENTRY_PCT = 0.65          # Only enter in first 65% of window (was 80%)
 INTERVALS = [5]               # Only 5-minute windows (faster signal)
 
 # Polymarket fee formula (5m/15m crypto)
@@ -449,6 +458,17 @@ class SpikeDetector:
                     peak = price
         return peak
 
+    def get_spike_start(self, side):
+        """Get the oldest price within SPIKE_WINDOW, i.e. where the spike started from."""
+        history = self._history_up if side == "UP" else self._history_down
+        if len(history) < 2:
+            return None
+        now = time.time()
+        for ts, price in history:
+            if now - ts <= SPIKE_WINDOW:
+                return price
+        return None
+
 
 # =========================================================================
 # FOLLOWER — main trading engine
@@ -467,10 +487,30 @@ class Follower:
         self._win_count = 0
         self._total_pnl = 0.0
         self._lock = threading.Lock()
-        # Leaked-fill prevention (same pattern as sniper.py)
-        self._buy_attempted = False     # True once a buy is placed this cycle
-        self._last_buy_token = None     # token_id of last buy attempt
-        self._last_buy_order_id = None  # order_id of last buy attempt
+        self._window_trade_count = {}  # epoch -> count of trades in this window
+        # Persistent leaked-fill tracker:
+        # List of {token_id, order_id, cancel_time, checks_done}
+        # We keep scanning these tokens for several seconds after "cancel"
+        self._pending_leak_checks = []
+        self._last_leak_scan = 0
+
+    def _emergency_sell(self, token_id, shares):
+        """Emergency sell leaked shares at bid."""
+        log(f"    Placing emergency sell for {shares:.1f}sh of {token_id[:10]}")
+        bid, _, _ = self.poly.get_price(token_id)
+        sell_p = round(bid - 0.01, 2) if bid and bid > 0.02 else 0.01
+        try:
+            sell_order = OrderArgs(
+                token_id=token_id,
+                price=sell_p,
+                size=shares,
+                side=SELL,
+            )
+            signed = client.create_order(sell_order)
+            resp = client.post_order(signed, OrderType.GTC)
+            log(f"    Emergency sell @ {sell_p} ({resp})")
+        except Exception as e:
+            log(f"    ⚠ Emergency sell error: {e}")
 
     def update_markets(self, markets):
         """Update tracked windows and subscribe to all tokens."""
@@ -501,34 +541,29 @@ class Follower:
                     if mid is not None:
                         self.detector.update(side, mid)
 
-        # ─── Leaked-fill detection ───
-        # If we placed a buy that was "cancelled", check if it leaked a fill
-        if (self._buy_attempted and self._position is None
-                and self._last_buy_token):
-            leaked = get_share_balance(self._last_buy_token)
-            if leaked is not None and leaked >= MIN_ORDER_SIZE:
-                log(f"  ⚠ LEAKED FILL detected: {leaked:.1f}sh of {self._last_buy_token[:10]}")
-                log(f"    Placing emergency sell at bid to dump leaked shares")
-                bid, _, _ = self.poly.get_price(self._last_buy_token)
-                sell_p = round(bid - 0.01, 2) if bid and bid > 0.02 else 0.01
-                try:
-                    sell_order = OrderArgs(
-                        token_id=self._last_buy_token,
-                        price=sell_p,
-                        size=leaked,
-                        side=SELL,
-                    )
-                    signed = client.create_order(sell_order)
-                    resp = client.post_order(signed, OrderType.GTC)
-                    log(f"    Emergency sell placed @ {sell_p} ({resp})")
-                except Exception as e:
-                    log(f"    ⚠ Emergency sell error: {e}")
-                self._buy_attempted = False
-                self._last_buy_token = None
-                return
-            # No leak — reset flag
-            self._buy_attempted = False
-            self._last_buy_token = None
+        # ─── Persistent leaked-fill scanner ───
+        # Scan ALL recently-cancelled buy tokens for leaked fills (not just last one)
+        if (self._pending_leak_checks
+                and now - self._last_leak_scan >= LEAK_CHECK_INTERVAL
+                and self._position is None):
+            self._last_leak_scan = now
+            still_pending = []
+            for item in self._pending_leak_checks:
+                token_id = item["token_id"]
+                checks = item["checks_done"]
+                leaked = get_share_balance(token_id)
+                if leaked is not None and leaked >= MIN_ORDER_SIZE:
+                    log(f"  ⚠ LEAKED FILL detected: {leaked:.1f}sh of {token_id[:10]} "
+                        f"(check #{checks+1}, {now - item['cancel_time']:.0f}s after cancel)")
+                    self._emergency_sell(token_id, leaked)
+                    # Don't add back to pending — dealt with
+                    continue
+                item["checks_done"] = checks + 1
+                if item["checks_done"] < LEAK_CHECK_COUNT:
+                    still_pending.append(item)  # Keep checking
+                else:
+                    pass  # Checked enough times, no leak found — drop it
+            self._pending_leak_checks = still_pending
 
         # ─── Manage open position ───
         if self._position is not None:
@@ -557,7 +592,12 @@ class Follower:
                 if not is_spike:
                     continue
 
-                # BTC spike detected! Check ETH token
+                # BTC spike detected! Check window trade limit
+                wnd_trades = self._window_trade_count.get(epoch, 0)
+                if wnd_trades >= MAX_SPIKES_PER_WINDOW:
+                    continue  # Already traded enough in this window
+
+                # Check ETH token
                 eth_token = info.get(f"eth_{side.lower()}")
                 if not eth_token:
                     continue
@@ -565,6 +605,12 @@ class Follower:
                 eth_bid, eth_ask, eth_age = self.poly.get_price(eth_token)
                 if not eth_ask or eth_ask <= 0 or (eth_age and eth_age > 5):
                     continue
+                if not eth_bid or eth_bid <= 0:
+                    continue
+
+                # Buy at mid + offset (not at ask — ask is already the moved price)
+                eth_mid_now = (eth_bid + eth_ask) / 2.0
+                buy_price = min(round(eth_mid_now + BUY_PRICE_OFFSET, 2), eth_ask)
 
                 # Check balance
                 balance = get_usdc_balance()
@@ -576,13 +622,14 @@ class Follower:
 
                 log(f"  ⚡ BTC {side} SPIKE: +{change:.3f} in {SPIKE_WINDOW}s "
                     f"(btc_mid={btc_price:.3f})")
-                log(f"  🎯 Buying ETH {side} @ {eth_ask:.2f} | bet=${bet:.0f} | "
-                    f"window {pct:.0%} elapsed")
+                log(f"  🎯 Buying ETH {side} @ {buy_price:.2f} (mid={eth_mid_now:.2f} ask={eth_ask:.2f}) | "
+                    f"bet=${bet:.0f} | window {pct:.0%} elapsed")
 
                 success = self._buy_eth(
-                    eth_token, side, eth_ask, bet, epoch, info
+                    eth_token, side, buy_price, bet, epoch, info
                 )
                 if success:
+                    self._window_trade_count[epoch] = wnd_trades + 1
                     return  # Only one position at a time
 
     def _buy_eth(self, token_id, side, buy_price, bet, epoch, window_info):
@@ -635,11 +682,6 @@ class Follower:
 
             log(f"  📝 Order placed (id: {order_id[:8] if order_id else '?'})")
 
-            # Track for leaked-fill detection
-            self._buy_attempted = True
-            self._last_buy_token = token_id
-            self._last_buy_order_id = order_id
-
             time.sleep(FILL_WAIT)
 
             # CANCEL FIRST, then check balance (prevent additional fills)
@@ -648,7 +690,7 @@ class Follower:
                     client.cancel(order_id)
             except Exception:
                 pass
-            time.sleep(0.5)  # brief pause for cancel to settle
+            time.sleep(1.0)  # 1s pause for cancel + balance to settle
 
             actual = get_share_balance(token_id)
 
@@ -656,6 +698,30 @@ class Follower:
                 fee = compute_taker_fee(actual, buy_price)
                 actual_cost = round(actual * buy_price + fee, 4)
                 log(f"  ✅ Filled! {actual:.1f}sh, cost ${actual_cost:.2f} (fee ${fee:.2f})")
+
+                # Post-fill validation: is BTC still spiking?
+                if POST_FILL_BTC_CHECK:
+                    btc_now = self.detector.get_current(side)
+                    btc_spike_start = self.detector.get_spike_start(side)
+                    if btc_now is not None and btc_spike_start is not None:
+                        btc_move = btc_now - btc_spike_start
+                        if btc_move < SPIKE_THRESHOLD * 0.5:
+                            log(f"  ⚠ POST-FILL CHECK FAIL: BTC {side} momentum gone "
+                                f"(now={btc_now:.3f}, spike_start={btc_spike_start:.3f}, "
+                                f"move={btc_move:+.3f} < {SPIKE_THRESHOLD * 0.5:.3f})")
+                            log(f"    Immediately selling — spike already over")
+                            # Sell immediately at bid
+                            bid, _, _ = self.poly.get_price(token_id)
+                            sell_p = round(bid, 2) if bid and bid > 0 else buy_price
+                            try:
+                                so = OrderArgs(token_id=token_id, price=sell_p,
+                                               size=actual, side=SELL)
+                                signed_s = client.create_order(so)
+                                resp_s = client.post_order(signed_s, OrderType.GTC)
+                                log(f"    Emergency sell @ {sell_p}: {resp_s}")
+                            except Exception as e:
+                                log(f"    Emergency sell error: {e}")
+                            return False
 
                 # Record ETH mid at entry for fair stop-loss comparison
                 eth_mid_now = self.poly.mid_price(token_id) or buy_price
@@ -674,12 +740,16 @@ class Follower:
                     "order_id": order_id,
                     "dry_run": False,
                 }
-                self._buy_attempted = False  # position taken, no leak possible
-                self._last_buy_token = None
                 return True
             else:
                 log(f"  ⏳ Not filled after {FILL_WAIT}s — cancelled")
-                # _buy_attempted stays True → leaked-fill check on next tick
+                # Register for persistent leak scanning (check multiple times)
+                self._pending_leak_checks.append({
+                    "token_id": token_id,
+                    "order_id": order_id,
+                    "cancel_time": time.time(),
+                    "checks_done": 0,
+                })
                 return False
 
         except Exception as e:
