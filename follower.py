@@ -63,7 +63,7 @@ MIN_BET = 5                   # Polymarket minimum
 MAX_EXPOSURE_PCT = 0.30       # Max 30% of balance at risk
 
 # Spike detection — BTC token price must rise this much this fast
-SPIKE_THRESHOLD = 0.12        # BTC token mid-price jump ≥ 12¢
+SPIKE_THRESHOLD = 0.3        # BTC token mid-price jump ≥ 30¢
 SPIKE_WINDOW = 10             # … within 10 seconds
 MAX_SPIKES_PER_WINDOW = 3     # Max spike entries per 5m window
 
