@@ -29,6 +29,7 @@ import os
 import sys
 import time
 import json
+import queue
 import threading
 import asyncio
 import requests
@@ -135,6 +136,109 @@ def compute_taker_fee(shares, price):
         return 0.0
     fee_shares = shares * CRYPTO_FEE_RATE * (price * (1 - price)) ** CRYPTO_FEE_EXPONENT
     return round(fee_shares * price, 4)
+
+
+# =========================================================================
+# BACKGROUND SELL WORKER
+# =========================================================================
+class SellWorker:
+    """Background thread that retries failed sells until shares are gone."""
+
+    RETRY_INTERVAL = 3       # seconds between retries
+    MAX_RETRIES = 60         # give up after ~3 minutes
+
+    def __init__(self, poly):
+        self.poly = poly
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._active_count = 0
+        self._lock = threading.Lock()
+
+    def enqueue(self, pos, reason):
+        """Hand off a failed sell for background retry."""
+        with self._lock:
+            self._active_count += 1
+        self._queue.put((pos, reason, 0))
+        log(f"  🔄 Queued background sell: {pos['shares']:.1f}sh {pos['side']} "
+            f"(token {pos['token_id'][:8]}...)")
+
+    @property
+    def pending(self):
+        with self._lock:
+            return self._active_count
+
+    def drain(self, timeout=15):
+        """Block until all pending sells finish or timeout."""
+        deadline = time.time() + timeout
+        while self.pending > 0 and time.time() < deadline:
+            time.sleep(0.5)
+        remaining = self.pending
+        if remaining > 0:
+            log(f"  ⚠ SellWorker drain timeout: {remaining} sells still pending")
+
+    def _run(self):
+        """Worker loop — process sell queue forever."""
+        while True:
+            try:
+                pos, reason, attempts = self._queue.get()
+                self._try_sell(pos, reason, attempts)
+            except Exception as e:
+                log(f"  ⚠ SellWorker error: {e}")
+                time.sleep(1)
+
+    def _try_sell(self, pos, reason, attempts):
+        """Attempt FOK sell. Re-queue on failure."""
+        token_id = pos["token_id"]
+        shares = pos["shares"]
+        side = pos["side"]
+
+        if attempts >= self.MAX_RETRIES:
+            log(f"  ❌ SellWorker gave up on {shares:.1f}sh {side} "
+                f"after {attempts} attempts")
+            with self._lock:
+                self._active_count -= 1
+            return
+
+        try:
+            bid, _, _ = self.poly.get_price(token_id)
+            price = round(bid, 2) if bid and bid > 0 else 0.01
+
+            market_order = MarketOrderArgs(
+                token_id=token_id,
+                amount=shares,
+                side=SELL,
+            )
+            signed = client.create_market_order(market_order)
+            resp = client.post_order(signed, OrderType.FOK)
+
+            success = resp.get("success", False) if isinstance(resp, dict) else False
+            taking = float(resp.get("takingAmount", 0)) if isinstance(resp, dict) else 0
+            making = float(resp.get("makingAmount", 0)) if isinstance(resp, dict) else 0
+
+            if success or taking > 0:
+                actual_revenue = taking
+                actual_shares_sold = making if making > 0 else shares
+                actual_price = round(actual_revenue / actual_shares_sold, 4) if actual_shares_sold > 0 else price
+                log(f"  🔄✅ Background sold {actual_shares_sold:.1f}sh {side} "
+                    f"@ ~{actual_price:.3f} (${actual_revenue:.2f}) "
+                    f"[attempt {attempts+1}]")
+                with self._lock:
+                    self._active_count -= 1
+                return
+
+        except Exception as e:
+            err_str = str(e)
+            if "not enough balance" in err_str or "allowance" in err_str:
+                log(f"  🔄✅ Background sell: shares already gone ({side})")
+                with self._lock:
+                    self._active_count -= 1
+                return
+            log(f"  🔄⚠ Background sell error (attempt {attempts+1}): {e}")
+
+        # Re-queue for retry
+        time.sleep(self.RETRY_INTERVAL)
+        self._queue.put((pos, reason, attempts + 1))
 
 
 # =========================================================================
@@ -456,6 +560,7 @@ class Follower:
         self._total_pnl = 0.0
         self._lock = threading.Lock()
         self._window_trade_count = {}  # epoch -> count of trades in this window
+        self._sell_worker = SellWorker(poly)
 
     def update_markets(self, markets):
         """Update tracked windows and subscribe to all tokens."""
@@ -762,9 +867,9 @@ class Follower:
                     return
                 time.sleep(0.5)
 
-        # All retries failed
-        log(f"  ⚠ All sell retries failed — shares may be stuck")
-        self._record_trade(pos, 0, -pos["cost"], reason + "_stuck")
+        # All inline retries failed — hand off to background sell worker
+        log(f"  ⚠ Inline sell failed — handing to background worker")
+        self._sell_worker.enqueue(pos, reason)
 
         self._position = None
         self._cooldowns[side] = time.time()
@@ -821,7 +926,11 @@ class Follower:
                     f"now={eth_mid:.3f} Δ{change:+.3f} | "
                     f"BTC peak={pos['btc_peak']:.3f} drop={btc_drop:.3f} | "
                     f"hold={hold:.0f}s/{MAX_HOLD_SECS}s")
-        return "SCANNING for BTC spikes..."
+        pending = self._sell_worker.pending
+        base = "SCANNING for BTC spikes..."
+        if pending > 0:
+            base += f" | ⚠ {pending} background sell(s)"
+        return base
 
 
 # =========================================================================
@@ -907,6 +1016,10 @@ def main():
             if follower._position and not follower._position.get("dry_run"):
                 log("  Closing open position...")
                 follower._sell_eth("shutdown")
+            # Wait for background sell worker to finish
+            if follower._sell_worker.pending > 0:
+                log(f"  Draining {follower._sell_worker.pending} background sell(s)...")
+                follower._sell_worker.drain(timeout=20)
             # Cancel all open orders
             try:
                 open_orders = client.get_orders()
