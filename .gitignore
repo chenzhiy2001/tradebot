@@ -18,3 +18,5 @@ sniper_data.jsonl
 sniper_trades.json
 follower_log.txt
 follower_trades.json   
+gapbot_log.txt
+gapbot_trades.json

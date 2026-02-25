@@ -99,6 +99,12 @@ follower_logs_backup:
 	zip -j -9 archives/follower_logs_$$(date +%Y%m%d_%H%M%S).zip follower_log.txt follower_trades.json
 	rm -f follower_log.txt follower_trades.json
 # git add . and git commit -m "backup logs" and git push"
+
+gapbot_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/gapbot_logs_$$(date +%Y%m%d_%H%M%S).zip gapbot_log.txt gapbot_trades.json
+	rm -f gapbot_log.txt gapbot_trades.json
+
 git_logs_backup:
 	git add .
 	git commit -m "backup logs"
