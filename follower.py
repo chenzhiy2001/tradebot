@@ -123,6 +123,19 @@ client = ClobClient(
 client.set_api_creds(client.create_or_derive_api_creds())
 
 
+def ensure_usdc_allowance():
+    """Set USDC spending allowance on the exchange contract."""
+    try:
+        client.update_balance_allowance(
+            params=BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL, token_id="", signature_type=1
+            )
+        )
+        log("  ✅ USDC allowance set")
+    except Exception as e:
+        log(f"  ⚠ USDC allowance error: {e}")
+
+
 def get_usdc_balance():
     try:
         ba = client.get_balance_allowance(
@@ -1138,6 +1151,8 @@ def main():
 
     if not poly.connected:
         log("⚠ Polymarket WS not connected after 30s")
+
+    ensure_usdc_allowance()
 
     balance = get_usdc_balance()
     if balance:
