@@ -77,7 +77,7 @@ ETH_TRAIL_STOP = 0.03         # Minimum trail: exit when ETH drops 3¢ from peak
 ETH_TRAIL_PCT = 0.40          # Dynamic trail: allow 40% retracement of gain (keep 60%)
 ETH_TRAIL_ACTIVATION = 0.02   # Trail activates after 2¢ gain (avoid noise)
 MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
-NO_GAIN_EXIT_SECS = 30        # If no gain after 30s, thesis is wrong — exit early
+NO_GAIN_EXIT_SECS = 45        # If no gain after 45s, thesis is wrong — exit early
 ENTRY_GRACE_SECS = 8          # Don't check exits for first 8s (settlement)
 TOKEN_COOLDOWN_SECS = 10      # Don't re-buy same token_id within 10s (settlement overlap)
 
@@ -305,6 +305,12 @@ class SellWorker:
                 log(f"  🔄✅ Token expired / no match — stopping retries ({side})")
                 with self._lock:
                     self._active_count -= 1
+                return
+            # Service not ready (425) — transient, don't count as attempt
+            if 'not ready' in err_str.lower() or '425' in err_str:
+                log(f"  🔄⚠ Service not ready, retrying (not counted as attempt)")
+                time.sleep(self.RETRY_INTERVAL)
+                self._queue.put((pos, reason, attempts))  # same attempt count
                 return
             log(f"  🔄⚠ Background sell error (attempt {attempts+1}): {e}")
 
