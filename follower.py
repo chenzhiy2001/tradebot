@@ -85,6 +85,7 @@ ENTRY_GRACE_SECS = 8          # Don't check stop-loss for first 8s (settlement +
 
 # Window timing
 MAX_ENTRY_PCT = 0.65          # Only enter in first 65% of window (need more runway)
+MIN_ENTRY_PCT = 0.10          # Don't enter in first 10% (prices still initializing)
 INTERVALS = [5]               # Only 5-minute windows (faster signal)
 
 # Polymarket fee formula (5m/15m crypto)
@@ -510,10 +511,17 @@ def discover_markets():
 class SpikeDetector:
     """Track BTC UP and DOWN token mid-prices, detect spikes."""
 
+    MIN_TICKS = 3  # Need at least this many ticks before detecting a spike
+
     def __init__(self):
         # Rolling price history: deque of (timestamp, mid_price)
         self._history_up = deque(maxlen=200)
         self._history_down = deque(maxlen=200)
+
+    def clear(self):
+        """Clear all history. Call when window tokens change."""
+        self._history_up.clear()
+        self._history_down.clear()
 
     def update(self, side, mid_price):
         """Record a new mid-price tick for BTC UP or DOWN token."""
@@ -530,7 +538,7 @@ class SpikeDetector:
         A spike = price increased by ≥ SPIKE_THRESHOLD in the last SPIKE_WINDOW seconds.
         """
         history = self._history_up if side == "UP" else self._history_down
-        if len(history) < 2:
+        if len(history) < max(2, self.MIN_TICKS):
             return False, None, 0
 
         now = time.time()
@@ -609,6 +617,22 @@ class Follower:
 
     def update_markets(self, markets):
         """Update tracked windows and subscribe to all tokens."""
+        # Detect if BTC tokens changed (new window) → clear spike history
+        old_btc = set()
+        for info in self._windows.values():
+            for k in ["btc_up", "btc_down"]:
+                if k in info:
+                    old_btc.add(info[k])
+        new_btc = set()
+        for info in markets.values():
+            for k in ["btc_up", "btc_down"]:
+                if k in info:
+                    new_btc.add(info[k])
+        if new_btc != old_btc:
+            self.detector.clear()
+            if old_btc:  # Don't log on first discovery
+                log("  🔄 New window tokens — spike history cleared")
+
         self._windows = markets
         all_tokens = []
         for epoch, info in markets.items():
@@ -652,6 +676,8 @@ class Follower:
 
             if pct > MAX_ENTRY_PCT:
                 continue  # Too late in window
+            if pct < MIN_ENTRY_PCT:
+                continue  # Too early — prices still initializing
 
             for side in ["UP", "DOWN"]:
                 # Check cooldown
