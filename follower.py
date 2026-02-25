@@ -73,10 +73,12 @@ MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = ba
 
 # Exit conditions
 TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢
-ETH_TRAIL_STOP = 0.03         # Exit when ETH drops 3¢ from peak
+ETH_TRAIL_STOP = 0.03         # Minimum trail: exit when ETH drops 3¢ from peak
+ETH_TRAIL_PCT = 0.40          # Dynamic trail: allow 40% retracement of gain (keep 60%)
 ETH_TRAIL_ACTIVATION = 0.02   # Trail activates after 2¢ gain (avoid noise)
 MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
 ENTRY_GRACE_SECS = 8          # Don't check exits for first 8s (settlement)
+TOKEN_COOLDOWN_SECS = 10      # Don't re-buy same token_id within 10s (settlement overlap)
 
 # Window timing
 MAX_ENTRY_PCT = 0.70          # Enter in first 70% of window (need 90s+ runway for exit)
@@ -717,6 +719,11 @@ class Follower:
                 if not eth_token:
                     continue
 
+                # Skip if we just sold this same token (settlement overlap)
+                last_sold_time = self._cooldowns.get(eth_token, 0)
+                if now - last_sold_time < TOKEN_COOLDOWN_SECS:
+                    continue
+
                 eth_bid, eth_ask, eth_age = self.poly.get_price(eth_token)
                 if not eth_ask or eth_ask <= 0 or (eth_age and eth_age > 5):
                     continue
@@ -901,13 +908,18 @@ class Follower:
             return
 
         # 2. ETH trailing stop — lock in gains when ETH reverses from peak
+        #    Trail distance = max(ETH_TRAIL_STOP, ETH_TRAIL_PCT * gain)
+        #    So with 40% retracement: up 20¢ → allow 8¢ pullback, up 5¢ → allow 3¢ min
         if hold_secs >= ENTRY_GRACE_SECS:
             eth_peak = pos.get("eth_peak", eth_mid)
-            if eth_peak > entry_mid + ETH_TRAIL_ACTIVATION:
+            gain_from_entry = eth_peak - entry_mid
+            if gain_from_entry >= ETH_TRAIL_ACTIVATION:
+                trail_distance = max(ETH_TRAIL_STOP, ETH_TRAIL_PCT * gain_from_entry)
                 eth_drop_from_peak = eth_peak - eth_mid
-                if eth_drop_from_peak >= ETH_TRAIL_STOP:
+                if eth_drop_from_peak >= trail_distance:
                     log(f"  📉 ETH TRAIL: {side} dropped {eth_drop_from_peak:.3f} from peak "
-                        f"(peak={eth_peak:.3f}, now={eth_mid:.3f}, entry={entry_mid:.3f})")
+                        f"(peak={eth_peak:.3f}, now={eth_mid:.3f}, entry={entry_mid:.3f}, "
+                        f"trail={trail_distance:.3f})")
                     self._sell_eth("eth_trail")
                     return
 
@@ -940,6 +952,7 @@ class Follower:
             self._record_trade(pos, sell_price, pnl, reason)
             self._position = None
             self._cooldowns[side] = time.time()
+            self._cooldowns[token_id] = time.time()
             return
 
         # Use FOK market sell — amount = shares to sell
@@ -973,6 +986,7 @@ class Follower:
                     self._record_trade(pos, actual_price, pnl, reason)
                     self._position = None
                     self._cooldowns[side] = time.time()
+                    self._cooldowns[token_id] = time.time()
                     return
 
                 # FOK rejected — retry (book may have changed)
@@ -988,6 +1002,7 @@ class Follower:
                     self._record_trade(pos, 1.0, pnl, reason + "_resolved")
                     self._position = None
                     self._cooldowns[side] = time.time()
+                    self._cooldowns[token_id] = time.time()
                     return
                 # "no match" = token expired / window closed
                 if 'no match' in err_str.lower():
@@ -996,6 +1011,7 @@ class Follower:
                     self._record_trade(pos, 0.0, -pos["cost"], reason + "_expired")
                     self._position = None
                     self._cooldowns[side] = time.time()
+                    self._cooldowns[token_id] = time.time()
                     return
                 log(f"  ⚠ Sell error (attempt {attempt+1}): {e}")
                 time.sleep(0.5)
@@ -1006,6 +1022,7 @@ class Follower:
 
         self._position = None
         self._cooldowns[side] = time.time()
+        self._cooldowns[token_id] = time.time()
 
     def _record_trade(self, pos, sell_price, pnl, reason):
         """Record completed trade to log file."""
@@ -1074,7 +1091,7 @@ def main():
     log(f"═══ Follower Bot ═══ [{mode}]")
     log(f"Strategy: BTC spike → buy ETH same side → sell on BTC revert")
     log(f"Params: BET=${BET_AMOUNT} SPIKE={SPIKE_THRESHOLD:.2f}/{SPIKE_WINDOW}s "
-        f"TRAIL={ETH_TRAIL_STOP}/{ETH_TRAIL_ACTIVATION} TP={TAKE_PROFIT}")
+        f"TRAIL={ETH_TRAIL_STOP}/{ETH_TRAIL_PCT:.0%}retr/{ETH_TRAIL_ACTIVATION} TP={TAKE_PROFIT}")
     log(f"Windows: {INTERVALS}m | Max hold: {MAX_HOLD_SECS}s")
     log("")
 
