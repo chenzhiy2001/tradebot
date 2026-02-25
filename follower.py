@@ -67,8 +67,8 @@ SPIKE_THRESHOLD = 0.12        # BTC token mid-price jump ≥ 12¢
 SPIKE_WINDOW = 5              # … within 5 seconds
 MAX_SPIKES_PER_WINDOW = 3     # Max spike entries per 5m window
 
-# Entry quality filter — avoid near-zero noise tokens, but allow lower-priced momentum
-MIN_ETH_MID = 0.20            # Only buy ETH token if its mid ≥ 20¢ (cheap tokens move more)
+# Entry quality filter — avoid very cheap tokens that can go to zero
+MIN_ETH_MID = 0.35            # Only buy ETH token if its mid ≥ 35¢ (avoid sub-30¢ wipeouts)
 MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = bad fills)
 
 # Exit conditions
@@ -154,8 +154,9 @@ def get_share_balance(token_id):
         return None
 
 
-def wait_for_settlement(token_id, expected_shares, timeout=30):
-    """Poll until on-chain balance shows shares, or timeout.
+def wait_for_settlement(token_id, expected_shares, pre_buy_balance=0, timeout=30):
+    """Poll until on-chain balance shows NEW shares, or timeout.
+    Uses pre_buy_balance to detect stale balances from previous positions.
     Returns (settled: bool, balance: float)."""
     deadline = time.time() + timeout
     last_balance = 0
@@ -163,7 +164,9 @@ def wait_for_settlement(token_id, expected_shares, timeout=30):
         bal = get_share_balance(token_id)
         if bal is not None:
             last_balance = bal
-            if bal >= expected_shares * 0.9:  # allow small rounding
+            # Must see balance INCREASE over pre-buy snapshot
+            new_shares = bal - pre_buy_balance
+            if new_shares >= expected_shares * 0.9:  # allow small rounding
                 return True, bal
         time.sleep(2)
     return False, last_balance
@@ -248,12 +251,18 @@ class SellWorker:
                     self._active_count -= 1
                 return
 
+            # Use actual on-chain balance as sell amount (not recorded shares)
+            # Recorded shares may be stale from settlement bugs
+            sell_amount = bal if (bal is not None and bal > 0) else shares
+            if sell_amount != shares:
+                log(f"  🔄 Adjusted sell amount: {shares:.1f} → {sell_amount:.1f} (on-chain)")
+
             bid, _, _ = self.poly.get_price(token_id)
             price = round(bid, 2) if bid and bid > 0 else 0.01
 
             market_order = MarketOrderArgs(
                 token_id=token_id,
-                amount=shares,
+                amount=sell_amount,
                 side=SELL,
             )
             signed = client.create_market_order(market_order)
@@ -798,14 +807,19 @@ class Follower:
             log(f"  ✅ FOK filled! {actual_shares:.1f}sh @ ~{fill_price:.3f} "
                 f"(spent ${actual_cost:.2f})")
 
+            # Snapshot pre-buy balance to detect stale shares from prior positions
+            pre_buy_bal = get_share_balance(token_id) or 0
+
             # Wait for on-chain settlement (Polygon block confirmation)
-            log(f"  ⏳ Waiting for on-chain settlement...")
+            log(f"  ⏳ Waiting for on-chain settlement (pre-balance={pre_buy_bal:.1f})...")
             settled, on_chain_shares = wait_for_settlement(
-                token_id, actual_shares, timeout=30
+                token_id, actual_shares, pre_buy_balance=pre_buy_bal, timeout=30
             )
             if settled:
-                log(f"  ✅ Settled: {on_chain_shares:.1f}sh on-chain")
-                actual_shares = on_chain_shares  # use confirmed amount
+                # Use only the NEW shares (total minus pre-buy)
+                new_shares = on_chain_shares - pre_buy_bal
+                log(f"  ✅ Settled: {new_shares:.1f}sh new ({on_chain_shares:.1f} total, {pre_buy_bal:.1f} pre)")
+                actual_shares = new_shares  # use only new shares, not stale leftovers
             else:
                 log(f"  ⚠ Settlement timeout ({on_chain_shares:.1f}sh on-chain) "
                     f"— proceeding anyway")
@@ -864,9 +878,12 @@ class Follower:
         if btc_current is not None and btc_current > pos["btc_peak"]:
             pos["btc_peak"] = btc_current
 
-        # Update ETH peak (for trailing stop)
-        if eth_mid > pos.get("eth_peak", 0):
-            pos["eth_peak"] = eth_mid
+        # Update ETH peak (for trailing stop) — only after grace period
+        # During grace (settlement), prices are noisy; tracking peak there
+        # causes trail to fire immediately when grace ends
+        if hold_secs >= ENTRY_GRACE_SECS:
+            if eth_mid > pos.get("eth_peak", 0):
+                pos["eth_peak"] = eth_mid
 
         # ─── Exit checks (in priority order) ───
 
