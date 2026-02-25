@@ -78,11 +78,12 @@ MAX_ETH_SPREAD = 0.06         # Skip if ETH bid-ask spread > 6¢ (thin book = ba
 # Exit conditions
 EXIT_REVERT = 0.20            # Sell ETH when BTC token drops 20¢ from peak (emergency only)
 STOP_LOSS = 0.06              # Sell ETH if its price drops 6¢ from FILL price
+EMERGENCY_STOP = 0.15         # INSTANT exit if price drops 15¢ (no grace period)
 TAKE_PROFIT = 0.99            # Sell ETH if its price rises 99¢
 ETH_TRAIL_STOP = 0.025        # Exit when ETH drops 2.5¢ from peak (tight = lock profits fast)
 ETH_TRAIL_ACTIVATION = 0.01   # Trail activates after just 1¢ gain (scalp small profits)
 MAX_HOLD_SECS = 90            # Hard time stop: sell after 90s
-ENTRY_GRACE_SECS = 8          # Don't check stop-loss for first 8s (settlement + spread settle)
+ENTRY_GRACE_SECS = 4          # Don't check stop-loss for first 4s (settlement only)
 
 # Window timing
 MAX_ENTRY_PCT = 0.85          # Enter in first 85% of window (need 45s runway for exit)
@@ -872,7 +873,14 @@ class Follower:
 
         # ─── Exit checks (in priority order) ───
 
-        # 1. Stop loss (with grace period to let position settle)
+        # 0. EMERGENCY STOP — no grace period, instant exit on catastrophic drop
+        if price_change <= -EMERGENCY_STOP:
+            log(f"  🚨 EMERGENCY STOP: ETH {side} crashed {price_change:+.3f} from entry "
+                f"(mid={eth_mid:.3f}, entry_mid={entry_mid:.3f})")
+            self._sell_eth("emergency_stop")
+            return
+
+        # 1. Stop loss (with short grace period for settlement)
         if price_change <= -STOP_LOSS and hold_secs >= ENTRY_GRACE_SECS:
             log(f"  🛑 STOP LOSS: ETH {side} dropped {price_change:+.3f} from entry_mid "
                 f"(mid={eth_mid:.3f}, entry_mid={entry_mid:.3f})")
