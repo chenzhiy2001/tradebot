@@ -510,48 +510,65 @@ class BTC80Bot:
             log(f"  📋 GTC limit sell at {LIMIT_SELL_PRICE} (simulated)")
             return
 
-        # ── Live FOK buy ──
-        try:
-            market_order = MarketOrderArgs(
-                token_id=token_id,
-                amount=bet,
-                side=BUY,
-            )
-            signed = client.create_market_order(market_order)
-            resp = client.post_order(signed, OrderType.FOK)
+        # ── Live FOK buy (retry with smaller size on fill failure) ──
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                market_order = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=bet,
+                    side=BUY,
+                )
+                signed = client.create_market_order(market_order)
+                resp = client.post_order(signed, OrderType.FOK)
 
-            success = resp.get("success", False) if isinstance(resp, dict) else False
-            taking = float(resp.get("takingAmount", 0)) if isinstance(resp, dict) else 0
-            making = float(resp.get("makingAmount", 0)) if isinstance(resp, dict) else 0
+                success = resp.get("success", False) if isinstance(resp, dict) else False
+                taking = float(resp.get("takingAmount", 0)) if isinstance(resp, dict) else 0
+                making = float(resp.get("makingAmount", 0)) if isinstance(resp, dict) else 0
 
-            if not success and (resp.get("status") == "error" if isinstance(resp, dict) else True):
-                log(f"  ⚠ Buy rejected: {resp}")
-                return
+                if not success and (resp.get("status") == "error" if isinstance(resp, dict) else True):
+                    log(f"  ⚠ Buy rejected: {resp}")
+                    return
 
-            if taking <= 0:
-                log(f"  ⚠ Buy got 0 shares: {resp}")
-                return
+                if taking <= 0:
+                    log(f"  ⚠ Buy got 0 shares: {resp}")
+                    return
 
-            actual_shares = taking
-            actual_cost = making
-            fill_price = round(actual_cost / actual_shares, 4) if actual_shares > 0 else 0
+                actual_shares = taking
+                actual_cost = making
+                fill_price = round(actual_cost / actual_shares, 4) if actual_shares > 0 else 0
 
-            log(f"  ✅ FOK filled! {actual_shares:.1f}sh @ ~{fill_price:.3f} "
-                f"(spent ${actual_cost:.2f})")
+                log(f"  ✅ FOK filled! {actual_shares:.1f}sh @ ~{fill_price:.3f} "
+                    f"(spent ${actual_cost:.2f})")
+                break  # Success — exit retry loop
 
-        except Exception as e:
-            err_str = str(e)
-            if 'no match' in err_str.lower():
-                self._no_match_until = time.time() + NO_MATCH_BACKOFF
-                log(f"  ⚠ Buy error: no match — backing off {NO_MATCH_BACKOFF}s")
-            elif 'not enough balance' in err_str.lower():
-                self._no_match_until = time.time() + NO_MATCH_BACKOFF
-                log(f"  ⚠ Buy error: not enough balance — backing off {NO_MATCH_BACKOFF}s")
-            elif 'fully filled' in err_str.lower() or 'fok' in err_str.lower():
-                self._no_match_until = time.time() + NO_MATCH_BACKOFF
-                log(f"  ⚠ Buy error: FOK fill failed — backing off {NO_MATCH_BACKOFF}s")
-            else:
-                log(f"  ⚠ Buy error: {e}")
+            except Exception as e:
+                err_str = str(e)
+                if 'no match' in err_str.lower():
+                    self._no_match_until = time.time() + NO_MATCH_BACKOFF
+                    log(f"  ⚠ Buy error: no match — backing off {NO_MATCH_BACKOFF}s")
+                    return
+                elif 'not enough balance' in err_str.lower():
+                    self._no_match_until = time.time() + NO_MATCH_BACKOFF
+                    log(f"  ⚠ Buy error: not enough balance — backing off {NO_MATCH_BACKOFF}s")
+                    return
+                elif 'fully filled' in err_str.lower() or 'fok' in err_str.lower():
+                    # Reduce bet by 20% and retry immediately
+                    old_bet = bet
+                    bet = round(bet * 0.8)
+                    if bet < MIN_BET:
+                        self._no_match_until = time.time() + NO_MATCH_BACKOFF
+                        log(f"  ⚠ FOK fill failed at ${old_bet}, reduced to ${bet} < min — backing off {NO_MATCH_BACKOFF}s")
+                        return
+                    log(f"  ⚠ FOK fill failed at ${old_bet} — retrying at ${bet} (attempt {attempt+2}/{max_attempts})")
+                    continue
+                else:
+                    log(f"  ⚠ Buy error: {e}")
+                    return
+        else:
+            # All attempts exhausted
+            self._no_match_until = time.time() + NO_MATCH_BACKOFF
+            log(f"  ⚠ FOK fill failed after {max_attempts} attempts — backing off {NO_MATCH_BACKOFF}s")
             return
 
         # ── Wait for settlement ──
