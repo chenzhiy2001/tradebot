@@ -105,6 +105,10 @@ gapbot_logs_backup:
 	zip -j -9 archives/gapbot_logs_$$(date +%Y%m%d_%H%M%S).zip gapbot_log.txt gapbot_trades.json
 	rm -f gapbot_log.txt gapbot_trades.json
 
+btc80_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/btc80_logs_$$(date +%Y%m%d_%H%M%S).zip btc80_log.txt btc80_trades.json
+	rm -f btc80_log.txt btc80_trades.json
 git_logs_backup:
 	git add .
 	git commit -m "backup logs"
