@@ -483,7 +483,7 @@ class BTC80Bot:
 
         effective = min(self.tracked_balance, real_balance)
         bet = round(effective * BET_PCT)
-        bet = min(bet, MAX_BET)
+        bet = min(bet, MAX_BET, int(real_balance))  # Never exceed real USDC
         if bet < MIN_BET:
             # Set backoff so we don't spam this message every 250ms
             if not hasattr(self, '_low_bal_logged') or not self._low_bal_logged:
