@@ -477,7 +477,7 @@ class BTC80Bot:
             self.tracked_balance = INITIAL_BALANCE
 
         effective = min(self.tracked_balance, real_balance)
-        bet = int(effective * BET_PCT)
+        bet = round(effective * BET_PCT)
         bet = min(bet, MAX_BET)
         if bet < MIN_BET:
             # Set backoff so we don't spam this message every 250ms
