@@ -878,7 +878,9 @@ class BTC80Bot:
             log(f"  ⏸ Stop-loss cooldown: {STOP_LOSS_COOLDOWN}s before next entry")
 
         if proceeds > 0:
-            self.tracked_balance = proceeds
+            # tracked = unspent portion + proceeds from this trade
+            cost = pos["cost"] if pos else 0
+            self.tracked_balance = (self.tracked_balance - cost) + proceeds
         else:
             # Total loss — reset to 0 (will need external deposit)
             self.tracked_balance = max(0, self.tracked_balance + pnl)
