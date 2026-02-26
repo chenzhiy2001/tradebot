@@ -73,6 +73,7 @@ ORDER_POLL_SECS = 3.0         # How often to poll share balance for GTC fill det
 SETTLEMENT_TIMEOUT = 30       # Max seconds to wait for on-chain settlement
 RESOLUTION_GRACE = 15         # Seconds after window end to check for resolution
 NO_MATCH_BACKOFF = 10         # Seconds to stop retrying after first "no match" error
+STOP_LOSS_COOLDOWN = 60       # Seconds to wait after a stop loss before re-entering
 SELL_MAX_RETRIES = 5          # Max FOK sell attempts for stop loss (was 3)
 SELL_RETRY_SLEEP = 1.0        # Seconds between sell retries (was 0.5)
 
@@ -414,6 +415,7 @@ class BTC80Bot:
         self.win_count = 0
         self.total_pnl = 0.0
         self._no_match_until = 0  # Backoff timestamp after "no match" errors
+        self._stop_loss_until = 0  # Cooldown timestamp after stop loss
 
     def update_market(self, window):
         """Update current window and subscribe to tokens."""
@@ -441,6 +443,10 @@ class BTC80Bot:
 
         # No-match backoff: skip entry attempts for a while after market goes dead
         if time.time() < self._no_match_until:
+            return
+
+        # Post-stop-loss cooldown: don't re-enter the same crash
+        if time.time() < self._stop_loss_until:
             return
 
         for side in ["UP", "DOWN"]:
@@ -541,6 +547,9 @@ class BTC80Bot:
             elif 'not enough balance' in err_str.lower():
                 self._no_match_until = time.time() + NO_MATCH_BACKOFF
                 log(f"  ⚠ Buy error: not enough balance — backing off {NO_MATCH_BACKOFF}s")
+            elif 'fully filled' in err_str.lower() or 'fok' in err_str.lower():
+                self._no_match_until = time.time() + NO_MATCH_BACKOFF
+                log(f"  ⚠ Buy error: FOK fill failed — backing off {NO_MATCH_BACKOFF}s")
             else:
                 log(f"  ⚠ Buy error: {e}")
             return
@@ -850,6 +859,11 @@ class BTC80Bot:
         """Update tracked balance, check book depth, record trade."""
         pos = self.position
         self.position = None
+
+        # Set cooldown after stop-loss exits to avoid re-entering the same crash
+        if reason and 'stop_loss' in reason:
+            self._stop_loss_until = time.time() + STOP_LOSS_COOLDOWN
+            log(f"  ⏸ Stop-loss cooldown: {STOP_LOSS_COOLDOWN}s before next entry")
 
         if proceeds > 0:
             self.tracked_balance = proceeds
