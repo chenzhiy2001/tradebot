@@ -59,6 +59,7 @@ MIN_BET = 5                   # Polymarket minimum bet
 MAX_BET = 50                  # Safety cap
 
 ENTRY_MID = 0.80              # Buy when either BTC side mid-price reaches this
+MAX_ENTRY_MID = 0.92          # Don't buy above this — risk/reward too bad
 LIMIT_SELL_PRICE = 0.99       # GTC limit sell price (take profit)
 STOP_LOSS_MID = 0.60          # FOK sell if mid drops to this (stop loss)
 
@@ -71,6 +72,9 @@ TICK_INTERVAL = 0.25          # 250ms main loop tick
 ORDER_POLL_SECS = 3.0         # How often to poll share balance for GTC fill detection
 SETTLEMENT_TIMEOUT = 30       # Max seconds to wait for on-chain settlement
 RESOLUTION_GRACE = 15         # Seconds after window end to check for resolution
+NO_MATCH_BACKOFF = 10         # Seconds to stop retrying after first "no match" error
+SELL_MAX_RETRIES = 5          # Max FOK sell attempts for stop loss (was 3)
+SELL_RETRY_SLEEP = 1.0        # Seconds between sell retries (was 0.5)
 
 # Data files
 LOG_FILE = "btc80_log.txt"
@@ -409,6 +413,7 @@ class BTC80Bot:
         self.trade_count = 0
         self.win_count = 0
         self.total_pnl = 0.0
+        self._no_match_until = 0  # Backoff timestamp after "no match" errors
 
     def update_market(self, window):
         """Update current window and subscribe to tokens."""
@@ -433,12 +438,18 @@ class BTC80Bot:
         if now_utc >= self.current_window["end"]:
             return
 
+        # No-match backoff: skip entry attempts for a while after market goes dead
+        if time.time() < self._no_match_until:
+            return
+
         for side in ["UP", "DOWN"]:
             token = self.current_window[f"{side.lower()}_token"]
             mid = self.poly.mid_price(token)
             if mid is None:
                 continue
             if mid >= ENTRY_MID:
+                if mid > MAX_ENTRY_MID:
+                    continue  # Risk/reward too bad above cap
                 self._enter(token, side)
                 return
 
@@ -512,7 +523,12 @@ class BTC80Bot:
                 f"(spent ${actual_cost:.2f})")
 
         except Exception as e:
-            log(f"  ⚠ Buy error: {e}")
+            err_str = str(e)
+            if 'no match' in err_str.lower():
+                self._no_match_until = time.time() + NO_MATCH_BACKOFF
+                log(f"  ⚠ Buy error: no match — backing off {NO_MATCH_BACKOFF}s")
+            else:
+                log(f"  ⚠ Buy error: {e}")
             return
 
         # ── Wait for settlement ──
@@ -721,7 +737,7 @@ class BTC80Bot:
         sell_amount = share_bal if (share_bal and share_bal > 0) else pos["shares"]
 
         # FOK market sell
-        for attempt in range(3):
+        for attempt in range(SELL_MAX_RETRIES):
             try:
                 bid, _, _ = self.poly.get_price(token_id)
                 sell_price_est = round(bid, 2) if bid and bid > 0 else 0.01
@@ -751,7 +767,7 @@ class BTC80Bot:
                     return
 
                 log(f"  ⚠ Sell FOK rejected (attempt {attempt+1}): {resp}")
-                time.sleep(0.5)
+                time.sleep(SELL_RETRY_SLEEP)
 
             except Exception as e:
                 err_str = str(e)
@@ -765,11 +781,17 @@ class BTC80Bot:
                     self._handle_exit(0, -pos["cost"], 0, "stop_loss_expired")
                     return
                 log(f"  ⚠ Sell error (attempt {attempt+1}): {e}")
-                time.sleep(0.5)
+                time.sleep(SELL_RETRY_SLEEP)
 
-        # All retries failed
-        log(f"  ❌ Stop loss sell failed after 3 attempts")
-        self._handle_exit(0, -pos["cost"], 0, "stop_loss_failed")
+        # All retries failed — shares likely still exist and may auto-resolve
+        log(f"  ❌ Stop loss sell failed after {SELL_MAX_RETRIES} attempts")
+        # Check real balance: if we still have USDC, shares probably resolved
+        real_bal = get_usdc_balance()
+        if real_bal is not None and real_bal >= INITIAL_BALANCE:
+            log(f"  🔄 Real USDC=${real_bal:.2f} ≥ ${INITIAL_BALANCE} — resetting tracked balance")
+            self._handle_exit(INITIAL_BALANCE, INITIAL_BALANCE - pos["cost"], 0, "stop_loss_failed_reset")
+        else:
+            self._handle_exit(0, -pos["cost"], 0, "stop_loss_failed")
 
     # ─── EXIT HANDLING ────────────────────────────────────────────────
 
@@ -863,8 +885,9 @@ class BTC80Bot:
 def main():
     mode = "DRY" if DRY_RUN else "LIVE"
     log(f"═══ BTC80 Bot ═══ [{mode}]")
-    log(f"Strategy: Buy BTC side at {ENTRY_MID} → limit sell {LIMIT_SELL_PRICE} / stop {STOP_LOSS_MID}")
+    log(f"Strategy: Buy BTC side at {ENTRY_MID}-{MAX_ENTRY_MID} → limit sell {LIMIT_SELL_PRICE} / stop {STOP_LOSS_MID}")
     log(f"Balance: ${INITIAL_BALANCE:.2f} start | 99% per trade | reset when > book depth")
+    log(f"Sell retries: {SELL_MAX_RETRIES} @ {SELL_RETRY_SLEEP}s | no-match backoff: {NO_MATCH_BACKOFF}s")
     log("")
 
     poly = PolymarketFeed()
