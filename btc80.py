@@ -515,7 +515,7 @@ class BTC80Bot:
             log(f"  📋 GTC limit sell at {LIMIT_SELL_PRICE} (simulated)")
             return
 
-        # ── Live FOK buy (retry with smaller size on fill failure) ──
+        # ── Live FOK buy (retry on fill failure, same amount) ──
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
@@ -558,14 +558,7 @@ class BTC80Bot:
                     log(f"  ⚠ Buy error: not enough balance — backing off {NO_MATCH_BACKOFF}s")
                     return
                 elif 'fully filled' in err_str.lower() or 'fok' in err_str.lower():
-                    # Reduce bet by 20% and retry immediately
-                    old_bet = bet
-                    bet = round(bet * 0.8)
-                    if bet < MIN_BET:
-                        self._no_match_until = time.time() + NO_MATCH_BACKOFF
-                        log(f"  ⚠ FOK fill failed at ${old_bet}, reduced to ${bet} < min — backing off {NO_MATCH_BACKOFF}s")
-                        return
-                    log(f"  ⚠ FOK fill failed at ${old_bet} — retrying at ${bet} (attempt {attempt+2}/{max_attempts})")
+                    log(f"  ⚠ FOK fill failed at ${bet} (attempt {attempt+1}/{max_attempts})")
                     continue
                 else:
                     log(f"  ⚠ Buy error: {e}")
@@ -574,6 +567,24 @@ class BTC80Bot:
             # All attempts exhausted
             self._no_match_until = time.time() + NO_MATCH_BACKOFF
             log(f"  ⚠ FOK fill failed after {max_attempts} attempts — backing off {NO_MATCH_BACKOFF}s")
+            return
+
+        # ── Post-fill price guard: reject bad fills above MAX_ENTRY_MID ──
+        if fill_price > MAX_ENTRY_MID:
+            log(f"  ⚠ Fill price {fill_price:.3f} > MAX_ENTRY_MID {MAX_ENTRY_MID} — selling back immediately")
+            self.position = {
+                "token_id": token_id,
+                "side": side,
+                "entry_price": fill_price,
+                "shares": actual_shares,
+                "cost": actual_cost,
+                "entry_time": time.time(),
+                "limit_order_id": None,
+                "usdc_snapshot": 0,
+                "last_poll": 0,
+                "dry_run": False,
+            }
+            self._execute_stop_loss()
             return
 
         # ── Wait for settlement ──
