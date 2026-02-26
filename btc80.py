@@ -463,6 +463,13 @@ class BTC80Bot:
         if real_balance is None:
             return
 
+        # Reality check: if real USDC is too low but tracked is inflated
+        # (e.g. funds locked in unclaimed positions), reset tracked balance
+        if real_balance < MIN_BET and self.tracked_balance > INITIAL_BALANCE:
+            log(f"  ⚠ Reality check: real=${real_balance:.2f} < ${MIN_BET} "
+                f"but tracked=${self.tracked_balance:.2f} — resetting to ${INITIAL_BALANCE}")
+            self.tracked_balance = INITIAL_BALANCE
+
         effective = min(self.tracked_balance, real_balance)
         bet = int(effective * BET_PCT)
         bet = min(bet, MAX_BET)
@@ -531,6 +538,9 @@ class BTC80Bot:
             if 'no match' in err_str.lower():
                 self._no_match_until = time.time() + NO_MATCH_BACKOFF
                 log(f"  ⚠ Buy error: no match — backing off {NO_MATCH_BACKOFF}s")
+            elif 'not enough balance' in err_str.lower():
+                self._no_match_until = time.time() + NO_MATCH_BACKOFF
+                log(f"  ⚠ Buy error: not enough balance — backing off {NO_MATCH_BACKOFF}s")
             else:
                 log(f"  ⚠ Buy error: {e}")
             return
