@@ -56,7 +56,7 @@ FUNDER_ADDRESS = founder_address
 INITIAL_BALANCE = 20.0        # Starting tracked balance / profit-taking reset value
 BET_PCT = 0.99                # Use 99% of tracked balance per trade
 MIN_BET = 5                   # Polymarket minimum bet
-MAX_BET = 50                  # Safety cap
+MAX_BET = 2000                  # Safety cap
 
 ENTRY_MID = 0.80              # Buy when either BTC side mid-price reaches this
 MAX_ENTRY_MID = 0.92          # Don't buy above this — risk/reward too bad
