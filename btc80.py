@@ -685,15 +685,10 @@ class BTC80Bot:
             if share_bal is not None and share_bal < 1.0:
                 # Shares gone → GTC filled or market resolved
                 log(f"  🎉 LIMIT FILLED: BTC {side} shares={share_bal:.1f} (sold)")
-                # Wait a moment for USDC settlement
-                time.sleep(3)
-                usdc_now = get_usdc_balance() or 0
-                proceeds = usdc_now - pos.get("usdc_snapshot", 0)
-                if proceeds <= 0:
-                    # Fallback: estimate from limit price
-                    proceeds = pos["shares"] * LIMIT_SELL_PRICE
-                    fee = compute_taker_fee(pos["shares"], LIMIT_SELL_PRICE)
-                    proceeds -= fee
+                # Compute proceeds analytically (USDC snapshot is unreliable due to settlement lag)
+                proceeds = pos["shares"] * LIMIT_SELL_PRICE
+                fee = compute_taker_fee(pos["shares"], LIMIT_SELL_PRICE)
+                proceeds -= fee
                 pnl = proceeds - pos["cost"]
                 sell_price = LIMIT_SELL_PRICE
                 log(f"  💰 Proceeds: ${proceeds:.2f} → PnL ${pnl:+.2f}")
