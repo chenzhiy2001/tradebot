@@ -59,7 +59,7 @@ FUNDER_ADDRESS = founder_address
 # STRATEGY PARAMETERS
 # =========================================================================
 MIN_BET = 5                   # Polymarket minimum
-MAX_BET = 50                  # Cap bet size — compound up to here, then steady
+MAX_BET = 2000                  # Cap bet size — compound up to here, then steady
 BET_PCT = 0.90                # Bet 90% of balance, keep 10% buffer
 
 # Spike detection — BTC token price must rise this much this fast
