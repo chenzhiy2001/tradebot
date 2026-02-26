@@ -422,6 +422,11 @@ class BTC80Bot:
         old_epoch = self.current_window["epoch"] if self.current_window else None
         self.current_window = window
         if window and window["epoch"] != old_epoch:
+            # Emergency close: if holding a position from the old window, sell NOW
+            # before switching WS subscriptions (old token feed will die)
+            if self.position and old_epoch is not None:
+                log("  ⚠ Window changing while holding position — emergency close!")
+                self._execute_stop_loss()
             tokens = [window["up_token"], window["down_token"]]
             self.poly.subscribe(tokens)
             self._low_bal_logged = False  # Reset balance-too-low log flag on new window
