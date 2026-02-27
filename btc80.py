@@ -145,8 +145,11 @@ def get_share_balance(token_id):
         return None
 
 
-def wait_for_settlement(token_id, expected_shares, pre_buy_balance=0, timeout=30):
-    """Poll until on-chain balance shows NEW shares, or timeout."""
+def wait_for_settlement(token_id, expected_shares, pre_buy_balance=0, timeout=30,
+                        price_monitor=None, stop_price=None):
+    """Poll until on-chain balance shows NEW shares, or timeout.
+    If price_monitor and stop_price are provided, also checks mid price
+    each iteration and returns early if mid <= stop_price."""
     deadline = time.time() + timeout
     last_balance = 0
     while time.time() < deadline:
@@ -156,6 +159,13 @@ def wait_for_settlement(token_id, expected_shares, pre_buy_balance=0, timeout=30
             new_shares = bal - pre_buy_balance
             if new_shares >= expected_shares * 0.9:
                 return True, bal
+        # Check if price crashed during settlement
+        if price_monitor and stop_price is not None:
+            mid = price_monitor(token_id)
+            if mid is not None and mid <= stop_price:
+                log(f"  ⚠ Price crashed to {mid:.3f} during settlement — settling early")
+                if last_balance > pre_buy_balance:
+                    return True, last_balance
         time.sleep(2)
     return False, last_balance
 
@@ -578,6 +588,7 @@ class BTC80Bot:
         settled, on_chain = wait_for_settlement(
             token_id, actual_shares, pre_buy_balance=pre_buy_bal,
             timeout=SETTLEMENT_TIMEOUT,
+            price_monitor=self.poly.mid_price, stop_price=STOP_LOSS_MID,
         )
         if settled:
             new_shares = on_chain - pre_buy_bal
@@ -791,7 +802,9 @@ class BTC80Bot:
             self._handle_exit(proceeds, pnl, LIMIT_SELL_PRICE, "limit_fill")
             return
 
-        sell_amount = share_bal if (share_bal and share_bal > 0) else pos["shares"]
+        # Use position shares, NOT on-chain balance — auto-claimer can deposit
+        # resolved shares into the same wallet, inflating get_share_balance()
+        sell_amount = pos["shares"]
 
         # Place aggressive GTC sell at floor price (0.01) — sweeps all bids
         # This works unlike FOK because it partially fills and rests the remainder
