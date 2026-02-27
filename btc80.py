@@ -63,6 +63,7 @@ LIMIT_BUY_PRICE = 0.80        # GTC limit buy price (fixed entry)
 LIMIT_SELL_PRICE = 0.99       # GTC limit sell price (take profit)
 STOP_LOSS_MID = 0.70          # FOK sell if mid drops to this (stop loss)
 BUY_FILL_TIMEOUT = 120        # Max seconds to wait for GTC buy to fill
+ENTRY_CONFIRM_SECS = 5        # Mid must stay >= ENTRY_MID for this many seconds before entering
 
 # Polymarket fee formula (5m crypto)
 CRYPTO_FEE_RATE = 0.25
@@ -74,9 +75,6 @@ ORDER_POLL_SECS = 1.0         # How often to poll share balance for GTC fill det
 SETTLEMENT_TIMEOUT = 30       # Max seconds to wait for on-chain settlement
 RESOLUTION_GRACE = 15         # Seconds after window end to check for resolution
 NO_MATCH_BACKOFF = 10         # Seconds to stop retrying after first "no match" error
-STOP_LOSS_COOLDOWN = 60       # Seconds to wait after a stop loss before re-entering
-CONSEC_LOSS_COOLDOWN = 300    # Seconds to wait after 2+ consecutive losses
-CONSEC_LOSS_THRESHOLD = 2     # Number of consecutive losses to trigger long cooldown
 SELL_MAX_RETRIES = 5          # Max FOK sell attempts for stop loss (was 3)
 SELL_RETRY_SLEEP = 1.0        # Seconds between sell retries (was 0.5)
 
@@ -429,8 +427,7 @@ class BTC80Bot:
         self.win_count = 0
         self.total_pnl = 0.0
         self._no_match_until = 0  # Backoff timestamp after "no match" errors
-        self._stop_loss_until = 0  # Cooldown timestamp after stop loss
-        self._consec_losses = 0      # Consecutive loss counter
+        self._entry_confirm = {}     # {token_id: first_seen_timestamp} for entry confirmation
 
     def update_market(self, window):
         """Update current window and subscribe to tokens."""
@@ -478,18 +475,25 @@ class BTC80Bot:
         if time.time() < self._no_match_until:
             return
 
-        # Post-stop-loss cooldown: don't re-enter the same crash
-        if time.time() < self._stop_loss_until:
-            return
-
+        now = time.time()
         for side in ["UP", "DOWN"]:
             token = self.current_window[f"{side.lower()}_token"]
             mid = self.poly.mid_price(token)
             if mid is None:
+                self._entry_confirm.pop(token, None)
                 continue
             if mid >= ENTRY_MID:
-                self._enter(token, side)
-                return
+                # Entry confirmation: mid must stay >= ENTRY_MID for N seconds
+                if token not in self._entry_confirm:
+                    self._entry_confirm[token] = now
+                elapsed = now - self._entry_confirm[token]
+                if elapsed >= ENTRY_CONFIRM_SECS:
+                    self._entry_confirm.pop(token, None)
+                    self._enter(token, side)
+                    return
+            else:
+                # Mid dropped below threshold — reset confirmation
+                self._entry_confirm.pop(token, None)
 
     # ─── ENTRY ────────────────────────────────────────────────────────
 
@@ -986,18 +990,8 @@ class BTC80Bot:
         pos = self.position
         self.position = None
 
-        # Set cooldown after stop-loss exits to avoid re-entering the same crash
-        if reason and 'stop_loss' in reason:
-            self._consec_losses += 1
-            if self._consec_losses >= CONSEC_LOSS_THRESHOLD:
-                cooldown = CONSEC_LOSS_COOLDOWN
-                log(f"  ⏸ {self._consec_losses} consecutive losses — extended cooldown: {cooldown}s")
-            else:
-                cooldown = STOP_LOSS_COOLDOWN
-                log(f"  ⏸ Stop-loss cooldown: {cooldown}s before next entry")
-            self._stop_loss_until = time.time() + cooldown
-        else:
-            self._consec_losses = 0  # Reset on any non-stop-loss exit (win)
+        # Reset entry confirmation after any exit
+        self._entry_confirm = {}
 
         if proceeds > 0:
             # tracked = unspent portion + proceeds from this trade
