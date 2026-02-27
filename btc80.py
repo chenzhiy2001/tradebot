@@ -550,15 +550,19 @@ class BTC80Bot:
             resp = client.post_order(signed_order, OrderType.GTC)
 
             order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
-            taking = float(resp.get("takingAmount", 0)) if isinstance(resp, dict) else 0
+            # Parse takingAmount safely — API sometimes returns empty string
+            raw_taking = resp.get("takingAmount", 0) if isinstance(resp, dict) else 0
+            try:
+                taking = float(raw_taking) if raw_taking != "" else 0
+            except (ValueError, TypeError):
+                taking = 0
 
             if not order_id and taking <= 0:
                 log(f"  ⚠ GTC buy rejected: {resp}")
                 return
 
-            if order_id:
-                log(f"  📋 GTC buy placed (order={order_id[:12]}...)")
-
+            # Store pending_buy IMMEDIATELY so we track the order even if
+            # subsequent parsing/logic errors occur
             self.pending_buy = {
                 "order_id": order_id,
                 "token_id": token_id,
@@ -569,6 +573,9 @@ class BTC80Bot:
                 "pre_buy_bal": pre_buy_bal,
                 "last_poll": 0,
             }
+
+            if order_id:
+                log(f"  📋 GTC buy placed (order={order_id[:12]}...)")
 
             # If it filled instantly (taking > 0 and no resting order)
             if taking > 0 and not order_id:
@@ -585,6 +592,11 @@ class BTC80Bot:
                 log(f"  ⚠ Buy error: not enough balance — backing off {NO_MATCH_BACKOFF}s")
             else:
                 log(f"  ⚠ Buy error: {e}")
+                # If pending_buy was already stored (order placed but parsing
+                # failed), don't clear it — let _manage_pending_buy detect fill
+                if self.pending_buy:
+                    log(f"  ℹ Order may have been placed — monitoring for fill")
+                    return
 
     def _cancel_pending_buy_and_handle_partial(self, reason):
         """Cancel pending GTC buy and handle any partial fill."""
