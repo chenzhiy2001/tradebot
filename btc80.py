@@ -63,7 +63,6 @@ LIMIT_BUY_PRICE = 0.80        # GTC limit buy price (fixed entry)
 LIMIT_SELL_PRICE = 0.99       # GTC limit sell price (take profit)
 STOP_LOSS_MID = 0.70          # FOK sell if mid drops to this (stop loss)
 BUY_FILL_TIMEOUT = 120        # Max seconds to wait for GTC buy to fill
-ENTRY_CONFIRM_SECS = 5        # Mid must stay >= ENTRY_MID for this many seconds before entering
 
 # Polymarket fee formula (5m crypto)
 CRYPTO_FEE_RATE = 0.25
@@ -427,7 +426,7 @@ class BTC80Bot:
         self.win_count = 0
         self.total_pnl = 0.0
         self._no_match_until = 0  # Backoff timestamp after "no match" errors
-        self._entry_confirm = {}     # {token_id: first_seen_timestamp} for entry confirmation
+
 
     def update_market(self, window):
         """Update current window and subscribe to tokens."""
@@ -470,25 +469,14 @@ class BTC80Bot:
         if time.time() < self._no_match_until:
             return
 
-        now = time.time()
         for side in ["UP", "DOWN"]:
             token = self.current_window[f"{side.lower()}_token"]
             mid = self.poly.mid_price(token)
             if mid is None:
-                self._entry_confirm.pop(token, None)
                 continue
             if mid >= ENTRY_MID:
-                # Entry confirmation: mid must stay >= ENTRY_MID for N seconds
-                if token not in self._entry_confirm:
-                    self._entry_confirm[token] = now
-                elapsed = now - self._entry_confirm[token]
-                if elapsed >= ENTRY_CONFIRM_SECS:
-                    self._entry_confirm.pop(token, None)
-                    self._enter(token, side)
-                    return
-            else:
-                # Mid dropped below threshold — reset confirmation
-                self._entry_confirm.pop(token, None)
+                self._enter(token, side)
+                return
 
     # ─── ENTRY ────────────────────────────────────────────────────────
 
@@ -984,9 +972,6 @@ class BTC80Bot:
         """Update tracked balance, check book depth, record trade."""
         pos = self.position
         self.position = None
-
-        # Reset entry confirmation after any exit
-        self._entry_confirm = {}
 
         if proceeds > 0:
             # tracked = unspent portion + proceeds from this trade
