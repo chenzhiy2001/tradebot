@@ -469,6 +469,11 @@ class BTC80Bot:
         if now_utc >= self.current_window["end"]:
             return
 
+        # Don't enter if window ends in < 30s — not enough time
+        secs_left = (self.current_window["end"] - now_utc).total_seconds()
+        if secs_left < 30:
+            return
+
         # No-match backoff: skip entry attempts for a while after market goes dead
         if time.time() < self._no_match_until:
             return
@@ -653,14 +658,6 @@ class BTC80Bot:
             log(f"  🛑 Price crashed to {mid:.3f} while waiting for buy fill")
             self._cancel_pending_buy_and_handle_partial("price crash")
             return
-
-        # Cancel if window is about to end (< 30s remaining)
-        if self.current_window:
-            secs_left = (self.current_window["end"] - datetime.now(timezone.utc)).total_seconds()
-            if secs_left < 30:
-                log(f"  ⚠ Window ending in {secs_left:.0f}s")
-                self._cancel_pending_buy_and_handle_partial("window ending")
-                return
 
         # Poll for fill every ORDER_POLL_SECS
         if now - pb.get("last_poll", 0) < ORDER_POLL_SECS:
