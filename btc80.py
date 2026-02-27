@@ -74,8 +74,6 @@ ORDER_POLL_SECS = 1.0         # How often to poll share balance for GTC fill det
 SETTLEMENT_TIMEOUT = 30       # Max seconds to wait for on-chain settlement
 RESOLUTION_GRACE = 15         # Seconds after window end to check for resolution
 NO_MATCH_BACKOFF = 10         # Seconds to stop retrying after first "no match" error
-SELL_MAX_RETRIES = 5          # Max FOK sell attempts for stop loss (was 3)
-SELL_RETRY_SLEEP = 1.0        # Seconds between sell retries (was 0.5)
 
 # Data files
 LOG_FILE = "btc80_log.txt"
@@ -860,9 +858,8 @@ class BTC80Bot:
     # ─── STOP LOSS EXECUTION ─────────────────────────────────────────
 
     def _execute_stop_loss(self):
-        """Cancel GTC limit order, then sell all shares via GTC limit at 0.01.
-        Uses GTC at floor price instead of FOK so partial fills work even in
-        thin/crashing order books where FOK can't match."""
+        """Cancel GTC limit sell, then sell all shares at current bid.
+        Simple: sell at bid → wait → retry at new bid → give up."""
         pos = self.position
         if not pos:
             return
@@ -870,20 +867,18 @@ class BTC80Bot:
         token_id = pos["token_id"]
         side = pos["side"]
 
-        # Cancel take-profit GTC limit order first
+        # ── 1. Cancel take-profit GTC limit sell ──
         if pos.get("limit_order_id"):
             try:
                 client.cancel(pos["limit_order_id"])
                 log(f"  ❌ Canceled GTC limit order")
             except Exception as e:
                 log(f"  ⚠ Cancel error (may be already filled): {e}")
-            # Brief pause to let cancel propagate before checking balance
             time.sleep(1)
 
-        # Check actual share balance (after cancel settles)
+        # ── 2. Check if shares already gone (GTC filled during cancel) ──
         share_bal = get_share_balance(token_id)
         if share_bal is not None and share_bal < 1.0:
-            # Shares already gone (GTC filled while we were canceling)
             log(f"  ℹ Shares already gone — GTC likely filled")
             proceeds = pos["shares"] * LIMIT_SELL_PRICE
             fee = compute_taker_fee(pos["shares"], LIMIT_SELL_PRICE)
@@ -892,8 +887,7 @@ class BTC80Bot:
             self._handle_exit(proceeds, pnl, LIMIT_SELL_PRICE, "limit_fill")
             return
 
-        # Use position shares, but verify against on-chain balance.
-        # If on-chain is lower, use that (pos["shares"] may be inflated).
+        # ── 3. Determine sell amount ──
         sell_amount = pos["shares"]
         if share_bal is not None and share_bal < sell_amount:
             log(f"  ⚠ On-chain shares ({share_bal:.1f}) < position ({sell_amount:.1f}) — using on-chain")
@@ -903,21 +897,17 @@ class BTC80Bot:
             self._handle_exit(0, -pos["cost"], 0, "stop_loss_no_shares")
             return
 
-        # Place GTC sell at stop-loss price (0.75) for controlled exit.
-        # If not filled quickly, fall back to lower price to force exit.
-        stop_sell_order_id = None
-        for attempt in range(SELL_MAX_RETRIES):
-            try:
-                # First attempt at STOP_LOSS_MID, subsequent attempts at lower prices
-                if attempt == 0:
-                    sell_price = STOP_LOSS_MID
-                elif attempt == 1:
-                    bid, _, _ = self.poly.get_price(token_id)
-                    sell_price = round(bid - 0.01, 2) if bid and bid > 0.02 else 0.01
-                else:
-                    sell_price = 0.01
-                log(f"  📤 GTC sell {sell_amount:.1f}sh BTC {side} @ {sell_price} (attempt {attempt+1})")
+        # ── 4. Sell at bid — up to 3 attempts ──
+        for attempt in range(3):
+            # Get current bid for sell price
+            bid, _, _ = self.poly.get_price(token_id)
+            if attempt == 0:
+                sell_price = round(bid, 2) if bid and bid > 0.02 else STOP_LOSS_MID
+            else:
+                sell_price = round(bid - 0.01, 2) if bid and bid > 0.02 else 0.01
+            log(f"  📤 Stop-sell {sell_amount:.1f}sh BTC {side} @ {sell_price} (attempt {attempt+1}, bid={bid})")
 
+            try:
                 order_args = OrderArgs(
                     price=sell_price,
                     size=sell_amount,
@@ -926,167 +916,107 @@ class BTC80Bot:
                 )
                 signed_order = client.create_order(order_args)
                 resp = client.post_order(signed_order, OrderType.GTC)
-
-                order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
-                success = resp.get("success", False) if isinstance(resp, dict) else False
-                # Safe parsing — API sometimes returns empty string for takingAmount/makingAmount
-                raw_taking = resp.get("takingAmount", 0) if isinstance(resp, dict) else 0
-                raw_making = resp.get("makingAmount", 0) if isinstance(resp, dict) else 0
-                try:
-                    taking = float(raw_taking) if raw_taking != "" else 0
-                except (ValueError, TypeError):
-                    taking = 0
-                try:
-                    making = float(raw_making) if raw_making != "" else 0
-                except (ValueError, TypeError):
-                    making = 0
-
-                if order_id:
-                    stop_sell_order_id = order_id
-                    log(f"  📋 Stop-sell order placed (order={order_id[:12]}...)")
-                    # Wait for fills — poll share balance
-                    break
-
-                if taking > 0:
-                    # Immediately filled entirely
-                    actual_revenue = taking
-                    actual_shares_sold = making if making > 0 else sell_amount
-                    actual_price = round(actual_revenue / actual_shares_sold, 4) if actual_shares_sold > 0 else 0
-                    pnl = actual_revenue - pos["cost"]
-                    log(f"  💰 Sold {actual_shares_sold:.1f}sh @ ~{actual_price:.3f} "
-                        f"→ PnL ${pnl:+.2f} (stop_loss)")
-                    self._handle_exit(actual_revenue, pnl, actual_price, "stop_loss")
-                    return
-
-                # No order_id and no taking — check if shares disappeared (silent fill)
-                log(f"  ⚠ Ambiguous sell response (attempt {attempt+1}): {resp}")
-                time.sleep(1)
-                remaining = get_share_balance(token_id)
-                if remaining is not None and remaining < 1.0:
-                    log(f"  ✅ Shares gone after sell — order filled silently")
-                    proceeds = sell_amount * sell_price
-                    fee = compute_taker_fee(sell_amount, sell_price)
-                    proceeds -= fee
-                    pnl = proceeds - pos["cost"]
-                    log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                    self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
-                    return
-                time.sleep(SELL_RETRY_SLEEP)
-
             except Exception as e:
-                err_str = str(e)
-                if 'price' in err_str.lower() and 'max' in err_str.lower():
+                err_str = str(e).lower()
+                if 'price' in err_str and 'max' in err_str:
                     log(f"  ✅ Market resolved in our favor")
                     pnl = pos["shares"] * 1.0 - pos["cost"]
                     self._handle_exit(pos["shares"], pnl, 1.0, "stop_loss_resolved")
                     return
-                if 'no match' in err_str.lower() or 'orderbook' in err_str.lower():
+                if 'no match' in err_str or 'orderbook' in err_str:
                     log(f"  ⚠ Market closed — shares may auto-redeem")
                     self._handle_exit(0, -pos["cost"], 0, "stop_loss_expired")
                     return
-                if 'not enough balance' in err_str.lower():
-                    # Shares likely already sold by a previous attempt
-                    log(f"  ⚠ Sell error: not enough balance — checking if already sold")
+                if 'not enough balance' in err_str:
                     time.sleep(1)
                     remaining = get_share_balance(token_id)
                     if remaining is not None and remaining < 1.0:
-                        log(f"  ✅ Shares already sold (balance={remaining:.1f})")
-                        proceeds = sell_amount * STOP_LOSS_MID
-                        fee = compute_taker_fee(sell_amount, STOP_LOSS_MID)
+                        log(f"  ✅ Shares already sold")
+                        proceeds = sell_amount * sell_price
+                        fee = compute_taker_fee(sell_amount, sell_price)
+                        proceeds -= fee
+                        pnl = proceeds - pos["cost"]
+                        self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
+                        return
+                log(f"  ⚠ Sell error (attempt {attempt+1}): {e}")
+                time.sleep(1)
+                continue
+
+            # Parse response
+            order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
+            raw_taking = resp.get("takingAmount", 0) if isinstance(resp, dict) else 0
+            raw_making = resp.get("makingAmount", 0) if isinstance(resp, dict) else 0
+            try:
+                taking = float(raw_taking) if raw_taking != "" else 0
+            except (ValueError, TypeError):
+                taking = 0
+            try:
+                making = float(raw_making) if raw_making != "" else 0
+            except (ValueError, TypeError):
+                making = 0
+
+            # Instant fill
+            if taking > 0 and not order_id:
+                actual_shares = making if making > 0 else sell_amount
+                actual_price = round(taking / actual_shares, 4) if actual_shares > 0 else 0
+                pnl = taking - pos["cost"]
+                log(f"  💰 Sold {actual_shares:.1f}sh @ ~{actual_price:.3f} → PnL ${pnl:+.2f}")
+                self._handle_exit(taking, pnl, actual_price, "stop_loss")
+                return
+
+            # GTC resting — wait up to 10s
+            if order_id:
+                log(f"  📋 Stop-sell placed (order={order_id[:12]}...)")
+                deadline = time.time() + 10
+                filled = False
+                while time.time() < deadline:
+                    remaining = get_share_balance(token_id)
+                    if remaining is not None and remaining < 1.0:
+                        proceeds = sell_amount * sell_price
+                        fee = compute_taker_fee(sell_amount, sell_price)
                         proceeds -= fee
                         pnl = proceeds - pos["cost"]
                         log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                        self._handle_exit(proceeds, pnl, STOP_LOSS_MID, "stop_loss")
+                        self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
                         return
-                log(f"  ⚠ Sell error (attempt {attempt+1}): {e}")
-                time.sleep(SELL_RETRY_SLEEP)
-
-        # If GTC order was placed, wait for it to fill (poll share balance)
-        if stop_sell_order_id:
-            log(f"  ⏳ Waiting for stop-sell to fill...")
-            deadline = time.time() + 10  # Wait up to 10s for fills
-            while time.time() < deadline:
+                    time.sleep(2)
+                # Not filled — cancel and retry
+                try:
+                    client.cancel(order_id)
+                    log(f"  ⚠ Not filled in 10s — canceling (attempt {attempt+1})")
+                except Exception:
+                    pass
+                time.sleep(1)
                 remaining = get_share_balance(token_id)
                 if remaining is not None and remaining < 1.0:
-                    # All shares sold — compute proceeds analytically
                     proceeds = sell_amount * sell_price
                     fee = compute_taker_fee(sell_amount, sell_price)
                     proceeds -= fee
                     pnl = proceeds - pos["cost"]
-                    log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
+                    log(f"  💰 Filled during cancel → PnL ${pnl:+.2f}")
                     self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
                     return
-                time.sleep(2)
-            # Timed out — cancel and retry at lower price
-            try:
-                client.cancel(stop_sell_order_id)
-                log(f"  ⚠ Stop-sell at {sell_price} not filled in 10s — canceling")
-            except Exception:
-                pass
-            stop_sell_order_id = None
+                continue
+
+            # Ambiguous response — check shares
+            log(f"  ⚠ Ambiguous response: {resp}")
             time.sleep(1)
-            # Check if shares gone after cancel (may have filled during cancel)
             remaining = get_share_balance(token_id)
             if remaining is not None and remaining < 1.0:
                 proceeds = sell_amount * sell_price
                 fee = compute_taker_fee(sell_amount, sell_price)
                 proceeds -= fee
                 pnl = proceeds - pos["cost"]
-                log(f"  💰 Stop-sell filled during cancel — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
+                log(f"  ✅ Shares gone — filled silently → PnL ${pnl:+.2f}")
                 self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
                 return
-            # Fall back to sweep at 0.01 to force exit
-            log(f"  📤 Sweep sell {sell_amount:.1f}sh BTC {side} @ 0.01 (fallback)")
-            try:
-                order_args = OrderArgs(
-                    price=0.01,
-                    size=sell_amount,
-                    side=SELL,
-                    token_id=token_id,
-                )
-                signed_order = client.create_order(order_args)
-                resp = client.post_order(signed_order, OrderType.GTC)
-                fb_order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
-                raw_taking = resp.get("takingAmount", 0) if isinstance(resp, dict) else 0
-                try:
-                    taking = float(raw_taking) if raw_taking != "" else 0
-                except (ValueError, TypeError):
-                    taking = 0
-                if taking > 0:
-                    pnl = taking - pos["cost"]
-                    log(f"  💰 Sweep filled — revenue=${taking:.2f}, PnL ${pnl:+.2f}")
-                    self._handle_exit(taking, pnl, 0.01, "stop_loss")
-                    return
-                if fb_order_id:
-                    # Wait briefly for this to fill
-                    log(f"  ⏳ Sweep order placed — waiting...")
-                    fb_deadline = time.time() + 15
-                    while time.time() < fb_deadline:
-                        remaining = get_share_balance(token_id)
-                        if remaining is not None and remaining < 1.0:
-                            bid, _, _ = self.poly.get_price(token_id)
-                            est_price = bid if bid and bid > 0 else 0.01
-                            proceeds = sell_amount * est_price
-                            fee = compute_taker_fee(sell_amount, est_price)
-                            proceeds -= fee
-                            pnl = proceeds - pos["cost"]
-                            log(f"  💰 Sweep filled — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                            self._handle_exit(proceeds, pnl, est_price, "stop_loss")
-                            return
-                        time.sleep(2)
-                    try:
-                        client.cancel(fb_order_id)
-                    except Exception:
-                        pass
-            except Exception as e:
-                log(f"  ⚠ Sweep sell error: {e}")
+            time.sleep(1)
 
-        # All retries failed — shares may still exist and auto-resolve
-        log(f"  ❌ Stop loss sell failed after all attempts")
-        # Check real balance: if enough USDC remains, reset tracked balance to real USDC
+        # ── 5. All attempts failed — sync from real balance ──
+        log(f"  ❌ Stop loss sell failed after 3 attempts")
         real_bal = get_usdc_balance()
         if real_bal is not None and real_bal >= MIN_BET:
-            log(f"  🔄 Real USDC=${real_bal:.2f} ≥ ${MIN_BET} — syncing tracked balance")
+            log(f"  🔄 Real USDC=${real_bal:.2f} — syncing tracked balance")
             self._handle_exit(0, -pos["cost"], 0, "stop_loss_failed_reset")
             self.tracked_balance = real_bal
             log(f"  💼 Tracked balance (synced): ${self.tracked_balance:.2f}")
@@ -1194,7 +1124,7 @@ def main():
     log(f"═══ BTC80 Bot ═══ [{mode}]")
     log(f"Strategy: GTC buy BTC side at {LIMIT_BUY_PRICE} → limit sell {LIMIT_SELL_PRICE} / stop {STOP_LOSS_MID}")
     log(f"Balance: ${INITIAL_BALANCE:.2f} start | 99% per trade | reset when > book depth")
-    log(f"Sell retries: {SELL_MAX_RETRIES} @ {SELL_RETRY_SLEEP}s | no-match backoff: {NO_MATCH_BACKOFF}s")
+    log(f"Stop-sell: 3 attempts at bid | no-match backoff: {NO_MATCH_BACKOFF}s")
     log("")
 
     poly = PolymarketFeed()
