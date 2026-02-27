@@ -691,6 +691,7 @@ class BTC80Bot:
         mid_now = self.poly.mid_price(token_id)
         if mid_now is not None and mid_now <= STOP_LOSS_MID:
             log(f"  🛑 Price crashed to {mid_now:.3f} after buy fill — immediate stop loss")
+            usdc_snap = get_usdc_balance() or 0
             self.position = {
                 "token_id": token_id,
                 "side": side,
@@ -699,7 +700,7 @@ class BTC80Bot:
                 "cost": actual_cost,
                 "entry_time": time.time(),
                 "limit_order_id": None,
-                "usdc_snapshot": 0,
+                "usdc_snapshot": usdc_snap,
                 "last_poll": 0,
                 "dry_run": False,
             }
