@@ -70,7 +70,7 @@ CRYPTO_FEE_EXPONENT = 2
 
 # Timing
 TICK_INTERVAL = 0.25          # 250ms main loop tick
-ORDER_POLL_SECS = 3.0         # How often to poll share balance for GTC fill detection
+ORDER_POLL_SECS = 1.0         # How often to poll share balance for GTC fill detection
 SETTLEMENT_TIMEOUT = 30       # Max seconds to wait for on-chain settlement
 RESOLUTION_GRACE = 15         # Seconds after window end to check for resolution
 NO_MATCH_BACKOFF = 10         # Seconds to stop retrying after first "no match" error
