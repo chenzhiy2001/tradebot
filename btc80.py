@@ -61,7 +61,7 @@ MAX_BET = 2000                  # Safety cap
 ENTRY_MID = 0.80              # Buy when either BTC side mid-price reaches this
 LIMIT_BUY_PRICE = 0.80        # GTC limit buy price (fixed entry)
 LIMIT_SELL_PRICE = 0.99       # GTC limit sell price (take profit)
-STOP_LOSS_MID = 0.70          # FOK sell if mid drops to this (stop loss)
+STOP_LOSS_MID = 0.75          # FOK sell if mid drops to this (stop loss)
 BUY_FILL_TIMEOUT = 120        # Max seconds to wait for GTC buy to fill
 
 # Polymarket fee formula (5m crypto)
