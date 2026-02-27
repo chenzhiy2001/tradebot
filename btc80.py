@@ -681,6 +681,13 @@ class BTC80Bot:
         if not pb:
             return
 
+        # Cap shares at what we actually ordered — get_share_balance can be
+        # inflated by stale shares from prior windows or auto-claimer deposits
+        if actual_shares > pb["shares_requested"] * 1.05:
+            log(f"  ⚠ Share balance inflated: {actual_shares:.1f}sh vs "
+                f"{pb['shares_requested']:.1f}sh ordered — capping")
+            actual_shares = pb["shares_requested"]
+
         token_id = pb["token_id"]
         side = pb["side"]
         actual_cost = round(actual_shares * LIMIT_BUY_PRICE, 2)
@@ -869,9 +876,16 @@ class BTC80Bot:
             self._handle_exit(proceeds, pnl, LIMIT_SELL_PRICE, "limit_fill")
             return
 
-        # Use position shares, NOT on-chain balance — auto-claimer can deposit
-        # resolved shares into the same wallet, inflating get_share_balance()
+        # Use position shares, but verify against on-chain balance.
+        # If on-chain is lower, use that (pos["shares"] may be inflated).
         sell_amount = pos["shares"]
+        if share_bal is not None and share_bal < sell_amount:
+            log(f"  ⚠ On-chain shares ({share_bal:.1f}) < position ({sell_amount:.1f}) — using on-chain")
+            sell_amount = share_bal
+        if sell_amount < 1.0:
+            log(f"  ℹ No shares to sell ({sell_amount:.1f})")
+            self._handle_exit(0, -pos["cost"], 0, "stop_loss_no_shares")
+            return
 
         # Place aggressive GTC sell at floor price (0.01) — sweeps all bids
         # This works unlike FOK because it partially fills and rests the remainder
