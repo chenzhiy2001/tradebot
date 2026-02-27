@@ -647,6 +647,13 @@ class BTC80Bot:
             self._cancel_pending_buy_and_handle_partial("timeout")
             return
 
+        # Stop-loss check: if price crashed, cancel buy and dump any partial fill
+        mid = self.poly.mid_price(token_id)
+        if mid is not None and mid <= STOP_LOSS_MID:
+            log(f"  🛑 Price crashed to {mid:.3f} while waiting for buy fill")
+            self._cancel_pending_buy_and_handle_partial("price crash")
+            return
+
         # Cancel if window is about to end (< 30s remaining)
         if self.current_window:
             secs_left = (self.current_window["end"] - datetime.now(timezone.utc)).total_seconds()
