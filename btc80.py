@@ -837,18 +837,21 @@ class BTC80Bot:
                 log(f"  📊 Window ended {secs_past_end:.0f}s ago — checking resolution")
                 share_bal = get_share_balance(token_id)
                 if share_bal is not None and share_bal < 1.0:
-                    # Shares redeemed
+                    # Shares redeemed — determine win/loss analytically
                     time.sleep(3)
                     usdc_now = get_usdc_balance() or 0
-                    proceeds = usdc_now - pos.get("usdc_snapshot", 0)
-                    if proceeds > pos["cost"] * 0.5:
-                        # Won (got back more than half)
+                    usdc_delta = usdc_now - pos.get("usdc_snapshot", 0)
+                    # Win: shares redeemed at $1 each; Loss: $0 each
+                    # Use USDC delta only to decide win vs loss (gap is large)
+                    if usdc_delta > pos["shares"] * 0.5:
+                        proceeds = pos["shares"] * 1.0  # $1 per share
                         pnl = proceeds - pos["cost"]
                         log(f"  🎉 RESOLVED WIN: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
                     else:
-                        pnl = (proceeds if proceeds > 0 else 0) - pos["cost"]
+                        proceeds = 0.0
+                        pnl = -pos["cost"]
                         log(f"  ❌ RESOLVED LOSS: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                    self._handle_exit(max(proceeds, 0), pnl, 0, "resolved")
+                    self._handle_exit(proceeds, pnl, 0, "resolved")
                 else:
                     # Shares still there? Try canceling + selling
                     log(f"  ⚠ Window ended but still have {share_bal:.1f}sh — forcing sell")
@@ -880,11 +883,9 @@ class BTC80Bot:
         if share_bal is not None and share_bal < 1.0:
             # Shares already gone (GTC filled while we were canceling)
             log(f"  ℹ Shares already gone — GTC likely filled")
-            time.sleep(3)
-            usdc_now = get_usdc_balance() or 0
-            proceeds = usdc_now - pos.get("usdc_snapshot", 0)
-            if proceeds <= 0:
-                proceeds = pos["shares"] * LIMIT_SELL_PRICE
+            proceeds = pos["shares"] * LIMIT_SELL_PRICE
+            fee = compute_taker_fee(pos["shares"], LIMIT_SELL_PRICE)
+            proceeds -= fee
             pnl = proceeds - pos["cost"]
             self._handle_exit(proceeds, pnl, LIMIT_SELL_PRICE, "limit_fill")
             return
@@ -961,11 +962,9 @@ class BTC80Bot:
                 remaining = get_share_balance(token_id)
                 if remaining is not None and remaining < 1.0:
                     log(f"  ✅ Shares gone after sell — order filled silently")
-                    time.sleep(1)
-                    usdc_now = get_usdc_balance() or 0
-                    proceeds = usdc_now - pos.get("usdc_snapshot", 0)
-                    if proceeds <= 0:
-                        proceeds = sell_amount * sell_price  # estimate
+                    proceeds = sell_amount * sell_price
+                    fee = compute_taker_fee(sell_amount, sell_price)
+                    proceeds -= fee
                     pnl = proceeds - pos["cost"]
                     log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
                     self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
@@ -990,14 +989,12 @@ class BTC80Bot:
                     remaining = get_share_balance(token_id)
                     if remaining is not None and remaining < 1.0:
                         log(f"  ✅ Shares already sold (balance={remaining:.1f})")
-                        time.sleep(1)
-                        usdc_now = get_usdc_balance() or 0
-                        proceeds = usdc_now - pos.get("usdc_snapshot", 0)
-                        if proceeds <= 0:
-                            proceeds = sell_amount * STOP_LOSS_MID  # estimate at stop price
+                        proceeds = sell_amount * STOP_LOSS_MID
+                        fee = compute_taker_fee(sell_amount, STOP_LOSS_MID)
+                        proceeds -= fee
                         pnl = proceeds - pos["cost"]
                         log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                        self._handle_exit(proceeds, pnl, 0, "stop_loss")
+                        self._handle_exit(proceeds, pnl, STOP_LOSS_MID, "stop_loss")
                         return
                 log(f"  ⚠ Sell error (attempt {attempt+1}): {e}")
                 time.sleep(SELL_RETRY_SLEEP)
@@ -1009,17 +1006,13 @@ class BTC80Bot:
             while time.time() < deadline:
                 remaining = get_share_balance(token_id)
                 if remaining is not None and remaining < 1.0:
-                    # All shares sold
-                    time.sleep(2)  # Let USDC settle
-                    usdc_now = get_usdc_balance() or 0
-                    proceeds = usdc_now - pos.get("usdc_snapshot", 0)
-                    if proceeds <= 0:
-                        # Fallback estimate from current bid
-                        bid, _, _ = self.poly.get_price(token_id)
-                        proceeds = sell_amount * (bid or 0.01)
+                    # All shares sold — compute proceeds analytically
+                    proceeds = sell_amount * sell_price
+                    fee = compute_taker_fee(sell_amount, sell_price)
+                    proceeds -= fee
                     pnl = proceeds - pos["cost"]
                     log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                    self._handle_exit(proceeds, pnl, 0, "stop_loss")
+                    self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
                     return
                 time.sleep(3)
             # Timed out — cancel and accept whatever we got
@@ -1031,11 +1024,13 @@ class BTC80Bot:
 
         # All retries failed — shares may still exist and auto-resolve
         log(f"  ❌ Stop loss sell failed after {SELL_MAX_RETRIES} attempts")
-        # Check real balance: if enough USDC remains, reset tracked balance
+        # Check real balance: if enough USDC remains, reset tracked balance to real USDC
         real_bal = get_usdc_balance()
         if real_bal is not None and real_bal >= MIN_BET:
-            log(f"  🔄 Real USDC=${real_bal:.2f} ≥ ${MIN_BET} — resetting tracked balance")
-            self._handle_exit(INITIAL_BALANCE, INITIAL_BALANCE - pos["cost"], 0, "stop_loss_failed_reset")
+            log(f"  🔄 Real USDC=${real_bal:.2f} ≥ ${MIN_BET} — syncing tracked balance")
+            self._handle_exit(0, -pos["cost"], 0, "stop_loss_failed_reset")
+            self.tracked_balance = real_bal
+            log(f"  💼 Tracked balance (synced): ${self.tracked_balance:.2f}")
         else:
             self._handle_exit(0, -pos["cost"], 0, "stop_loss_failed")
 
