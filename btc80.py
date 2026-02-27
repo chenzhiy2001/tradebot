@@ -572,24 +572,6 @@ class BTC80Bot:
             log(f"  ⚠ FOK fill failed after {max_attempts} attempts — backing off {NO_MATCH_BACKOFF}s")
             return
 
-        # ── Post-fill price guard: reject bad fills above MAX_ENTRY_MID ──
-        if fill_price > MAX_ENTRY_MID:
-            log(f"  ⚠ Fill price {fill_price:.3f} > MAX_ENTRY_MID {MAX_ENTRY_MID} — selling back immediately")
-            self.position = {
-                "token_id": token_id,
-                "side": side,
-                "entry_price": fill_price,
-                "shares": actual_shares,
-                "cost": actual_cost,
-                "entry_time": time.time(),
-                "limit_order_id": None,
-                "usdc_snapshot": 0,
-                "last_poll": 0,
-                "dry_run": False,
-            }
-            self._execute_stop_loss()
-            return
-
         # ── Wait for settlement ──
         pre_buy_bal = get_share_balance(token_id) or 0
         log(f"  ⏳ Waiting for settlement...")
@@ -606,6 +588,25 @@ class BTC80Bot:
                 actual_shares = new_shares
         else:
             log(f"  ⚠ Settlement timeout — proceeding anyway")
+
+        # ── Post-fill price guard: reject bad fills above MAX_ENTRY_MID ──
+        # (must run AFTER settlement so shares are on-chain for the sell)
+        if fill_price > MAX_ENTRY_MID:
+            log(f"  ⚠ Fill price {fill_price:.3f} > MAX_ENTRY_MID {MAX_ENTRY_MID} — selling back immediately")
+            self.position = {
+                "token_id": token_id,
+                "side": side,
+                "entry_price": fill_price,
+                "shares": actual_shares,
+                "cost": actual_cost,
+                "entry_time": time.time(),
+                "limit_order_id": None,
+                "usdc_snapshot": 0,
+                "last_poll": 0,
+                "dry_run": False,
+            }
+            self._execute_stop_loss()
+            return
 
         # ── Check if price already crashed during settlement ──
         mid_now = self.poly.mid_price(token_id)
