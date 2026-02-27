@@ -59,9 +59,10 @@ MIN_BET = 5                   # Polymarket minimum bet
 MAX_BET = 2000                  # Safety cap
 
 ENTRY_MID = 0.80              # Buy when either BTC side mid-price reaches this
-MAX_ENTRY_MID = 0.92          # Don't buy above this — risk/reward too bad
+LIMIT_BUY_PRICE = 0.80        # GTC limit buy price (fixed entry)
 LIMIT_SELL_PRICE = 0.99       # GTC limit sell price (take profit)
 STOP_LOSS_MID = 0.70          # FOK sell if mid drops to this (stop loss)
+BUY_FILL_TIMEOUT = 120        # Max seconds to wait for GTC buy to fill
 
 # Polymarket fee formula (5m crypto)
 CRYPTO_FEE_RATE = 0.25
@@ -422,6 +423,7 @@ class BTC80Bot:
         self.poly = poly
         self.tracked_balance = INITIAL_BALANCE
         self.position = None
+        self.pending_buy = None  # {"order_id", "token_id", "side", "bet", "placed_at", "pre_buy_bal"}
         self.current_window = None
         self.trade_count = 0
         self.win_count = 0
@@ -435,6 +437,10 @@ class BTC80Bot:
         old_epoch = self.current_window["epoch"] if self.current_window else None
         self.current_window = window
         if window and window["epoch"] != old_epoch:
+            # Cancel pending buy from old window (handle partial fills)
+            if self.pending_buy and old_epoch is not None:
+                log("  ⚠ Window changing — canceling pending buy")
+                self._cancel_pending_buy_and_handle_partial("window change")
             # Emergency close: if holding a position from the old window, sell NOW
             # before switching WS subscriptions (old token feed will die)
             if self.position and old_epoch is not None:
@@ -447,9 +453,13 @@ class BTC80Bot:
                 log("  🔄 New window")
 
     def tick(self):
-        """Main tick: check entry or manage position."""
+        """Main tick: check pending buy, manage position, or look for entry."""
         if self.position:
             self._manage_position()
+            return
+
+        if self.pending_buy:
+            self._manage_pending_buy()
             return
 
         # No position — look for entry
@@ -473,15 +483,13 @@ class BTC80Bot:
             if mid is None:
                 continue
             if mid >= ENTRY_MID:
-                if mid > MAX_ENTRY_MID:
-                    continue  # Risk/reward too bad above cap
                 self._enter(token, side)
                 return
 
     # ─── ENTRY ────────────────────────────────────────────────────────
 
     def _enter(self, token_id, side):
-        """Buy the BTC side via FOK, then place GTC limit sell at 0.99."""
+        """Place a GTC limit buy at LIMIT_BUY_PRICE. Fill is detected in _manage_pending_buy."""
         # Determine bet size
         real_balance = get_usdc_balance()
         if real_balance is None:
@@ -505,19 +513,20 @@ class BTC80Bot:
                 self._low_bal_logged = True
             return
 
-        log(f"  ⚡ BTC {side} mid ≥ {ENTRY_MID} — BUYING")
-        log(f"  💰 BTC {side}: ${bet} FOK market buy "
-            f"(tracked=${self.tracked_balance:.2f})")
+        # Calculate shares to buy at LIMIT_BUY_PRICE
+        shares_to_buy = round(bet / LIMIT_BUY_PRICE, 2)
+
+        log(f"  ⚡ BTC {side} mid ≥ {ENTRY_MID} — placing GTC buy")
+        log(f"  💰 BTC {side}: {shares_to_buy:.1f}sh @ {LIMIT_BUY_PRICE} "
+            f"(${bet} | tracked=${self.tracked_balance:.2f})")
 
         if DRY_RUN:
-            mid = self.poly.mid_price(token_id) or ENTRY_MID
-            est_shares = bet / mid if mid > 0 else 0
-            log(f"  🧪 DRY RUN — ~{est_shares:.1f}sh @ ~{mid:.3f}")
+            log(f"  🧪 DRY RUN — GTC buy {shares_to_buy:.1f}sh @ {LIMIT_BUY_PRICE}")
             self.position = {
                 "token_id": token_id,
                 "side": side,
-                "entry_price": mid,
-                "shares": est_shares,
+                "entry_price": LIMIT_BUY_PRICE,
+                "shares": shares_to_buy,
                 "cost": bet,
                 "entry_time": time.time(),
                 "limit_order_id": None,
@@ -528,105 +537,147 @@ class BTC80Bot:
             log(f"  📋 GTC limit sell at {LIMIT_SELL_PRICE} (simulated)")
             return
 
-        # ── Live FOK buy (retry on fill failure, same amount) ──
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                market_order = MarketOrderArgs(
-                    token_id=token_id,
-                    amount=bet,
-                    side=BUY,
-                )
-                signed = client.create_market_order(market_order)
-                resp = client.post_order(signed, OrderType.FOK)
-
-                success = resp.get("success", False) if isinstance(resp, dict) else False
-                taking = float(resp.get("takingAmount", 0)) if isinstance(resp, dict) else 0
-                making = float(resp.get("makingAmount", 0)) if isinstance(resp, dict) else 0
-
-                if not success and (resp.get("status") == "error" if isinstance(resp, dict) else True):
-                    log(f"  ⚠ Buy rejected: {resp}")
-                    return
-
-                if taking <= 0:
-                    log(f"  ⚠ Buy got 0 shares: {resp}")
-                    return
-
-                actual_shares = taking
-                actual_cost = making
-                fill_price = round(actual_cost / actual_shares, 4) if actual_shares > 0 else 0
-
-                log(f"  ✅ FOK filled! {actual_shares:.1f}sh @ ~{fill_price:.3f} "
-                    f"(spent ${actual_cost:.2f})")
-                break  # Success — exit retry loop
-
-            except Exception as e:
-                err_str = str(e)
-                if 'no match' in err_str.lower():
-                    self._no_match_until = time.time() + NO_MATCH_BACKOFF
-                    log(f"  ⚠ Buy error: no match — backing off {NO_MATCH_BACKOFF}s")
-                    return
-                elif 'not enough balance' in err_str.lower():
-                    self._no_match_until = time.time() + NO_MATCH_BACKOFF
-                    log(f"  ⚠ Buy error: not enough balance — backing off {NO_MATCH_BACKOFF}s")
-                    return
-                elif 'fully filled' in err_str.lower() or 'fok' in err_str.lower():
-                    log(f"  ⚠ FOK fill failed at ${bet} (attempt {attempt+1}/{max_attempts})")
-                    continue
-                else:
-                    log(f"  ⚠ Buy error: {e}")
-                    return
-        else:
-            # All attempts exhausted
-            self._no_match_until = time.time() + NO_MATCH_BACKOFF
-            log(f"  ⚠ FOK fill failed after {max_attempts} attempts — backing off {NO_MATCH_BACKOFF}s")
-            return
-
-        # ── Wait for settlement ──
+        # ── Place GTC limit buy ──
         pre_buy_bal = get_share_balance(token_id) or 0
-        log(f"  ⏳ Waiting for settlement...")
-        settled, on_chain = wait_for_settlement(
-            token_id, actual_shares, pre_buy_balance=pre_buy_bal,
-            timeout=SETTLEMENT_TIMEOUT,
-            price_monitor=self.poly.mid_price, stop_price=STOP_LOSS_MID,
-        )
-        if settled:
-            new_shares = on_chain - pre_buy_bal
-            log(f"  ✅ Settled: {new_shares:.1f}sh")
-            if new_shares > actual_shares * 1.5:
-                log(f"  ⚠ On-chain inflated — using FOK amount")
-            else:
-                actual_shares = new_shares
-        else:
-            log(f"  ⚠ Settlement timeout — proceeding anyway")
+        try:
+            order_args = OrderArgs(
+                price=LIMIT_BUY_PRICE,
+                size=shares_to_buy,
+                side=BUY,
+                token_id=token_id,
+            )
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, OrderType.GTC)
 
-        # ── Post-fill price guard: reject bad fills above MAX_ENTRY_MID ──
-        # (must run AFTER settlement so shares are on-chain for the sell)
-        if fill_price > MAX_ENTRY_MID:
-            log(f"  ⚠ Fill price {fill_price:.3f} > MAX_ENTRY_MID {MAX_ENTRY_MID} — selling back immediately")
-            self.position = {
+            order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
+            taking = float(resp.get("takingAmount", 0)) if isinstance(resp, dict) else 0
+
+            if not order_id and taking <= 0:
+                log(f"  ⚠ GTC buy rejected: {resp}")
+                return
+
+            if order_id:
+                log(f"  📋 GTC buy placed (order={order_id[:12]}...)")
+
+            self.pending_buy = {
+                "order_id": order_id,
                 "token_id": token_id,
                 "side": side,
-                "entry_price": fill_price,
-                "shares": actual_shares,
-                "cost": actual_cost,
-                "entry_time": time.time(),
-                "limit_order_id": None,
-                "usdc_snapshot": 0,
+                "bet": bet,
+                "shares_requested": shares_to_buy,
+                "placed_at": time.time(),
+                "pre_buy_bal": pre_buy_bal,
                 "last_poll": 0,
-                "dry_run": False,
             }
-            self._execute_stop_loss()
+
+            # If it filled instantly (taking > 0 and no resting order)
+            if taking > 0 and not order_id:
+                log(f"  ✅ GTC buy filled instantly! {taking:.1f}sh")
+                self._on_buy_filled(taking)
+
+        except Exception as e:
+            err_str = str(e)
+            if 'no match' in err_str.lower():
+                self._no_match_until = time.time() + NO_MATCH_BACKOFF
+                log(f"  ⚠ Buy error: no match — backing off {NO_MATCH_BACKOFF}s")
+            elif 'not enough balance' in err_str.lower():
+                self._no_match_until = time.time() + NO_MATCH_BACKOFF
+                log(f"  ⚠ Buy error: not enough balance — backing off {NO_MATCH_BACKOFF}s")
+            else:
+                log(f"  ⚠ Buy error: {e}")
+
+    def _cancel_pending_buy_and_handle_partial(self, reason):
+        """Cancel pending GTC buy and handle any partial fill."""
+        pb = self.pending_buy
+        if not pb:
+            return
+        token_id = pb["token_id"]
+
+        # Cancel the remaining resting order
+        try:
+            client.cancel(pb["order_id"])
+            log(f"  ❌ Canceled GTC buy ({reason})")
+        except Exception:
+            pass
+
+        # Check if any shares were partially filled
+        time.sleep(1)  # Brief pause for on-chain state to settle
+        share_bal = get_share_balance(token_id)
+        if share_bal is None:
+            self.pending_buy = None
             return
 
-        # ── Check if price already crashed during settlement ──
+        new_shares = share_bal - pb["pre_buy_bal"]
+        partial_cost = round(new_shares * LIMIT_BUY_PRICE, 2)
+
+        if new_shares >= 1.0 and partial_cost >= MIN_BET:
+            log(f"  ⚡ Partial fill detected: {new_shares:.1f}sh "
+                f"(${partial_cost:.2f}) — treating as valid entry")
+            self._on_buy_filled(new_shares)
+        else:
+            if new_shares > 0:
+                log(f"  ⚠ Tiny partial fill ({new_shares:.1f}sh, "
+                    f"${partial_cost:.2f}) — too small, ignoring")
+            self.pending_buy = None
+
+    def _manage_pending_buy(self):
+        """Poll for GTC buy fill. Cancel if timed out or window ending."""
+        pb = self.pending_buy
+        if not pb:
+            return
+
+        now = time.time()
+        token_id = pb["token_id"]
+
+        # Timeout — cancel remaining and handle any partial fill
+        if now - pb["placed_at"] > BUY_FILL_TIMEOUT:
+            log(f"  ⚠ GTC buy timed out after {BUY_FILL_TIMEOUT}s")
+            self._cancel_pending_buy_and_handle_partial("timeout")
+            return
+
+        # Cancel if window is about to end (< 30s remaining)
+        if self.current_window:
+            secs_left = (self.current_window["end"] - datetime.now(timezone.utc)).total_seconds()
+            if secs_left < 30:
+                log(f"  ⚠ Window ending in {secs_left:.0f}s")
+                self._cancel_pending_buy_and_handle_partial("window ending")
+                return
+
+        # Poll for fill every ORDER_POLL_SECS
+        if now - pb.get("last_poll", 0) < ORDER_POLL_SECS:
+            return
+        pb["last_poll"] = now
+
+        share_bal = get_share_balance(token_id)
+        if share_bal is None:
+            return
+
+        new_shares = share_bal - pb["pre_buy_bal"]
+
+        # Full fill (within 1 share of requested — rounding tolerance)
+        if new_shares >= pb["shares_requested"] - 1.0:
+            log(f"  ✅ GTC buy filled! {new_shares:.1f}sh @ {LIMIT_BUY_PRICE}")
+            self._on_buy_filled(new_shares)
+
+    def _on_buy_filled(self, actual_shares):
+        """Called when GTC buy is filled — place GTC limit sell at 0.99."""
+        pb = self.pending_buy
+        if not pb:
+            return
+
+        token_id = pb["token_id"]
+        side = pb["side"]
+        actual_cost = round(actual_shares * LIMIT_BUY_PRICE, 2)
+        self.pending_buy = None
+
+        # ── Check if price already crashed ──
         mid_now = self.poly.mid_price(token_id)
         if mid_now is not None and mid_now <= STOP_LOSS_MID:
-            log(f"  🛑 Price crashed to {mid_now:.3f} during settlement — immediate stop loss")
+            log(f"  🛑 Price crashed to {mid_now:.3f} after buy fill — immediate stop loss")
             self.position = {
                 "token_id": token_id,
                 "side": side,
-                "entry_price": fill_price,
+                "entry_price": LIMIT_BUY_PRICE,
                 "shares": actual_shares,
                 "cost": actual_cost,
                 "entry_time": time.time(),
@@ -658,13 +709,13 @@ class BTC80Bot:
         except Exception as e:
             log(f"  ⚠ GTC limit error: {e} — will rely on stop-loss only")
 
-        # ── Record USDC snapshot (for detecting limit fill proceeds) ──
+        # ── Record USDC snapshot ──
         usdc_snap = get_usdc_balance() or 0
 
         self.position = {
             "token_id": token_id,
             "side": side,
-            "entry_price": fill_price,
+            "entry_price": LIMIT_BUY_PRICE,
             "shares": actual_shares,
             "cost": actual_cost,
             "entry_time": time.time(),
@@ -996,6 +1047,11 @@ class BTC80Bot:
             return (f"HOLDING BTC {pos['side']} | entry={pos['entry_price']:.3f} "
                     f"now={mid:.3f} Δ{change:+.3f} | hold={hold:.0f}s | "
                     f"stop≤{STOP_LOSS_MID} limit={LIMIT_SELL_PRICE}")
+        if self.pending_buy:
+            pb = self.pending_buy
+            wait = time.time() - pb["placed_at"]
+            return (f"PENDING BUY BTC {pb['side']} | {pb['shares_requested']:.1f}sh @ "
+                    f"{LIMIT_BUY_PRICE} | waiting {wait:.0f}s")
         return "SCANNING for BTC side ≥ 0.80..."
 
 
@@ -1005,7 +1061,7 @@ class BTC80Bot:
 def main():
     mode = "DRY" if DRY_RUN else "LIVE"
     log(f"═══ BTC80 Bot ═══ [{mode}]")
-    log(f"Strategy: Buy BTC side at {ENTRY_MID}-{MAX_ENTRY_MID} → limit sell {LIMIT_SELL_PRICE} / stop {STOP_LOSS_MID}")
+    log(f"Strategy: GTC buy BTC side at {LIMIT_BUY_PRICE} → limit sell {LIMIT_SELL_PRICE} / stop {STOP_LOSS_MID}")
     log(f"Balance: ${INITIAL_BALANCE:.2f} start | 99% per trade | reset when > book depth")
     log(f"Sell retries: {SELL_MAX_RETRIES} @ {SELL_RETRY_SLEEP}s | no-match backoff: {NO_MATCH_BACKOFF}s")
     log("")
@@ -1081,11 +1137,14 @@ def main():
 
         except KeyboardInterrupt:
             log(f"\nStopping...")
-            # Cancel any open GTC orders
+            # Cancel any pending buy order (handle partial fills)
+            if bot.pending_buy:
+                bot._cancel_pending_buy_and_handle_partial("shutdown")
+            # Cancel any open GTC sell orders
             if bot.position and bot.position.get("limit_order_id"):
                 try:
                     client.cancel(bot.position["limit_order_id"])
-                    log("  Canceled open GTC order")
+                    log("  Canceled open GTC sell order")
                 except Exception:
                     pass
             # Try to sell if holding
