@@ -466,11 +466,6 @@ class BTC80Bot:
         if now_utc >= self.current_window["end"]:
             return
 
-        # Don't enter if window ends in < 30s — not enough time
-        secs_left = (self.current_window["end"] - now_utc).total_seconds()
-        if secs_left < 30:
-            return
-
         # No-match backoff: skip entry attempts for a while after market goes dead
         if time.time() < self._no_match_until:
             return
