@@ -926,8 +926,17 @@ class BTC80Bot:
 
                 order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
                 success = resp.get("success", False) if isinstance(resp, dict) else False
-                taking = float(resp.get("takingAmount", 0)) if isinstance(resp, dict) else 0
-                making = float(resp.get("makingAmount", 0)) if isinstance(resp, dict) else 0
+                # Safe parsing — API sometimes returns empty string for takingAmount/makingAmount
+                raw_taking = resp.get("takingAmount", 0) if isinstance(resp, dict) else 0
+                raw_making = resp.get("makingAmount", 0) if isinstance(resp, dict) else 0
+                try:
+                    taking = float(raw_taking) if raw_taking != "" else 0
+                except (ValueError, TypeError):
+                    taking = 0
+                try:
+                    making = float(raw_making) if raw_making != "" else 0
+                except (ValueError, TypeError):
+                    making = 0
 
                 if order_id:
                     stop_sell_order_id = order_id
@@ -946,7 +955,21 @@ class BTC80Bot:
                     self._handle_exit(actual_revenue, pnl, actual_price, "stop_loss")
                     return
 
-                log(f"  ⚠ Sell order rejected (attempt {attempt+1}): {resp}")
+                # No order_id and no taking — check if shares disappeared (silent fill)
+                log(f"  ⚠ Ambiguous sell response (attempt {attempt+1}): {resp}")
+                time.sleep(1)
+                remaining = get_share_balance(token_id)
+                if remaining is not None and remaining < 1.0:
+                    log(f"  ✅ Shares gone after sell — order filled silently")
+                    time.sleep(1)
+                    usdc_now = get_usdc_balance() or 0
+                    proceeds = usdc_now - pos.get("usdc_snapshot", 0)
+                    if proceeds <= 0:
+                        proceeds = sell_amount * sell_price  # estimate
+                    pnl = proceeds - pos["cost"]
+                    log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
+                    self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
+                    return
                 time.sleep(SELL_RETRY_SLEEP)
 
             except Exception as e:
@@ -960,6 +983,22 @@ class BTC80Bot:
                     log(f"  ⚠ Market closed — shares may auto-redeem")
                     self._handle_exit(0, -pos["cost"], 0, "stop_loss_expired")
                     return
+                if 'not enough balance' in err_str.lower():
+                    # Shares likely already sold by a previous attempt
+                    log(f"  ⚠ Sell error: not enough balance — checking if already sold")
+                    time.sleep(1)
+                    remaining = get_share_balance(token_id)
+                    if remaining is not None and remaining < 1.0:
+                        log(f"  ✅ Shares already sold (balance={remaining:.1f})")
+                        time.sleep(1)
+                        usdc_now = get_usdc_balance() or 0
+                        proceeds = usdc_now - pos.get("usdc_snapshot", 0)
+                        if proceeds <= 0:
+                            proceeds = sell_amount * STOP_LOSS_MID  # estimate at stop price
+                        pnl = proceeds - pos["cost"]
+                        log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
+                        self._handle_exit(proceeds, pnl, 0, "stop_loss")
+                        return
                 log(f"  ⚠ Sell error (attempt {attempt+1}): {e}")
                 time.sleep(SELL_RETRY_SLEEP)
 
