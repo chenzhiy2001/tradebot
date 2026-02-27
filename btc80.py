@@ -74,6 +74,8 @@ SETTLEMENT_TIMEOUT = 30       # Max seconds to wait for on-chain settlement
 RESOLUTION_GRACE = 15         # Seconds after window end to check for resolution
 NO_MATCH_BACKOFF = 10         # Seconds to stop retrying after first "no match" error
 STOP_LOSS_COOLDOWN = 60       # Seconds to wait after a stop loss before re-entering
+CONSEC_LOSS_COOLDOWN = 300    # Seconds to wait after 2+ consecutive losses
+CONSEC_LOSS_THRESHOLD = 2     # Number of consecutive losses to trigger long cooldown
 SELL_MAX_RETRIES = 5          # Max FOK sell attempts for stop loss (was 3)
 SELL_RETRY_SLEEP = 1.0        # Seconds between sell retries (was 0.5)
 
@@ -416,6 +418,7 @@ class BTC80Bot:
         self.total_pnl = 0.0
         self._no_match_until = 0  # Backoff timestamp after "no match" errors
         self._stop_loss_until = 0  # Cooldown timestamp after stop loss
+        self._consec_losses = 0      # Consecutive loss counter
 
     def update_market(self, window):
         """Update current window and subscribe to tokens."""
@@ -890,8 +893,16 @@ class BTC80Bot:
 
         # Set cooldown after stop-loss exits to avoid re-entering the same crash
         if reason and 'stop_loss' in reason:
-            self._stop_loss_until = time.time() + STOP_LOSS_COOLDOWN
-            log(f"  ⏸ Stop-loss cooldown: {STOP_LOSS_COOLDOWN}s before next entry")
+            self._consec_losses += 1
+            if self._consec_losses >= CONSEC_LOSS_THRESHOLD:
+                cooldown = CONSEC_LOSS_COOLDOWN
+                log(f"  ⏸ {self._consec_losses} consecutive losses — extended cooldown: {cooldown}s")
+            else:
+                cooldown = STOP_LOSS_COOLDOWN
+                log(f"  ⏸ Stop-loss cooldown: {cooldown}s before next entry")
+            self._stop_loss_until = time.time() + cooldown
+        else:
+            self._consec_losses = 0  # Reset on any non-stop-loss exit (win)
 
         if proceeds > 0:
             # tracked = unspent portion + proceeds from this trade
