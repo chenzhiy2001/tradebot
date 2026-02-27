@@ -582,6 +582,24 @@ class BTC80Bot:
             elif 'not enough balance' in err_str.lower():
                 self._no_match_until = time.time() + NO_MATCH_BACKOFF
                 log(f"  ⚠ Buy error: not enough balance — backing off {NO_MATCH_BACKOFF}s")
+                # Check if shares were already bought despite the error
+                time.sleep(1)
+                share_bal = get_share_balance(token_id) or 0
+                new_shares = share_bal - pre_buy_bal
+                if new_shares >= 1.0:
+                    log(f"  ⚡ Shares detected ({new_shares:.1f}sh) despite balance error — treating as fill")
+                    cost = round(new_shares * LIMIT_BUY_PRICE, 2)
+                    self.pending_buy = {
+                        "order_id": "",
+                        "token_id": token_id,
+                        "side": side,
+                        "bet": cost,
+                        "shares_requested": new_shares,
+                        "placed_at": time.time(),
+                        "pre_buy_bal": pre_buy_bal,
+                        "last_poll": 0,
+                    }
+                    self._on_buy_filled(new_shares)
             else:
                 log(f"  ⚠ Buy error: {e}")
                 # If pending_buy was already stored (order placed but parsing
@@ -882,15 +900,23 @@ class BTC80Bot:
             self._handle_exit(0, -pos["cost"], 0, "stop_loss_no_shares")
             return
 
-        # Place aggressive GTC sell at floor price (0.01) — sweeps all bids
-        # This works unlike FOK because it partially fills and rests the remainder
+        # Place GTC sell at stop-loss price (0.75) for controlled exit.
+        # If not filled quickly, fall back to lower price to force exit.
         stop_sell_order_id = None
         for attempt in range(SELL_MAX_RETRIES):
             try:
-                log(f"  📤 GTC sell {sell_amount:.1f}sh BTC {side} @ 0.01 (attempt {attempt+1})")
+                # First attempt at STOP_LOSS_MID, subsequent attempts at lower prices
+                if attempt == 0:
+                    sell_price = STOP_LOSS_MID
+                elif attempt == 1:
+                    bid, _, _ = self.poly.get_price(token_id)
+                    sell_price = round(bid - 0.01, 2) if bid and bid > 0.02 else 0.01
+                else:
+                    sell_price = 0.01
+                log(f"  📤 GTC sell {sell_amount:.1f}sh BTC {side} @ {sell_price} (attempt {attempt+1})")
 
                 order_args = OrderArgs(
-                    price=0.01,
+                    price=sell_price,
                     size=sell_amount,
                     side=SELL,
                     token_id=token_id,
