@@ -606,10 +606,17 @@ class BTC80Bot:
 
         # Check if any shares were partially filled
         time.sleep(1)  # Brief pause for on-chain state to settle
-        share_bal = get_share_balance(token_id)
+        share_bal = None
+        for attempt in range(3):
+            share_bal = get_share_balance(token_id)
+            if share_bal is not None:
+                break
+            log(f"  ⚠ get_share_balance returned None (attempt {attempt+1}/3)")
+            time.sleep(1)
         if share_bal is None:
-            self.pending_buy = None
-            return
+            log("  ⚠ Could not read share balance after cancel — assuming filled")
+            # Assume the order filled fully to avoid orphaned positions
+            share_bal = pb["pre_buy_bal"] + pb["shares"]
 
         new_shares = share_bal - pb["pre_buy_bal"]
         partial_cost = round(new_shares * LIMIT_BUY_PRICE, 2)
