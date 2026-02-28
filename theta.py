@@ -79,8 +79,8 @@ MIN_Z_SCORE = 2.0              # Unified entry threshold — z = |dist| / (vol �
                                # Replaces fixed MIN_DISTANCE — adapts to vol + time remaining
 MAX_VOL = 0.0030               # ABSOLUTE ceiling — never trade above this no matter what
                                # (extreme events: flash crash, CPI, etc.)
-VOL_PERCENTILE = 30            # Enter only when vol is in the bottom N% of recent history
-                               # 30 = "calmer than 70% of recent observations"
+VOL_PERCENTILE = 50            # Enter only when vol is in the bottom N% of recent history
+                               # 50 = "calmer than median" — p30 was too strict (blocked 100% of ticks)
 MIN_MID_PRICE = 0.87           # Only enter if Polymarket mid ≥ this (side is winning)
 MAX_ENTRY_PRICE = 0.95         # Don't buy above this (not enough upside to $1)
 
@@ -642,34 +642,16 @@ def discover_btc_market():
             up_idx = next((i for i, o in enumerate(outcomes) if "up" in o.lower()), 0)
             down_idx = 1 - up_idx
 
-            # Extract threshold from market description
-            # Markets are like "Will BTC be above $100,000 at 12:05 UTC?"
-            threshold = _parse_threshold(m.get("question", "") or m.get("description", ""))
-
             return {
                 "epoch": epoch,
                 "start": window_start,
                 "end": window_end,
                 "up_token": tokens[up_idx],
                 "down_token": tokens[down_idx],
-                "threshold": threshold,
+                "threshold": None,  # Set later from Chainlink snapshot
             }
     except Exception as e:
         log(f"  ⚠ Discovery error: {e}")
-    return None
-
-
-def _parse_threshold(text):
-    """Extract BTC threshold price from market question text.
-    e.g. 'Will the price of BTC be above $84,500.00 at ...' → 84500.0"""
-    import re
-    # Match dollar amounts like $84,500.00 or $100,000
-    match = re.search(r'\$([0-9,]+(?:\.[0-9]+)?)', text)
-    if match:
-        try:
-            return float(match.group(1).replace(",", ""))
-        except ValueError:
-            pass
     return None
 
 
@@ -719,8 +701,15 @@ class ThetaBot:
             self._entered_this_window = False
             self._skip_reason = ""
             self._low_bal_logged = False
-            if old_epoch is not None:
-                log(f"  🔄 New window (threshold={window.get('threshold')})")
+
+            # Snapshot Chainlink price as threshold ("Up or Down" markets
+            # resolve based on price at end vs price at beginning of window)
+            cl_price = self.chainlink.price
+            if cl_price:
+                window["threshold"] = round(cl_price, 2)
+                log(f"  🔄 New window (threshold=${cl_price:,.2f} from Chainlink snapshot)")
+            else:
+                log(f"  🔄 New window (threshold=pending — no Chainlink price yet)")
 
     # ─── MAIN TICK ────────────────────────────────────────────────────
 
@@ -790,8 +779,15 @@ class ThetaBot:
         # ── Check BTC distance from threshold (from Chainlink — resolution source) ──
         threshold = self.current_window.get("threshold")
         if threshold is None:
-            self._skip_reason = "no threshold parsed"
-            return
+            # Try to backfill from Chainlink if we missed the snapshot
+            cl_price = self.chainlink.price
+            if cl_price:
+                threshold = round(cl_price, 2)
+                self.current_window["threshold"] = threshold
+                log(f"  📌 Late threshold snapshot: ${threshold:,.2f}")
+            else:
+                self._skip_reason = "no threshold (no Chainlink price)"
+                return
 
         dist, btc_price = self.chainlink.distance_from_round(threshold)
         if dist is None:
