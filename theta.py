@@ -802,15 +802,13 @@ class ThetaBot:
                 log(f"  🔄 New window (threshold=${cl_historical:,.2f} "
                     f"from Chainlink @{delta_secs:.1f}s of start)")
             else:
-                # Fallback: use current Chainlink price (discovery was late)
-                cl_price = self.chainlink.price
-                if cl_price:
-                    window["threshold"] = round(cl_price, 2)
-                    lag = f", {delta_secs:.0f}s lag" if delta_secs is not None else ""
-                    log(f"  🔄 New window (threshold=${cl_price:,.2f} "
-                        f"from current Chainlink — no close match{lag})")
-                else:
-                    log(f"  🔄 New window (threshold=pending — no Chainlink price yet)")
+                # No reliable historical price near window start.
+                # Leave threshold=None — tick() will retry price_at_time()
+                # as Chainlink buffer fills.  NEVER use current price as
+                # threshold — it can be minutes stale and cause phantom wins.
+                lag_info = f" (nearest={delta_secs:.0f}s away)" if delta_secs is not None else ""
+                log(f"  🔄 New window (threshold=pending — "
+                    f"no Chainlink data near start{lag_info})")
 
     # ─── MAIN TICK ────────────────────────────────────────────────────
 
@@ -882,14 +880,18 @@ class ThetaBot:
         # ── Check BTC distance from threshold (from Chainlink — resolution source) ──
         threshold = self.current_window.get("threshold")
         if threshold is None:
-            # Try to backfill from Chainlink if we missed the snapshot
-            cl_price = self.chainlink.price
-            if cl_price:
-                threshold = round(cl_price, 2)
+            # Try to get historical price at window start now that Chainlink
+            # buffer may have filled.  NEVER use current price as threshold —
+            # that is fundamentally wrong and caused a $35 phantom-win bug.
+            win_start_ts = self.current_window["start"].timestamp()
+            cl_historical, delta_secs = self.chainlink.price_at_time(win_start_ts)
+            if cl_historical is not None and delta_secs is not None and delta_secs < 10:
+                threshold = round(cl_historical, 2)
                 self.current_window["threshold"] = threshold
-                log(f"  📌 Late threshold snapshot: ${threshold:,.2f}")
+                log(f"  📌 Late threshold from history: ${threshold:,.2f} "
+                    f"({delta_secs:.1f}s from window start)")
             else:
-                self._skip_reason = "no threshold (no Chainlink price)"
+                self._skip_reason = "no threshold (Chainlink has no data near window start)"
                 return
 
         dist, btc_price = self.chainlink.distance_from_round(threshold)
