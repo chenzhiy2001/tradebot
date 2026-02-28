@@ -4,8 +4,10 @@ Theta Bot — Late-entry volatility-filtered BTC 5-minute binary scalper.
 
 Strategy:
   1. Stream real-time BTC/USD from Chainlink via Polymarket RTDS websocket
-     (same oracle that determines market resolution).
-  2. Compute rolling 5-min realized volatility (stdev of 1s returns).
+     (same oracle that determines market resolution) for distance checks.
+  2. Stream real-time BTC/USDT from Binance websocket (1s kline) for
+     high-resolution volatility computation.
+  3. Compute rolling 5-min realized volatility (stdev of 1s returns via Binance).
   3. For each Polymarket BTC 5-min window:
      - Wait until ENTRY_DELAY seconds into the window (let uncertainty fade).
      - Check: is BTC comfortably on one side? (distance from threshold)
@@ -53,6 +55,7 @@ HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
+BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@kline_1s"
 CHAIN_ID = 137
 
 # Chainlink symbol (Polymarket resolution source)
@@ -178,10 +181,10 @@ class ChainlinkFeed:
     """Real-time BTC/USD price from Chainlink via Polymarket RTDS websocket.
 
     This is the SAME data source Polymarket uses to resolve crypto markets.
-    Using Chainlink instead of Binance means our distance/vol calculations
-    are based on the exact price that determines win/loss.
+    Used for distance-from-threshold checks (resolution-accurate price).
+    Volatility is computed from Binance's faster stream instead.
 
-    Stores prices for rolling volatility computation.
+    Stores prices for rolling price history.
     """
 
     def __init__(self):
@@ -270,9 +273,93 @@ class ChainlinkFeed:
     def connected(self):
         return self._connected
 
+    def distance_from_round(self, threshold_price):
+        """How far BTC is from a threshold price, as a fraction.
+
+        Returns (distance_fraction, btc_price) or (None, None).
+        distance_fraction > 0 means BTC is ABOVE threshold.
+        distance_fraction < 0 means BTC is BELOW threshold.
+        """
+        p = self.price
+        if p is None or threshold_price is None or threshold_price <= 0:
+            return None, None
+        return (p - threshold_price) / threshold_price, p
+
+
+# =========================================================================
+# BINANCE PRICE FEED (high-frequency volatility source)
+# =========================================================================
+class BinanceFeed:
+    """Real-time BTC/USDT price via Binance websocket (1s kline).
+
+    Used ONLY for volatility computation — Binance updates every ~1s vs
+    Chainlink's slower cadence, giving much better vol estimates.
+    """
+
+    def __init__(self):
+        self._price = None
+        self._prices = deque(maxlen=VOL_WINDOW)
+        self._lock = threading.Lock()
+        self._connected = False
+
+    def start(self):
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def _run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._ws_loop())
+
+    async def _ws_loop(self):
+        import websockets
+        while True:
+            try:
+                async with websockets.connect(
+                    BINANCE_WS_URL, close_timeout=5, open_timeout=10
+                ) as ws:
+                    self._connected = True
+                    log("  🔌 Binance WS connected (vol source)")
+
+                    while True:
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                        except asyncio.TimeoutError:
+                            await ws.ping()
+                            continue
+
+                        try:
+                            data = json.loads(msg)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+                        k = data.get("k")
+                        if k:
+                            try:
+                                close = float(k["c"])
+                                ts = time.time()
+                                with self._lock:
+                                    self._price = close
+                                    self._prices.append((ts, close))
+                            except (ValueError, KeyError):
+                                pass
+
+            except Exception as e:
+                self._connected = False
+                log(f"  ⚠ Binance WS error: {e}, reconnecting in 2s...")
+                await asyncio.sleep(2)
+
+    @property
+    def price(self):
+        with self._lock:
+            return self._price
+
+    @property
+    def connected(self):
+        return self._connected
+
     def realized_vol(self):
-        """Compute realized volatility as stdev of log returns between
-        consecutive Chainlink price updates.
+        """Compute realized volatility as stdev of 1-second log returns.
 
         Returns (vol, n_samples) or (None, 0) if not enough data.
         """
@@ -282,11 +369,10 @@ class ChainlinkFeed:
         if len(prices) < VOL_MIN_SAMPLES:
             return None, len(prices)
 
-        # Compute log returns
         log_returns = []
         for i in range(1, len(prices)):
             dt = prices[i][0] - prices[i - 1][0]
-            if dt > 10:  # Skip gaps > 10s (reconnection)
+            if dt > 5:  # Skip gaps > 5s (reconnection)
                 continue
             if prices[i - 1][1] > 0:
                 lr = math.log(prices[i][1] / prices[i - 1][1])
@@ -300,18 +386,6 @@ class ChainlinkFeed:
         vol = math.sqrt(variance)
 
         return vol, len(log_returns)
-
-    def distance_from_round(self, threshold_price):
-        """How far BTC is from a threshold price, as a fraction.
-
-        Returns (distance_fraction, btc_price) or (None, None).
-        distance_fraction > 0 means BTC is ABOVE threshold.
-        distance_fraction < 0 means BTC is BELOW threshold.
-        """
-        p = self.price
-        if p is None or threshold_price is None or threshold_price <= 0:
-            return None, None
-        return (p - threshold_price) / threshold_price, p
 
 
 # =========================================================================
@@ -554,14 +628,15 @@ class ThetaBot:
 
     Core logic:
       - Wait 2.5 min into each window
-      - Check Chainlink BTC vol + distance from threshold
+      - Check Binance vol + Chainlink distance from threshold
       - If low vol + comfortable distance → buy winning side on Polymarket
       - Hold to resolution → collect $1/share on win
     """
 
-    def __init__(self, poly, chainlink):
+    def __init__(self, poly, chainlink, binance):
         self.poly = poly
         self.chainlink = chainlink
+        self.binance = binance
         self.tracked_balance = INITIAL_BALANCE
         self.position = None
         self.pending_buy = None
@@ -634,8 +709,8 @@ class ThetaBot:
             self._skip_reason = "no-match backoff"
             return
 
-        # ── Check volatility ──
-        vol, n_samples = self.chainlink.realized_vol()
+        # ── Check volatility (from Binance — faster updates) ──
+        vol, n_samples = self.binance.realized_vol()
         if vol is None:
             self._skip_reason = f"vol: need {VOL_MIN_SAMPLES} samples (have {n_samples})"
             return
@@ -643,7 +718,7 @@ class ThetaBot:
             self._skip_reason = f"vol too high: {vol:.6f} > {MAX_VOL}"
             return
 
-        # ── Check BTC distance from threshold ──
+        # ── Check BTC distance from threshold (from Chainlink — resolution source) ──
         threshold = self.current_window.get("threshold")
         if threshold is None:
             self._skip_reason = "no threshold parsed"
@@ -1237,14 +1312,17 @@ def main():
     chainlink = ChainlinkFeed()
     chainlink.start()
 
+    binance = BinanceFeed()
+    binance.start()
+
     poly = PolymarketFeed()
     poly.start()
 
-    bot = ThetaBot(poly, chainlink)
+    bot = ThetaBot(poly, chainlink, binance)
 
     log("Waiting for WS connections...")
     for _ in range(30):
-        if poly.connected and chainlink.connected:
+        if poly.connected and chainlink.connected and binance.connected:
             break
         time.sleep(1)
 
@@ -1252,6 +1330,8 @@ def main():
         log("⚠ Polymarket WS not connected after 30s")
     if not chainlink.connected:
         log("⚠ Chainlink RTDS not connected after 30s")
+    if not binance.connected:
+        log("⚠ Binance WS not connected after 30s")
 
     balance = get_usdc_balance()
     if balance:
@@ -1259,7 +1339,7 @@ def main():
     log(f"Tracked balance: ${bot.tracked_balance:.2f}")
 
     # Wait for vol data to accumulate
-    log(f"Accumulating {VOL_MIN_SAMPLES} Chainlink price ticks for volatility...")
+    log(f"Accumulating {VOL_MIN_SAMPLES} Binance ticks for volatility...")
     log("")
 
     last_discovery = 0
@@ -1283,10 +1363,11 @@ def main():
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
             poly_ws = "🟢" if poly.connected else "🔴"
             cl_ws = "🟢" if chainlink.connected else "🔴"
+            bn_ws = "🟢" if binance.connected else "🔴"
             status = bot.get_status()
 
             btc_price = chainlink.price
-            vol, n_samples = chainlink.realized_vol()
+            vol, n_samples = binance.realized_vol()
 
             up_mid = down_mid = None
             threshold = None
@@ -1304,7 +1385,7 @@ def main():
             print(f"\033[2J\033[H", end="")
             print(f"═══ Theta Bot [{mode}] ═══  {now_str} UTC")
             print(f"{'─' * 70}")
-            print(f"  Polymarket {poly_ws}  |  Chainlink {cl_ws}")
+            print(f"  Polymarket {poly_ws}  |  Chainlink {cl_ws}  |  Binance {bn_ws}")
             print(f"  BTC: ${btc_price:,.2f}" if btc_price else "  BTC: --")
             if threshold:
                 dist = (btc_price - threshold) / threshold if btc_price else 0
