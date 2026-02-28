@@ -578,34 +578,36 @@ class BTC80Bot:
             if 'no match' in err_str.lower():
                 self._no_match_until = time.time() + NO_MATCH_BACKOFF
                 log(f"  ⚠ Buy error: no match — backing off {NO_MATCH_BACKOFF}s")
-            elif 'not enough balance' in err_str.lower():
-                self._no_match_until = time.time() + NO_MATCH_BACKOFF
-                log(f"  ⚠ Buy error: not enough balance — backing off {NO_MATCH_BACKOFF}s")
-                # Check if shares were already bought despite the error
-                time.sleep(1)
+                return
+
+            # Any other error: order may have gone through despite the error.
+            # Check share balance to detect orphaned fills.
+            log(f"  ⚠ Buy error: {e}")
+            self._no_match_until = time.time() + NO_MATCH_BACKOFF
+            time.sleep(2)
+            new_shares = 0
+            for attempt in range(5):
                 share_bal = get_share_balance(token_id) or 0
                 new_shares = share_bal - pre_buy_bal
                 if new_shares >= 1.0:
-                    log(f"  ⚡ Shares detected ({new_shares:.1f}sh) despite balance error — treating as fill")
-                    cost = round(new_shares * LIMIT_BUY_PRICE, 2)
-                    self.pending_buy = {
-                        "order_id": "",
-                        "token_id": token_id,
-                        "side": side,
-                        "bet": cost,
-                        "shares_requested": new_shares,
-                        "placed_at": time.time(),
-                        "pre_buy_bal": pre_buy_bal,
-                        "last_poll": 0,
-                    }
-                    self._on_buy_filled(new_shares)
-            else:
-                log(f"  ⚠ Buy error: {e}")
-                # If pending_buy was already stored (order placed but parsing
-                # failed), don't clear it — let _manage_pending_buy detect fill
-                if self.pending_buy:
-                    log(f"  ℹ Order may have been placed — monitoring for fill")
-                    return
+                    break
+                log(f"  ⚠ Share check {attempt+1}/5: bal={share_bal}, new={new_shares:.1f}")
+                time.sleep(2)
+
+            if new_shares >= 1.0:
+                log(f"  ⚡ Shares detected ({new_shares:.1f}sh) despite error — treating as fill")
+                cost = round(new_shares * LIMIT_BUY_PRICE, 2)
+                self.pending_buy = {
+                    "order_id": "",
+                    "token_id": token_id,
+                    "side": side,
+                    "bet": cost,
+                    "shares_requested": new_shares,
+                    "placed_at": time.time(),
+                    "pre_buy_bal": pre_buy_bal,
+                    "last_poll": 0,
+                }
+                self._on_buy_filled(new_shares)
 
     def _cancel_pending_buy_and_handle_partial(self, reason):
         """Cancel pending GTC buy and handle any partial fill."""
