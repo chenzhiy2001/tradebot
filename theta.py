@@ -692,10 +692,10 @@ class ThetaBot:
             if self.pending_buy and old_epoch is not None:
                 log("  ⚠ Window changing — canceling pending buy")
                 self._cancel_pending_buy_and_handle_partial("window change")
-            # Emergency close if holding from old window
+            # If holding from old window, DON'T sell — let it resolve naturally.
+            # _manage_position() will detect shares disappearing (resolution).
             if self.position and old_epoch is not None:
-                log("  ⚠ Window changing while holding — emergency close!")
-                self._execute_sell()
+                log(f"  ⏳ Window changed while holding — waiting for resolution")
             tokens = [window["up_token"], window["down_token"]]
             self.poly.subscribe(tokens)
             self._entered_this_window = False
@@ -932,6 +932,7 @@ class ThetaBot:
                 "shares": shares_to_buy,
                 "cost": bet,
                 "entry_time": time.time(),
+                "window_end": self.current_window["end"] if self.current_window else None,
                 "limit_order_id": None,
                 "usdc_snapshot": real_balance - bet,
                 "last_poll": 0,
@@ -1111,6 +1112,7 @@ class ThetaBot:
             "shares": actual_shares,
             "cost": actual_cost,
             "entry_time": time.time(),
+            "window_end": self.current_window["end"] if self.current_window else None,
             "limit_order_id": None,  # No GTC sell — hold to resolution
             "usdc_snapshot": usdc_snap,
             "last_poll": 0,
@@ -1137,7 +1139,8 @@ class ThetaBot:
             mid = self.poly.mid_price(token_id)
             if mid is None:
                 return
-            if self.current_window and datetime.now(timezone.utc) > self.current_window["end"] + timedelta(seconds=5):
+            win_end = pos.get("window_end")
+            if win_end and datetime.now(timezone.utc) > win_end + timedelta(seconds=5):
                 resolved_price = 1.0 if mid > 0.50 else 0.0
                 revenue = pos["shares"] * resolved_price
                 pnl = revenue - pos["cost"]
@@ -1186,9 +1189,14 @@ class ThetaBot:
                 self._handle_exit(proceeds, pnl, 0, "resolved")
                 return
 
-        # ── Check window resolution ──
-        if self.current_window:
-            secs_past_end = (datetime.now(timezone.utc) - self.current_window["end"]).total_seconds()
+        # ── Hard timeout: if way past window end, force sell ──
+        win_end = pos.get("window_end")
+        if win_end:
+            secs_past_end = (datetime.now(timezone.utc) - win_end).total_seconds()
+            if secs_past_end > 60:
+                log(f"  ⚠ Position still open {secs_past_end:.0f}s past window end — forcing sell")
+                self._execute_sell()
+                return
             if secs_past_end > RESOLUTION_GRACE:
                 log(f"  📊 Window ended {secs_past_end:.0f}s ago — checking resolution")
                 share_bal = get_share_balance(token_id)
@@ -1203,9 +1211,6 @@ class ThetaBot:
                         pnl = -pos["cost"]
                         log(f"  ❌ RESOLVED LOSS: PnL ${pnl:+.2f}")
                     self._handle_exit(proceeds if 'proceeds' in dir() else 0, pnl, 0, "resolved")
-                else:
-                    log(f"  ⚠ Window ended but still have {share_bal:.1f}sh — forcing sell")
-                    self._execute_sell()
 
     # ─── SELL EXECUTION ───────────────────────────────────────────────
 
