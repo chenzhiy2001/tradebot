@@ -108,6 +108,7 @@ VOL_HISTORY_SIZE = 360         # Rolling buffer of vol measurements for adaptive
 # ── Data files ──
 LOG_FILE = "theta_log.txt"
 TRADE_LOG = "theta_trades.json"
+TICK_LOG = "theta_ticks.csv"          # Every evaluation tick — for backtesting z-score model
 
 DRY_RUN = "--dry-run" in sys.argv
 
@@ -121,6 +122,27 @@ def log(msg):
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
     print(line)
+
+
+# =========================================================================
+# TICK CSV LOGGER
+# =========================================================================
+_TICK_CSV_FIELDS = [
+    "timestamp", "btc_price", "threshold", "distance", "vol", "vol_thresh",
+    "secs_left", "z_score", "up_mid", "down_mid", "action", "reason",
+]
+
+def _init_tick_log():
+    """Write CSV header if file doesn't exist or is empty."""
+    if not os.path.exists(TICK_LOG) or os.path.getsize(TICK_LOG) == 0:
+        with open(TICK_LOG, "w") as f:
+            f.write(",".join(_TICK_CSV_FIELDS) + "\n")
+
+def _log_tick(row: dict):
+    """Append one row to tick CSV. Missing fields become empty."""
+    vals = [str(row.get(k, "")) for k in _TICK_CSV_FIELDS]
+    with open(TICK_LOG, "a") as f:
+        f.write(",".join(vals) + "\n")
 
 
 # =========================================================================
@@ -748,6 +770,8 @@ class ThetaBot:
         # Absolute ceiling — never trade in extreme vol
         if vol > MAX_VOL:
             self._skip_reason = f"vol extreme: {vol:.6f} > {MAX_VOL} (abs ceiling)"
+            self._log_eval(secs_left=secs_left, vol=vol, action="skip",
+                           reason="vol_extreme")
             return
 
         # Adaptive threshold — vol must be in the bottom N% of recent history
@@ -758,6 +782,8 @@ class ThetaBot:
         if vol > vol_thresh:
             self._skip_reason = (f"vol not calm: {vol:.6f} > p{VOL_PERCENTILE}={vol_thresh:.6f} "
                                  f"({n_hist} samples)")
+            self._log_eval(secs_left=secs_left, vol=vol, vol_thresh=vol_thresh,
+                           action="skip", reason="vol_percentile")
             return
 
         # ── Check BTC distance from threshold (from Chainlink — resolution source) ──
@@ -778,9 +804,18 @@ class ThetaBot:
         # Higher z → price is further away in vol-adjusted terms → safer entry
         # z > 2.0 ≈ 97.7% confidence price stays on the winning side
         z = abs_dist / (vol * math.sqrt(secs_left)) if secs_left > 0 else 0.0
+
+        # Get both Polymarket mids for logging (always, not just on entry)
+        up_mid = self.poly.mid_price(self.current_window["up_token"])
+        down_mid = self.poly.mid_price(self.current_window["down_token"])
+
         if z < MIN_Z_SCORE:
             self._skip_reason = (f"z-score low: {z:.2f} < {MIN_Z_SCORE} "
                                  f"(dist={dist:+.4f} vol={vol:.6f} t={secs_left:.0f}s)")
+            self._log_eval(secs_left=secs_left, vol=vol, vol_thresh=vol_thresh,
+                           btc_price=btc_price, threshold=threshold, dist=dist,
+                           z=z, up_mid=up_mid, down_mid=down_mid,
+                           action="skip", reason="z_score_low")
             return
 
         # ── Determine which side to buy ──
@@ -794,29 +829,68 @@ class ThetaBot:
             token = self.current_window["down_token"]
 
         # ── Check Polymarket mid price ──
-        mid = self.poly.mid_price(token)
+        mid = up_mid if side == "UP" else down_mid
         if mid is None:
             self._skip_reason = "no Polymarket price"
             return
         if mid < MIN_MID_PRICE:
             self._skip_reason = f"mid too low: {mid:.3f} < {MIN_MID_PRICE}"
+            self._log_eval(secs_left=secs_left, vol=vol, vol_thresh=vol_thresh,
+                           btc_price=btc_price, threshold=threshold, dist=dist,
+                           z=z, up_mid=up_mid, down_mid=down_mid,
+                           action="skip", reason="mid_too_low")
             return
         if mid > MAX_ENTRY_PRICE:
             self._skip_reason = f"mid too high: {mid:.3f} > {MAX_ENTRY_PRICE} (not enough upside)"
+            self._log_eval(secs_left=secs_left, vol=vol, vol_thresh=vol_thresh,
+                           btc_price=btc_price, threshold=threshold, dist=dist,
+                           z=z, up_mid=up_mid, down_mid=down_mid,
+                           action="skip", reason="mid_too_high")
             return
 
         # ── All conditions met — enter! ──
+        self._log_eval(secs_left=secs_left, vol=vol, vol_thresh=vol_thresh,
+                       btc_price=btc_price, threshold=threshold, dist=dist,
+                       z=z, up_mid=up_mid, down_mid=down_mid,
+                       action="entry", reason=side)
         log(f"  ✅ ENTRY SIGNAL: BTC {side}")
         log(f"     BTC=${btc_price:,.2f} thresh=${threshold:,.0f} dist={dist:+.4f}")
         log(f"     z-score={z:.2f} (min={MIN_Z_SCORE}) | vol={vol:.6f} | t={secs_left:.0f}s")
         log(f"     mid={mid:.3f} | {secs_into_window:.0f}s in, {secs_left:.0f}s left")
-        self._enter(token, side, mid)
+        self._enter(token, side, mid,
+                    entry_z=z, entry_vol=vol, entry_dist=dist, entry_secs_left=secs_left)
+
+    # ─── TICK CSV LOGGING ─────────────────────────────────────────────
+
+    def _log_eval(self, *, secs_left=None, vol=None, vol_thresh=None,
+                  btc_price=None, threshold=None, dist=None, z=None,
+                  up_mid=None, down_mid=None, action="", reason=""):
+        """Write one evaluation row to the tick CSV."""
+        _log_tick({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "btc_price": f"{btc_price:.2f}" if btc_price else "",
+            "threshold": f"{threshold:.0f}" if threshold else "",
+            "distance": f"{dist:+.6f}" if dist is not None else "",
+            "vol": f"{vol:.8f}" if vol is not None else "",
+            "vol_thresh": f"{vol_thresh:.8f}" if vol_thresh is not None else "",
+            "secs_left": f"{secs_left:.1f}" if secs_left is not None else "",
+            "z_score": f"{z:.4f}" if z is not None else "",
+            "up_mid": f"{up_mid:.4f}" if up_mid is not None else "",
+            "down_mid": f"{down_mid:.4f}" if down_mid is not None else "",
+            "action": action,
+            "reason": reason,
+        })
 
     # ─── ENTRY ────────────────────────────────────────────────────────
 
-    def _enter(self, token_id, side, mid):
+    def _enter(self, token_id, side, mid, *,
+               entry_z=None, entry_vol=None, entry_dist=None, entry_secs_left=None):
         """Place a GTC limit buy at the current ask price (fill instantly)."""
         self._entered_this_window = True
+        self._entry_metrics = {
+            "z": entry_z, "vol": entry_vol,
+            "dist": entry_dist, "secs_left": entry_secs_left,
+        }
 
         real_balance = get_usdc_balance()
         if real_balance is None:
@@ -866,6 +940,7 @@ class ThetaBot:
                 "last_poll": 0,
                 "dry_run": True,
                 "crash_held": False,
+                "entry_metrics": self._entry_metrics,
             }
             return
 
@@ -1044,6 +1119,7 @@ class ThetaBot:
             "last_poll": 0,
             "dry_run": False,
             "crash_held": False,
+            "entry_metrics": getattr(self, '_entry_metrics', {}),
         }
         log(f"  📊 Position opened: {actual_shares:.1f}sh BTC {side} @ {buy_price}")
         log(f"     Holding to resolution (target: $1.00/share)")
@@ -1296,6 +1372,7 @@ class ThetaBot:
         self.position = None
 
         # Log trade
+        metrics = pos.get("entry_metrics", {})
         entry = {
             "time": datetime.now(timezone.utc).isoformat(),
             "side": pos["side"],
@@ -1308,6 +1385,10 @@ class ThetaBot:
             "reason": reason,
             "tracked_balance": round(self.tracked_balance, 2),
             "dry_run": pos.get("dry_run", False),
+            "entry_z": metrics.get("z"),
+            "entry_vol": metrics.get("vol"),
+            "entry_dist": metrics.get("dist"),
+            "entry_secs_left": metrics.get("secs_left"),
         }
 
         trades = []
@@ -1356,6 +1437,9 @@ def main():
     log(f"  Safety: exit_cutoff={EXIT_CUTOFF_SECS}s | min_stop_sell={MIN_STOP_SELL}")
     log(f"  Balance: ${INITIAL_BALANCE:.2f} start | {BET_PCT*100:.0f}% per trade")
     log("")
+
+    # Init tick CSV
+    _init_tick_log()
 
     # Start feeds
     chainlink = ChainlinkFeed()
