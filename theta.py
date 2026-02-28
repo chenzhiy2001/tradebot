@@ -72,7 +72,8 @@ MIN_BET = 5                    # Polymarket minimum bet
 MAX_BET = 2000                 # Safety cap
 
 # ── Entry conditions ──
-ENTRY_DELAY = 150              # Seconds into window before considering entry (2.5 min)
+ENTRY_DELAY = 30               # Seconds into window before considering entry
+                               # Just enough for Polymarket books to stabilize — z-score handles the rest
 MIN_Z_SCORE = 2.0              # Unified entry threshold — z = |dist| / (vol × √secs_left)
                                # z > 2.0 ≈ 97.7% confidence price stays on this side
                                # Replaces fixed MIN_DISTANCE — adapts to vol + time remaining
