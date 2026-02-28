@@ -499,6 +499,13 @@ class BTC80Bot:
                 f"but tracked=${self.tracked_balance:.2f} — resetting to ${INITIAL_BALANCE}")
             self.tracked_balance = INITIAL_BALANCE
 
+        # Reverse reality check: tracked bled to 0 but real USDC is available
+        # (e.g. GTC partial fills credited USDC but bot didn't track them)
+        if self.tracked_balance < MIN_BET and real_balance >= MIN_BET:
+            log(f"  ⚠ Reality check: tracked=${self.tracked_balance:.2f} < ${MIN_BET} "
+                f"but real=${real_balance:.2f} — resetting to ${INITIAL_BALANCE}")
+            self.tracked_balance = INITIAL_BALANCE
+
         effective = min(self.tracked_balance, real_balance)
         bet = round(effective * BET_PCT)
         bet = min(bet, MAX_BET, int(real_balance))  # Never exceed real USDC
@@ -817,6 +824,18 @@ class BTC80Bot:
                 return
             return
 
+        # ── If already crash-holding, skip price checks — just wait for resolution ──
+        if pos.get("crash_held"):
+            if now - pos.get("last_poll", 0) >= ORDER_POLL_SECS:
+                pos["last_poll"] = now
+                share_bal = get_share_balance(token_id)
+                if share_bal is not None and share_bal < 1.0:
+                    proceeds = 0.0
+                    pnl = -pos["cost"]
+                    log(f"  ❌ RESOLVED LOSS (crash held): PnL ${pnl:+.2f}")
+                    self._handle_exit(proceeds, pnl, 0, "resolved")
+            return
+
         # ── LIVE: Check stop loss (fastest priority) ──
         mid = self.poly.mid_price(token_id)
         if mid is not None and mid <= STOP_LOSS_MID:
@@ -919,14 +938,27 @@ class BTC80Bot:
             self._handle_exit(proceeds, pnl, LIMIT_SELL_PRICE, "limit_fill")
             return
 
-        # ── 3. Determine sell amount ──
+        # ── 3. Determine sell amount — account for GTC partial fills ──
         sell_amount = pos["shares"]
+        gtc_partial_proceeds = 0.0
         if share_bal is not None and share_bal < sell_amount:
-            log(f"  ⚠ On-chain shares ({share_bal:.1f}) < position ({sell_amount:.1f}) — using on-chain")
+            gtc_filled = sell_amount - share_bal
+            if gtc_filled >= 1.0:
+                gtc_fee = compute_taker_fee(gtc_filled, LIMIT_SELL_PRICE)
+                gtc_partial_proceeds = gtc_filled * LIMIT_SELL_PRICE - gtc_fee
+                log(f"  ⚠ On-chain shares ({share_bal:.1f}) < position ({sell_amount:.1f}) — "
+                    f"{gtc_filled:.1f}sh already sold via GTC at {LIMIT_SELL_PRICE} (${gtc_partial_proceeds:.2f})")
+            else:
+                log(f"  ⚠ On-chain shares ({share_bal:.1f}) < position ({sell_amount:.1f}) — using on-chain")
             sell_amount = share_bal
         if sell_amount < 1.0:
-            log(f"  ℹ No shares to sell ({sell_amount:.1f})")
-            self._handle_exit(0, -pos["cost"], 0, "stop_loss_no_shares")
+            if gtc_partial_proceeds > 0:
+                pnl = gtc_partial_proceeds - pos["cost"]
+                log(f"  ℹ No remaining shares — GTC partial proceeds ${gtc_partial_proceeds:.2f}, PnL ${pnl:+.2f}")
+                self._handle_exit(gtc_partial_proceeds, pnl, LIMIT_SELL_PRICE, "limit_fill_partial")
+            else:
+                log(f"  ℹ No shares to sell ({sell_amount:.1f})")
+                self._handle_exit(0, -pos["cost"], 0, "stop_loss_no_shares")
             return
 
         # ── 4. Sell at bid — up to 3 attempts ──
@@ -971,8 +1003,9 @@ class BTC80Bot:
                         proceeds = sell_amount * sell_price
                         fee = compute_taker_fee(sell_amount, sell_price)
                         proceeds -= fee
-                        pnl = proceeds - pos["cost"]
-                        self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
+                        total = proceeds + gtc_partial_proceeds
+                        pnl = total - pos["cost"]
+                        self._handle_exit(total, pnl, sell_price, "stop_loss")
                         return
                 log(f"  ⚠ Sell error (attempt {attempt+1}): {e}")
                 time.sleep(1)
@@ -995,9 +1028,10 @@ class BTC80Bot:
             if taking > 0 and not order_id:
                 actual_shares = making if making > 0 else sell_amount
                 actual_price = round(taking / actual_shares, 4) if actual_shares > 0 else 0
-                pnl = taking - pos["cost"]
+                total = taking + gtc_partial_proceeds
+                pnl = total - pos["cost"]
                 log(f"  💰 Sold {actual_shares:.1f}sh @ ~{actual_price:.3f} → PnL ${pnl:+.2f}")
-                self._handle_exit(taking, pnl, actual_price, "stop_loss")
+                self._handle_exit(total, pnl, actual_price, "stop_loss")
                 return
 
             # GTC resting — wait up to 10s
@@ -1011,9 +1045,10 @@ class BTC80Bot:
                         proceeds = sell_amount * sell_price
                         fee = compute_taker_fee(sell_amount, sell_price)
                         proceeds -= fee
-                        pnl = proceeds - pos["cost"]
-                        log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                        self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
+                        total = proceeds + gtc_partial_proceeds
+                        pnl = total - pos["cost"]
+                        log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, GTC=${gtc_partial_proceeds:.2f}, PnL ${pnl:+.2f}")
+                        self._handle_exit(total, pnl, sell_price, "stop_loss")
                         return
                     time.sleep(2)
                 # Not filled — cancel and retry
@@ -1028,9 +1063,10 @@ class BTC80Bot:
                     proceeds = sell_amount * sell_price
                     fee = compute_taker_fee(sell_amount, sell_price)
                     proceeds -= fee
-                    pnl = proceeds - pos["cost"]
+                    total = proceeds + gtc_partial_proceeds
+                    pnl = total - pos["cost"]
                     log(f"  💰 Filled during cancel → PnL ${pnl:+.2f}")
-                    self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
+                    self._handle_exit(total, pnl, sell_price, "stop_loss")
                     return
                 continue
 
@@ -1042,9 +1078,10 @@ class BTC80Bot:
                 proceeds = sell_amount * sell_price
                 fee = compute_taker_fee(sell_amount, sell_price)
                 proceeds -= fee
-                pnl = proceeds - pos["cost"]
+                total = proceeds + gtc_partial_proceeds
+                pnl = total - pos["cost"]
                 log(f"  ✅ Shares gone — filled silently → PnL ${pnl:+.2f}")
-                self._handle_exit(proceeds, pnl, sell_price, "stop_loss")
+                self._handle_exit(total, pnl, sell_price, "stop_loss")
                 return
             time.sleep(1)
 
