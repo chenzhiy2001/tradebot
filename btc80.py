@@ -64,6 +64,7 @@ LIMIT_SELL_PRICE = 0.99       # GTC limit sell price (take profit)
 STOP_LOSS_MID = 0.75          # FOK sell if mid drops to this (stop loss)
 MIN_STOP_SELL = 0.50          # Don't sell below this — hold for resolution instead
 BUY_FILL_TIMEOUT = 120        # Max seconds to wait for GTC buy to fill
+EXIT_CUTOFF_SECS = 60         # Sell at bid this many secs before window end to avoid crash zone
 
 # Polymarket fee formula (5m crypto)
 CRYPTO_FEE_RATE = 0.25
@@ -818,14 +819,40 @@ class BTC80Bot:
             self._execute_stop_loss()
             return
 
+        # ── EXIT CUTOFF: sell before crash zone (last ~60s of window) ──
+        if self.current_window:
+            secs_left = (self.current_window["end"] - datetime.now(timezone.utc)).total_seconds()
+            if 0 < secs_left <= EXIT_CUTOFF_SECS:
+                log(f"  ⏰ EXIT CUTOFF: {secs_left:.0f}s left — selling at bid to avoid crash zone")
+                self._execute_stop_loss()
+                return
+
         # ── Check if GTC limit sell filled (poll every N seconds) ──
         if now - pos.get("last_poll", 0) >= ORDER_POLL_SECS:
             pos["last_poll"] = now
             share_bal = get_share_balance(token_id)
             if share_bal is not None and share_bal < 1.0:
-                # Shares gone → GTC filled or market resolved
+                # Shares gone — but was it a GTC fill or resolution?
+                # If window already ended, use resolution logic instead.
+                if self.current_window:
+                    secs_past = (datetime.now(timezone.utc) - self.current_window["end"]).total_seconds()
+                    if secs_past > 5:
+                        # Window ended — this is resolution, not limit fill
+                        time.sleep(3)
+                        usdc_now = get_usdc_balance() or 0
+                        usdc_delta = usdc_now - pos.get("usdc_snapshot", 0)
+                        if usdc_delta > pos["shares"] * 0.5:
+                            proceeds = pos["shares"] * 1.0
+                            pnl = proceeds - pos["cost"]
+                            log(f"  🎉 RESOLVED WIN: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
+                        else:
+                            proceeds = 0.0
+                            pnl = -pos["cost"]
+                            log(f"  ❌ RESOLVED LOSS: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
+                        self._handle_exit(proceeds, pnl, 0, "resolved")
+                        return
+                # Window still active — genuine GTC fill
                 log(f"  🎉 LIMIT FILLED: BTC {side} shares={share_bal:.1f} (sold)")
-                # Compute proceeds analytically (USDC snapshot is unreliable due to settlement lag)
                 proceeds = pos["shares"] * LIMIT_SELL_PRICE
                 fee = compute_taker_fee(pos["shares"], LIMIT_SELL_PRICE)
                 proceeds -= fee
