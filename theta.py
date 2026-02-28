@@ -3,7 +3,8 @@
 Theta Bot — Late-entry volatility-filtered BTC 5-minute binary scalper.
 
 Strategy:
-  1. Stream real-time BTC/USDT from Binance websocket (100ms kline).
+  1. Stream real-time BTC/USD from Chainlink via Polymarket RTDS websocket
+     (same oracle that determines market resolution).
   2. Compute rolling 5-min realized volatility (stdev of 1s returns).
   3. For each Polymarket BTC 5-min window:
      - Wait until ENTRY_DELAY seconds into the window (let uncertainty fade).
@@ -51,8 +52,11 @@ founder_address = os.getenv("FUNDER_ADDRESS")
 HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@kline_1s"
+RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 CHAIN_ID = 137
+
+# Chainlink symbol (Polymarket resolution source)
+CHAINLINK_SYMBOL = "btc/usd"
 FUNDER_ADDRESS = founder_address
 
 # =========================================================================
@@ -168,17 +172,20 @@ def compute_taker_fee(shares, price):
 
 
 # =========================================================================
-# BINANCE BTC PRICE FEED
+# CHAINLINK PRICE FEED (via Polymarket RTDS — matches resolution source)
 # =========================================================================
-class BinanceFeed:
-    """Real-time BTC/USDT price via Binance websocket (1s kline).
+class ChainlinkFeed:
+    """Real-time BTC/USD price from Chainlink via Polymarket RTDS websocket.
 
-    Stores 1-second close prices for rolling volatility computation.
-    Also tracks the current BTC price for threshold distance checks.
+    This is the SAME data source Polymarket uses to resolve crypto markets.
+    Using Chainlink instead of Binance means our distance/vol calculations
+    are based on the exact price that determines win/loss.
+
+    Stores prices for rolling volatility computation.
     """
 
     def __init__(self):
-        self._price = None              # Latest BTC/USDT price
+        self._price = None              # Latest Chainlink BTC/USD price
         self._prices = deque(maxlen=VOL_WINDOW)  # (timestamp, price) pairs
         self._lock = threading.Lock()
         self._connected = False
@@ -197,17 +204,35 @@ class BinanceFeed:
         while True:
             try:
                 async with websockets.connect(
-                    BINANCE_WS_URL, close_timeout=5, open_timeout=10
+                    RTDS_WS_URL, close_timeout=5, open_timeout=10
                 ) as ws:
+                    # Subscribe to Chainlink crypto prices
+                    sub_msg = json.dumps({
+                        "action": "subscribe",
+                        "subscriptions": [{
+                            "topic": "crypto_prices_chainlink",
+                            "type": "*",
+                            "filters": "",
+                        }]
+                    })
+                    await ws.send(sub_msg)
                     self._connected = True
-                    log("  🔌 Binance WS connected")
+                    log("  🔗 Chainlink RTDS connected (Polymarket resolution source)")
+
+                    last_ping = time.time()
 
                     while True:
+                        # Keep alive — RTDS needs pings every ~5s
+                        if time.time() - last_ping > 4:
+                            try:
+                                await ws.send("PING")
+                                last_ping = time.time()
+                            except Exception:
+                                break
+
                         try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                            msg = await asyncio.wait_for(ws.recv(), timeout=1)
                         except asyncio.TimeoutError:
-                            # Send ping to keep alive
-                            await ws.ping()
                             continue
 
                         try:
@@ -215,26 +240,29 @@ class BinanceFeed:
                         except (json.JSONDecodeError, TypeError):
                             continue
 
-                        # Binance kline format: data["k"]["c"] = close price
-                        k = data.get("k")
-                        if k:
-                            try:
-                                close = float(k["c"])
-                                ts = time.time()
-                                with self._lock:
-                                    self._price = close
-                                    self._prices.append((ts, close))
-                            except (ValueError, KeyError):
-                                pass
+                        if data.get("topic") == "crypto_prices_chainlink":
+                            payload = data.get("payload", {})
+                            symbol = payload.get("symbol", "").lower()
+                            value = payload.get("value")
+                            ts_ms = payload.get("timestamp")
+                            if symbol == CHAINLINK_SYMBOL and value is not None:
+                                try:
+                                    price_val = float(value)
+                                    ts = (ts_ms / 1000.0) if ts_ms else time.time()
+                                    with self._lock:
+                                        self._price = price_val
+                                        self._prices.append((ts, price_val))
+                                except (ValueError, TypeError):
+                                    pass
 
             except Exception as e:
                 self._connected = False
-                log(f"  ⚠ Binance WS error: {e}, reconnecting in 2s...")
+                log(f"  ⚠ Chainlink RTDS error: {e}, reconnecting in 2s...")
                 await asyncio.sleep(2)
 
     @property
     def price(self):
-        """Current BTC/USDT price."""
+        """Current Chainlink BTC/USD price."""
         with self._lock:
             return self._price
 
@@ -243,10 +271,10 @@ class BinanceFeed:
         return self._connected
 
     def realized_vol(self):
-        """Compute realized volatility as stdev of 1-second log returns.
+        """Compute realized volatility as stdev of log returns between
+        consecutive Chainlink price updates.
 
         Returns (vol, n_samples) or (None, 0) if not enough data.
-        vol is annualized-ish but we just use the raw stdev for thresholding.
         """
         with self._lock:
             prices = list(self._prices)
@@ -258,7 +286,7 @@ class BinanceFeed:
         log_returns = []
         for i in range(1, len(prices)):
             dt = prices[i][0] - prices[i - 1][0]
-            if dt > 5:  # Skip gaps > 5s (reconnection)
+            if dt > 10:  # Skip gaps > 10s (reconnection)
                 continue
             if prices[i - 1][1] > 0:
                 lr = math.log(prices[i][1] / prices[i - 1][1])
@@ -526,14 +554,14 @@ class ThetaBot:
 
     Core logic:
       - Wait 2.5 min into each window
-      - Check Binance BTC vol + distance from threshold
+      - Check Chainlink BTC vol + distance from threshold
       - If low vol + comfortable distance → buy winning side on Polymarket
       - Hold to resolution → collect $1/share on win
     """
 
-    def __init__(self, poly, binance):
+    def __init__(self, poly, chainlink):
         self.poly = poly
-        self.binance = binance
+        self.chainlink = chainlink
         self.tracked_balance = INITIAL_BALANCE
         self.position = None
         self.pending_buy = None
@@ -607,7 +635,7 @@ class ThetaBot:
             return
 
         # ── Check volatility ──
-        vol, n_samples = self.binance.realized_vol()
+        vol, n_samples = self.chainlink.realized_vol()
         if vol is None:
             self._skip_reason = f"vol: need {VOL_MIN_SAMPLES} samples (have {n_samples})"
             return
@@ -621,7 +649,7 @@ class ThetaBot:
             self._skip_reason = "no threshold parsed"
             return
 
-        dist, btc_price = self.binance.distance_from_round(threshold)
+        dist, btc_price = self.chainlink.distance_from_round(threshold)
         if dist is None:
             self._skip_reason = "no BTC price"
             return
@@ -1206,24 +1234,24 @@ def main():
     log("")
 
     # Start feeds
-    binance = BinanceFeed()
-    binance.start()
+    chainlink = ChainlinkFeed()
+    chainlink.start()
 
     poly = PolymarketFeed()
     poly.start()
 
-    bot = ThetaBot(poly, binance)
+    bot = ThetaBot(poly, chainlink)
 
     log("Waiting for WS connections...")
     for _ in range(30):
-        if poly.connected and binance.connected:
+        if poly.connected and chainlink.connected:
             break
         time.sleep(1)
 
     if not poly.connected:
         log("⚠ Polymarket WS not connected after 30s")
-    if not binance.connected:
-        log("⚠ Binance WS not connected after 30s")
+    if not chainlink.connected:
+        log("⚠ Chainlink RTDS not connected after 30s")
 
     balance = get_usdc_balance()
     if balance:
@@ -1231,7 +1259,7 @@ def main():
     log(f"Tracked balance: ${bot.tracked_balance:.2f}")
 
     # Wait for vol data to accumulate
-    log(f"Accumulating {VOL_MIN_SAMPLES}s of BTC price data for volatility...")
+    log(f"Accumulating {VOL_MIN_SAMPLES} Chainlink price ticks for volatility...")
     log("")
 
     last_discovery = 0
@@ -1254,11 +1282,11 @@ def main():
             # Dashboard
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
             poly_ws = "🟢" if poly.connected else "🔴"
-            bn_ws = "🟢" if binance.connected else "🔴"
+            cl_ws = "🟢" if chainlink.connected else "🔴"
             status = bot.get_status()
 
-            btc_price = binance.price
-            vol, n_samples = binance.realized_vol()
+            btc_price = chainlink.price
+            vol, n_samples = chainlink.realized_vol()
 
             up_mid = down_mid = None
             threshold = None
@@ -1276,7 +1304,7 @@ def main():
             print(f"\033[2J\033[H", end="")
             print(f"═══ Theta Bot [{mode}] ═══  {now_str} UTC")
             print(f"{'─' * 70}")
-            print(f"  Polymarket {poly_ws}  |  Binance {bn_ws}")
+            print(f"  Polymarket {poly_ws}  |  Chainlink {cl_ws}")
             print(f"  BTC: ${btc_price:,.2f}" if btc_price else "  BTC: --")
             if threshold:
                 dist = (btc_price - threshold) / threshold if btc_price else 0
