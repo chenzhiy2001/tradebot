@@ -299,6 +299,20 @@ class ChainlinkFeed:
     def connected(self):
         return self._connected
 
+    def price_at_time(self, target_ts):
+        """Return the stored price closest to target_ts (epoch seconds).
+
+        Searches the rolling (timestamp, price) buffer for the entry
+        nearest to the requested time.  Returns (price, delta_secs)
+        where delta_secs = |entry_ts - target_ts|, or (None, None).
+        """
+        with self._lock:
+            prices = list(self._prices)
+        if not prices:
+            return None, None
+        best = min(prices, key=lambda tp: abs(tp[0] - target_ts))
+        return best[1], abs(best[0] - target_ts)
+
     def distance_from_round(self, threshold_price):
         """How far BTC is from a threshold price, as a fraction.
 
@@ -702,13 +716,26 @@ class ThetaBot:
             self._low_bal_logged = False
 
             # Snapshot Chainlink price as threshold ("Up or Down" markets
-            # resolve based on price at end vs price at beginning of window)
-            cl_price = self.chainlink.price
-            if cl_price:
-                window["threshold"] = round(cl_price, 2)
-                log(f"  🔄 New window (threshold=${cl_price:,.2f} from Chainlink snapshot)")
+            # resolve based on price at end vs price at beginning of window).
+            # Look up the stored price closest to the exact window start time
+            # to match Polymarket's "Price to beat".
+            win_start_ts = window["start"].timestamp()
+            cl_historical, delta_secs = self.chainlink.price_at_time(win_start_ts)
+            if cl_historical is not None and delta_secs < 10:
+                # Good historical match — within 10s of window start
+                window["threshold"] = round(cl_historical, 2)
+                log(f"  🔄 New window (threshold=${cl_historical:,.2f} "
+                    f"from Chainlink @{delta_secs:.1f}s of start)")
             else:
-                log(f"  🔄 New window (threshold=pending — no Chainlink price yet)")
+                # Fallback: use current Chainlink price (discovery was late)
+                cl_price = self.chainlink.price
+                if cl_price:
+                    window["threshold"] = round(cl_price, 2)
+                    lag = f", {delta_secs:.0f}s lag" if delta_secs is not None else ""
+                    log(f"  🔄 New window (threshold=${cl_price:,.2f} "
+                        f"from current Chainlink — no close match{lag})")
+                else:
+                    log(f"  🔄 New window (threshold=pending — no Chainlink price yet)")
 
     # ─── MAIN TICK ────────────────────────────────────────────────────
 
@@ -1514,13 +1541,16 @@ def main():
             print(f"  BTC: ${btc_price:,.2f}" if btc_price else "  BTC: --")
             if threshold:
                 dist = (btc_price - threshold) / threshold if btc_price else 0
+                diff_dollar = (btc_price - threshold) if btc_price else 0
+                diff_arrow = "▲" if diff_dollar >= 0 else "▼"
                 # Compute live z-score for dashboard
                 z_str = "--"
                 if vol and secs_left > 0:
                     z_live = abs(dist) / (vol * math.sqrt(secs_left))
                     z_ok = "✅" if z_live >= MIN_Z_SCORE else "❌"
                     z_str = f"{z_ok} {z_live:.2f} (min={MIN_Z_SCORE})"
-                print(f"  Threshold: ${threshold:,.0f}  |  Distance: {dist:+.4f}  |  Z: {z_str}")
+                print(f"  Price to beat: ${threshold:,.2f}  |  "
+                      f"{diff_arrow} ${abs(diff_dollar):,.2f}  |  Z: {z_str}")
             print(f"  Vol: {vol:.6f} ({n_samples} samples)" if vol else
                   f"  Vol: accumulating ({n_samples}/{VOL_MIN_SAMPLES} samples)")
             if vol and vol_thresh:
