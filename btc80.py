@@ -64,7 +64,7 @@ LIMIT_SELL_PRICE = 0.99       # GTC limit sell price (take profit)
 STOP_LOSS_MID = 0.75          # FOK sell if mid drops to this (stop loss)
 MIN_STOP_SELL = 0.50          # Don't sell below this — hold for resolution instead
 BUY_FILL_TIMEOUT = 120        # Max seconds to wait for GTC buy to fill
-EXIT_CUTOFF_SECS = 60         # Sell at bid this many secs before window end to avoid crash zone
+EXIT_CUTOFF_SECS = 30         # Sell at bid this many secs before window end to avoid crash zone
 
 # Polymarket fee formula (5m crypto)
 CRYPTO_FEE_RATE = 0.25
