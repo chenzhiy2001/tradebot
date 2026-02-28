@@ -833,25 +833,14 @@ class BTC80Bot:
             share_bal = get_share_balance(token_id)
             if share_bal is not None and share_bal < 1.0:
                 # Shares gone — but was it a GTC fill or resolution?
-                # If window already ended, use resolution logic instead.
-                if self.current_window:
-                    secs_past = (datetime.now(timezone.utc) - self.current_window["end"]).total_seconds()
-                    if secs_past > 5:
-                        # Window ended — this is resolution, not limit fill
-                        time.sleep(3)
-                        usdc_now = get_usdc_balance() or 0
-                        usdc_delta = usdc_now - pos.get("usdc_snapshot", 0)
-                        if usdc_delta > pos["shares"] * 0.5:
-                            proceeds = pos["shares"] * 1.0
-                            pnl = proceeds - pos["cost"]
-                            log(f"  🎉 RESOLVED WIN: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                        else:
-                            proceeds = 0.0
-                            pnl = -pos["cost"]
-                            log(f"  ❌ RESOLVED LOSS: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                        self._handle_exit(proceeds, pnl, 0, "resolved")
-                        return
-                # Window still active — genuine GTC fill
+                if pos.get("crash_held"):
+                    # We held through a crash — this is a loss (resolved to $0)
+                    proceeds = 0.0
+                    pnl = -pos["cost"]
+                    log(f"  ❌ RESOLVED LOSS (crash held): PnL ${pnl:+.2f}")
+                    self._handle_exit(proceeds, pnl, 0, "resolved")
+                    return
+                # No crash — genuine GTC fill
                 log(f"  🎉 LIMIT FILLED: BTC {side} shares={share_bal:.1f} (sold)")
                 proceeds = pos["shares"] * LIMIT_SELL_PRICE
                 fee = compute_taker_fee(pos["shares"], LIMIT_SELL_PRICE)
@@ -869,20 +858,16 @@ class BTC80Bot:
                 log(f"  📊 Window ended {secs_past_end:.0f}s ago — checking resolution")
                 share_bal = get_share_balance(token_id)
                 if share_bal is not None and share_bal < 1.0:
-                    # Shares redeemed — determine win/loss analytically
-                    time.sleep(3)
-                    usdc_now = get_usdc_balance() or 0
-                    usdc_delta = usdc_now - pos.get("usdc_snapshot", 0)
-                    # Win: shares redeemed at $1 each; Loss: $0 each
-                    # Use USDC delta only to decide win vs loss (gap is large)
-                    if usdc_delta > pos["shares"] * 0.5:
-                        proceeds = pos["shares"] * 1.0  # $1 per share
-                        pnl = proceeds - pos["cost"]
-                        log(f"  🎉 RESOLVED WIN: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                    else:
+                    # Shares redeemed — determine win/loss
+                    if pos.get("crash_held"):
                         proceeds = 0.0
                         pnl = -pos["cost"]
-                        log(f"  ❌ RESOLVED LOSS: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
+                        log(f"  ❌ RESOLVED LOSS (crash held): PnL ${pnl:+.2f}")
+                    else:
+                        # No crash seen — assume win (resolved at $1)
+                        proceeds = pos["shares"] * 1.0
+                        pnl = proceeds - pos["cost"]
+                        log(f"  🎉 RESOLVED WIN: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
                     self._handle_exit(proceeds, pnl, 0, "resolved")
                 else:
                     # Shares still there? Try canceling + selling
@@ -906,6 +891,7 @@ class BTC80Bot:
         bid, _, _ = self.poly.get_price(token_id)
         if bid is not None and bid < MIN_STOP_SELL:
             log(f"  ⚠ Bid={bid:.2f} < {MIN_STOP_SELL} — price crashed, holding for resolution")
+            pos["crash_held"] = True
             return
 
         # ── 1. Cancel take-profit GTC limit sell ──
