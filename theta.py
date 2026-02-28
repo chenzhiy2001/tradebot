@@ -67,7 +67,12 @@ FUNDER_ADDRESS = founder_address
 # STRATEGY PARAMETERS
 # =========================================================================
 INITIAL_BALANCE = 50.0         # Starting tracked balance
-BET_PCT = 0.65                 # 65% per trade — Kelly-justified at 18/18 win rate
+DEFAULT_BET_PCT = 0.35         # Fallback bet % before enough data for Kelly
+MIN_KELLY_TRADES = 10          # Minimum trades before Kelly kicks in
+KELLY_LOOKBACK = 50            # Use last N trades only (rolling window)
+KELLY_FRACTION = 0.5           # Use half-Kelly for safety (0.5 = half, 1.0 = full)
+MIN_BET_PCT = 0.05             # Floor — never bet less than 5%
+MAX_BET_PCT = 0.50             # Ceiling — never bet more than 50%
 MIN_BET = 5                    # Polymarket minimum bet
 MAX_BET = 2000                 # Safety cap
 
@@ -700,9 +705,71 @@ class ThetaBot:
         self.trade_count = 0
         self.win_count = 0
         self.total_pnl = 0.0
+        self.trade_history = []         # list of {"win_frac": float} for Kelly
+        self._load_trade_history()
         self._no_match_until = 0
         self._entered_this_window = False  # Only one entry per window
         self._skip_reason = ""             # Why we skipped (for dashboard)
+
+    # ─── ADAPTIVE KELLY ──────────────────────────────────────────────
+
+    def _load_trade_history(self):
+        """Bootstrap Kelly from saved trade log (theta_trades.json)."""
+        if not os.path.exists(TRADE_LOG):
+            return
+        try:
+            with open(TRADE_LOG) as f:
+                trades = json.load(f)
+            for t in trades:
+                cost = t.get("cost", 0)
+                pnl = t.get("pnl", 0)
+                if cost > 0:
+                    self.trade_history.append({"win_frac": pnl / cost})
+            if self.trade_history:
+                kelly = self._compute_kelly()
+                log(f"  📈 Loaded {len(self.trade_history)} trades for Kelly "
+                    f"→ bet_pct={kelly:.1%}")
+        except Exception as e:
+            log(f"  ⚠ Could not load trade history for Kelly: {e}")
+
+    def _compute_kelly(self):
+        """Compute Kelly-optimal bet fraction from trade history.
+
+        Kelly formula for binary outcomes:
+          f* = p - q/b
+        where p = win rate, q = 1-p, b = avg_win / avg_loss (as fractions of cost).
+
+        Returns the bet fraction clamped to [MIN_BET_PCT, MAX_BET_PCT],
+        scaled by KELLY_FRACTION (half-Kelly by default).
+        """
+        history = self.trade_history[-KELLY_LOOKBACK:]  # rolling window
+        if len(history) < MIN_KELLY_TRADES:
+            return DEFAULT_BET_PCT
+
+        wins = [h["win_frac"] for h in history if h["win_frac"] > 0]
+        losses = [h["win_frac"] for h in history if h["win_frac"] <= 0]
+
+        if not wins or not losses:
+            return DEFAULT_BET_PCT
+
+        p = len(wins) / len(history)
+        q = 1 - p
+        avg_win = sum(wins) / len(wins)       # e.g. 0.128 (12.8%)
+        avg_loss = sum(abs(l) for l in losses) / len(losses)  # e.g. 1.0
+
+        if avg_loss == 0:
+            return DEFAULT_BET_PCT
+
+        b = avg_win / avg_loss
+        kelly = p - q / b
+
+        if kelly <= 0:
+            return MIN_BET_PCT  # Edge is negative — bet minimum
+
+        # Apply fractional Kelly and clamp
+        kelly *= KELLY_FRACTION
+        kelly = max(MIN_BET_PCT, min(MAX_BET_PCT, kelly))
+        return kelly
 
     def update_market(self, window):
         """Update current window and subscribe to tokens."""
@@ -931,7 +998,8 @@ class ThetaBot:
             self.tracked_balance = INITIAL_BALANCE
 
         effective = min(self.tracked_balance, real_balance)
-        bet = round(effective * BET_PCT)
+        bet_pct = self._compute_kelly()
+        bet = round(effective * bet_pct)
         bet = min(bet, MAX_BET, int(real_balance))
         if bet < MIN_BET:
             if not hasattr(self, '_low_bal_logged') or not self._low_bal_logged:
@@ -950,7 +1018,7 @@ class ThetaBot:
         shares_to_buy = round(bet / buy_price, 2)
 
         log(f"  ⚡ BTC {side}: {shares_to_buy:.1f}sh @ {buy_price} "
-            f"(${bet} | tracked=${self.tracked_balance:.2f})")
+            f"(${bet} | kelly={bet_pct:.0%} | tracked=${self.tracked_balance:.2f})")
 
         if DRY_RUN:
             log(f"  🧪 DRY RUN — buy {shares_to_buy:.1f}sh @ {buy_price}")
@@ -1414,6 +1482,11 @@ class ThetaBot:
         if pnl > 0:
             self.win_count += 1
         self.total_pnl += pnl
+
+        # Update Kelly history
+        cost = pos.get("cost", 0)
+        if cost > 0:
+            self.trade_history.append({"win_frac": pnl / cost})
 
         # Update tracked balance
         self.tracked_balance += pnl
