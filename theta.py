@@ -6,7 +6,7 @@ Strategy:
   1. Stream real-time BTC/USD from Chainlink via Polymarket RTDS websocket
      (same oracle that determines market resolution) for distance checks.
   2. Stream real-time BTC/USDT from Binance websocket (1s kline) for
-     high-resolution volatility computation.
+     high-resolut   ion volatility computation.
   3. Compute rolling 5-min realized volatility (stdev of 1s returns via Binance).
   3. For each Polymarket BTC 5-min window:
      - Wait until ENTRY_DELAY seconds into the window (let uncertainty fade).
@@ -215,7 +215,7 @@ class ChainlinkFeed:
 
     def __init__(self):
         self._price = None              # Latest Chainlink BTC/USD price
-        self._prices = deque(maxlen=VOL_WINDOW)  # (timestamp, price) pairs
+        self._prices = deque(maxlen=3600)   # (timestamp, price) pairs — ~1hr at 1/s
         self._lock = threading.Lock()
         self._connected = False
 
@@ -687,6 +687,7 @@ class ThetaBot:
         self.binance = binance
         self.tracked_balance = INITIAL_BALANCE
         self.position = None
+        self.resolving_positions = []   # positions waiting for share redemption
         self.pending_buy = None
         self.current_window = None
         self.trade_count = 0
@@ -740,7 +741,9 @@ class ThetaBot:
     # ─── MAIN TICK ────────────────────────────────────────────────────
 
     def tick(self):
-        """Main tick: manage position/pending, or evaluate entry."""
+        """Main tick: manage resolving, then position/pending, or evaluate entry."""
+        self._manage_resolving()
+
         if self.position:
             self._manage_position()
             return
@@ -952,6 +955,7 @@ class ThetaBot:
                 "cost": bet,
                 "entry_time": time.time(),
                 "window_end": self.current_window["end"] if self.current_window else None,
+                "threshold": self.current_window.get("threshold") if self.current_window else None,
                 "limit_order_id": None,
                 "usdc_snapshot": real_balance - bet,
                 "last_poll": 0,
@@ -1132,6 +1136,7 @@ class ThetaBot:
             "cost": actual_cost,
             "entry_time": time.time(),
             "window_end": self.current_window["end"] if self.current_window else None,
+            "threshold": self.current_window.get("threshold") if self.current_window else None,
             "limit_order_id": None,  # No GTC sell — hold to resolution
             "usdc_snapshot": usdc_snap,
             "last_poll": 0,
@@ -1145,97 +1150,132 @@ class ThetaBot:
     # ─── POSITION MANAGEMENT ─────────────────────────────────────────
 
     def _manage_position(self):
-        """Monitor for resolution or exit cutoff. NO stop loss — hold to resolution."""
+        """Monitor active position. Once window ends, move to resolving queue."""
         pos = self.position
         if not pos:
             return
 
-        token_id = pos["token_id"]
-        now = time.time()
-
-        # ── DRY RUN ──
-        if pos.get("dry_run"):
-            mid = self.poly.mid_price(token_id)
-            if mid is None:
+        # ── Check if window has ended → move to resolving queue ──
+        win_end = pos.get("window_end")
+        if win_end:
+            secs_past_end = (datetime.now(timezone.utc) - win_end).total_seconds()
+            if secs_past_end > 0:
+                log(f"  ♻ Window ended — moving position to resolving queue")
+                self.resolving_positions.append(pos)
+                self.position = None
                 return
-            win_end = pos.get("window_end")
-            if win_end and datetime.now(timezone.utc) > win_end + timedelta(seconds=5):
-                resolved_price = 1.0 if mid > 0.50 else 0.0
-                revenue = pos["shares"] * resolved_price
-                pnl = revenue - pos["cost"]
-                log(f"  📊 RESOLVED: BTC {pos['side']} → {'WIN' if resolved_price > 0 else 'LOSS'}")
-                log(f"  🧪 DRY RUN — PnL ${pnl:+.2f}")
-                self._handle_exit(revenue, pnl, resolved_price, "resolved")
-            return
 
-        # ── Crash-held: skip all checks, just wait for resolution ──
-        if pos.get("crash_held"):
+        # Window still active — nothing to do, just hold
+
+    # ─── RESOLVING POSITIONS ─────────────────────────────────────────
+
+    def _resolve_by_chainlink(self, pos):
+        """Determine win/loss using Chainlink price vs threshold."""
+        threshold = pos.get("threshold")
+        side = pos["side"]
+
+        # Get Chainlink price at window end time
+        cl_price = None
+        win_end = pos.get("window_end")
+        if win_end:
+            cl_price, delta = self.chainlink.price_at_time(win_end.timestamp())
+            if cl_price is None or delta > 30:
+                cl_price = self.chainlink.price  # fallback to current
+        else:
+            cl_price = self.chainlink.price
+
+        # Determine outcome
+        if threshold and cl_price:
+            if side == "Up":
+                won = cl_price > threshold
+            else:
+                won = cl_price < threshold
+            log(f"  📊 Resolution: BTC ${cl_price:,.2f} vs beat=${threshold:,.2f} "
+                f"→ {side} {'WIN' if won else 'LOSS'}")
+        else:
+            # Fallback: USDC comparison (only reliable if no other positions in flight)
+            usdc_now = get_usdc_balance()
+            usdc_before = pos.get("usdc_snapshot", 0)
+            won = usdc_now is not None and usdc_now > usdc_before + pos["cost"] * 0.5
+            log(f"  📊 Resolution (USDC fallback): {'WIN' if won else 'LOSS'}")
+
+        if won:
+            proceeds = pos["shares"] * 1.0
+            pnl = proceeds - pos["cost"]
+            log(f"  🎉 RESOLVED WIN: BTC {side}, proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
+        else:
+            proceeds = 0.0
+            pnl = -pos["cost"]
+            log(f"  ❌ RESOLVED LOSS: BTC {side}, PnL ${pnl:+.2f}")
+
+        self._handle_exit(proceeds, pnl, 1.0 if won else 0.0, "resolved", pos=pos)
+
+    def _manage_resolving(self):
+        """Poll resolving positions for share redemption. Non-blocking."""
+        for pos in list(self.resolving_positions):  # copy so we can remove
+            token_id = pos["token_id"]
+            now = time.time()
+
+            # ── DRY RUN ──
+            if pos.get("dry_run"):
+                win_end = pos.get("window_end")
+                if win_end and (datetime.now(timezone.utc) - win_end).total_seconds() > 5:
+                    mid = self.poly.mid_price(token_id)
+                    if mid is not None:
+                        resolved_price = 1.0 if mid > 0.50 else 0.0
+                        revenue = pos["shares"] * resolved_price
+                        pnl = revenue - pos["cost"]
+                        log(f"  📊 RESOLVED: BTC {pos['side']} → "
+                            f"{'WIN' if resolved_price > 0 else 'LOSS'}")
+                        log(f"  🧪 DRY RUN — PnL ${pnl:+.2f}")
+                        self._handle_exit(revenue, pnl, resolved_price, "resolved", pos=pos)
+                continue
+
+            # ── Crash-held: just poll for share disappearance ──
+            if pos.get("crash_held"):
+                if now - pos.get("last_poll", 0) >= ORDER_POLL_SECS:
+                    pos["last_poll"] = now
+                    share_bal = get_share_balance(token_id)
+                    if share_bal is not None and share_bal < 1.0:
+                        self._resolve_by_chainlink(pos)
+                continue
+
+            # ── Poll for resolution (shares disappear) ──
             if now - pos.get("last_poll", 0) >= ORDER_POLL_SECS:
                 pos["last_poll"] = now
                 share_bal = get_share_balance(token_id)
                 if share_bal is not None and share_bal < 1.0:
-                    # Shares gone = resolved
-                    # Check USDC to see if we won
-                    usdc_now = get_usdc_balance()
-                    usdc_before = pos.get("usdc_snapshot", 0)
-                    if usdc_now is not None and usdc_now > usdc_before + pos["cost"] * 0.5:
-                        proceeds = pos["shares"] * 1.0
-                        pnl = proceeds - pos["cost"]
-                        log(f"  🎉 RESOLVED WIN (crash held): PnL ${pnl:+.2f}")
-                        self._handle_exit(proceeds, pnl, 1.0, "resolved")
-                    else:
-                        pnl = -pos["cost"]
-                        log(f"  ❌ RESOLVED LOSS (crash held): PnL ${pnl:+.2f}")
-                        self._handle_exit(0, pnl, 0, "resolved")
-            return
+                    self._resolve_by_chainlink(pos)
+                    continue
 
-        # ── Check if shares gone (resolution) ──
-        if now - pos.get("last_poll", 0) >= ORDER_POLL_SECS:
-            pos["last_poll"] = now
-            share_bal = get_share_balance(token_id)
-            if share_bal is not None and share_bal < 1.0:
-                # Shares redeemed — determine win/loss by USDC change
-                usdc_now = get_usdc_balance()
-                usdc_before = pos.get("usdc_snapshot", 0)
-                if usdc_now is not None and usdc_now > usdc_before + pos["cost"] * 0.5:
-                    proceeds = pos["shares"] * 1.0
-                    pnl = proceeds - pos["cost"]
-                    log(f"  🎉 RESOLVED WIN: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                else:
-                    proceeds = 0.0
-                    pnl = -pos["cost"]
-                    log(f"  ❌ RESOLVED LOSS: PnL ${pnl:+.2f}")
-                self._handle_exit(proceeds, pnl, 0, "resolved")
-                return
-
-        # ── Hard timeout: if way past window end, force sell ──
-        win_end = pos.get("window_end")
-        if win_end:
-            secs_past_end = (datetime.now(timezone.utc) - win_end).total_seconds()
-            if secs_past_end > 60:
-                log(f"  ⚠ Position still open {secs_past_end:.0f}s past window end — forcing sell")
-                self._execute_sell()
-                return
-            if secs_past_end > RESOLUTION_GRACE:
-                log(f"  📊 Window ended {secs_past_end:.0f}s ago — checking resolution")
-                share_bal = get_share_balance(token_id)
-                if share_bal is not None and share_bal < 1.0:
-                    usdc_now = get_usdc_balance()
-                    usdc_before = pos.get("usdc_snapshot", 0)
-                    if usdc_now is not None and usdc_now > usdc_before + pos["cost"] * 0.5:
-                        proceeds = pos["shares"] * 1.0
-                        pnl = proceeds - pos["cost"]
-                        log(f"  🎉 RESOLVED WIN: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
-                    else:
-                        pnl = -pos["cost"]
-                        log(f"  ❌ RESOLVED LOSS: PnL ${pnl:+.2f}")
-                    self._handle_exit(proceeds if 'proceeds' in dir() else 0, pnl, 0, "resolved")
+            # ── Hard timeout: force sell after 120s past window end ──
+            win_end = pos.get("window_end")
+            if win_end:
+                secs_past_end = (datetime.now(timezone.utc) - win_end).total_seconds()
+                if secs_past_end > 120:
+                    log(f"  ⚠ Resolving position {secs_past_end:.0f}s past window end "
+                        f"— forcing sell")
+                    self._execute_sell(pos=pos)
+                    continue
+                if secs_past_end > RESOLUTION_GRACE:
+                    # Log every ~5s
+                    last_res_log = pos.get("_last_res_log", 0)
+                    if now - last_res_log >= 5:
+                        log(f"  📊 Resolving: window ended {secs_past_end:.0f}s ago "
+                            f"— BTC {pos['side']}")
+                        pos["_last_res_log"] = now
+                    # Check more frequently after grace period
+                    share_bal = get_share_balance(token_id)
+                    if share_bal is not None and share_bal < 1.0:
+                        self._resolve_by_chainlink(pos)
+                        continue
 
     # ─── SELL EXECUTION ───────────────────────────────────────────────
 
-    def _execute_sell(self):
+    def _execute_sell(self, pos=None):
         """Sell all shares at bid-1¢. Used only for emergency close."""
-        pos = self.position
+        if pos is None:
+            pos = self.position
         if not pos:
             return
 
@@ -1250,15 +1290,8 @@ class ThetaBot:
 
         share_bal = get_share_balance(token_id)
         if share_bal is not None and share_bal < 1.0:
-            log(f"  ℹ No shares to sell")
-            usdc_now = get_usdc_balance()
-            usdc_before = pos.get("usdc_snapshot", 0)
-            if usdc_now is not None and usdc_now > usdc_before + pos["cost"] * 0.5:
-                proceeds = pos["shares"] * 1.0
-                pnl = proceeds - pos["cost"]
-                self._handle_exit(proceeds, pnl, 1.0, "resolved")
-            else:
-                self._handle_exit(0, -pos["cost"], 0, "sell_no_shares")
+            log(f"  ℹ No shares to sell — already resolved")
+            self._resolve_by_chainlink(pos)
             return
 
         sell_amount = share_bal if share_bal is not None else pos["shares"]
@@ -1280,11 +1313,11 @@ class ThetaBot:
             if 'price' in err_str and 'max' in err_str:
                 log(f"  ✅ Market resolved in our favor")
                 pnl = pos["shares"] * 1.0 - pos["cost"]
-                self._handle_exit(pos["shares"], pnl, 1.0, "resolved")
+                self._handle_exit(pos["shares"], pnl, 1.0, "resolved", pos=pos)
                 return
             if 'no match' in err_str or 'orderbook' in err_str:
                 log(f"  ⚠ Market closed — shares may auto-redeem")
-                self._handle_exit(0, -pos["cost"], 0, "sell_expired")
+                self._handle_exit(0, -pos["cost"], 0, "sell_expired", pos=pos)
                 return
             if 'not enough balance' in err_str:
                 time.sleep(1)
@@ -1295,7 +1328,7 @@ class ThetaBot:
                     fee = compute_taker_fee(sell_amount, sell_price)
                     proceeds -= fee
                     pnl = proceeds - pos["cost"]
-                    self._handle_exit(proceeds, pnl, sell_price, "sell")
+                    self._handle_exit(proceeds, pnl, sell_price, "sell", pos=pos)
                     return
             log(f"  ⚠ Sell error: {e}")
             log(f"  ❌ Sell failed — holding for resolution")
@@ -1320,7 +1353,7 @@ class ThetaBot:
             actual_price = round(taking / actual_shares, 4) if actual_shares > 0 else 0
             pnl = taking - pos["cost"]
             log(f"  💰 Sold {actual_shares:.1f}sh @ ~{actual_price:.3f} → PnL ${pnl:+.2f}")
-            self._handle_exit(taking, pnl, actual_price, "sell")
+            self._handle_exit(taking, pnl, actual_price, "sell", pos=pos)
             return
 
         # GTC resting — wait up to 60s
@@ -1335,7 +1368,7 @@ class ThetaBot:
                     proceeds -= fee
                     pnl = proceeds - pos["cost"]
                     log(f"  💰 Sell filled → PnL ${pnl:+.2f}")
-                    self._handle_exit(proceeds, pnl, sell_price, "sell")
+                    self._handle_exit(proceeds, pnl, sell_price, "sell", pos=pos)
                     return
                 time.sleep(2)
             # Not filled — leave resting
@@ -1344,7 +1377,7 @@ class ThetaBot:
             fee = compute_taker_fee(sell_amount, sell_price)
             proceeds -= fee
             pnl = proceeds - pos["cost"]
-            self._handle_exit(proceeds, pnl, sell_price, "sell_resting")
+            self._handle_exit(proceeds, pnl, sell_price, "sell_resting", pos=pos)
             return
 
         # Ambiguous
@@ -1356,16 +1389,17 @@ class ThetaBot:
             fee = compute_taker_fee(sell_amount, sell_price)
             proceeds -= fee
             pnl = proceeds - pos["cost"]
-            self._handle_exit(proceeds, pnl, sell_price, "sell")
+            self._handle_exit(proceeds, pnl, sell_price, "sell", pos=pos)
             return
 
         log(f"  ❌ Sell failed — holding for resolution")
 
     # ─── EXIT HANDLING ────────────────────────────────────────────────
 
-    def _handle_exit(self, proceeds, pnl, sell_price, reason):
+    def _handle_exit(self, proceeds, pnl, sell_price, reason, pos=None):
         """Record trade, update balance, clear position."""
-        pos = self.position
+        if pos is None:
+            pos = self.position
         if not pos:
             return
 
@@ -1382,7 +1416,11 @@ class ThetaBot:
         else:
             log(f"  💼 Tracked balance: ${self.tracked_balance:.2f}")
 
-        self.position = None
+        # Clear position from appropriate location
+        if pos is self.position:
+            self.position = None
+        elif pos in self.resolving_positions:
+            self.resolving_positions.remove(pos)
 
         # Log trade
         metrics = pos.get("entry_metrics", {})
@@ -1422,20 +1460,24 @@ class ThetaBot:
 
     def get_status(self):
         """One-line status for dashboard."""
+        resolving_tag = ""
+        if self.resolving_positions:
+            n = len(self.resolving_positions)
+            resolving_tag = f" | {n} resolving"
         if self.position:
             pos = self.position
             hold = time.time() - pos["entry_time"]
             mid = self.poly.mid_price(pos["token_id"]) or 0
             return (f"HOLDING BTC {pos['side']} | entry={pos['entry_price']:.3f} "
-                    f"now={mid:.3f} | hold={hold:.0f}s | wait for resolution")
+                    f"now={mid:.3f} | hold={hold:.0f}s{resolving_tag}")
         if self.pending_buy:
             pb = self.pending_buy
             wait = time.time() - pb["placed_at"]
             return (f"PENDING BUY BTC {pb['side']} | {pb['shares_requested']:.1f}sh @ "
-                    f"{pb['buy_price']} | waiting {wait:.0f}s")
+                    f"{pb['buy_price']} | waiting {wait:.0f}s{resolving_tag}")
         if self._skip_reason:
-            return f"SCANNING | skip: {self._skip_reason}"
-        return "SCANNING..."
+            return f"SCANNING | skip: {self._skip_reason}{resolving_tag}"
+        return f"SCANNING...{resolving_tag}"
 
 
 # =========================================================================
@@ -1583,6 +1625,10 @@ def main():
             if bot.position and not bot.position.get("dry_run"):
                 log("  Closing open position...")
                 bot._execute_sell()
+            for rpos in list(bot.resolving_positions):
+                if not rpos.get("dry_run"):
+                    log(f"  Closing resolving position: BTC {rpos['side']}...")
+                    bot._execute_sell(pos=rpos)
             bal = get_usdc_balance()
             if bal:
                 log(f"Final USDC balance: ${bal:.2f}")
