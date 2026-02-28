@@ -1,0 +1,1327 @@
+#!/usr/bin/env python3
+"""
+Theta Bot — Late-entry volatility-filtered BTC 5-minute binary scalper.
+
+Strategy:
+  1. Stream real-time BTC/USDT from Binance websocket (100ms kline).
+  2. Compute rolling 5-min realized volatility (stdev of 1s returns).
+  3. For each Polymarket BTC 5-min window:
+     - Wait until ENTRY_DELAY seconds into the window (let uncertainty fade).
+     - Check: is BTC comfortably on one side? (distance from threshold)
+     - Check: is realized volatility low enough?
+     - If both → buy the winning side at ask, hold to resolution ($1.00).
+     - If vol is high or price near threshold → skip the window.
+  4. No selling needed — just hold to resolution. Winner gets $1/share.
+     Only EXIT_CUTOFF sell + crash_held as safety nets.
+
+Edge:
+  Polymarket prices reflect AVERAGE volatility. By entering LATE and
+  only when vol is LOW, we buy at 0.87-0.92 what's actually ~95%+ to win.
+
+Usage:
+  python theta.py              # live trading
+  python theta.py --dry-run    # simulate trades using WS prices
+"""
+
+import os
+import sys
+import time
+import json
+import math
+import threading
+import asyncio
+import requests
+from collections import deque
+from datetime import datetime, timezone, timedelta
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import (
+    OrderArgs, OrderType,
+    BalanceAllowanceParams, AssetType,
+)
+from py_clob_client.order_builder.constants import BUY, SELL
+from dotenv import load_dotenv
+
+load_dotenv()
+private_key = os.getenv("PRIVATE_KEY")
+founder_address = os.getenv("FUNDER_ADDRESS")
+
+# =========================================================================
+# CLOB CONFIG
+# =========================================================================
+HOST = "https://clob.polymarket.com"
+GAMMA_API = "https://gamma-api.polymarket.com"
+WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@kline_1s"
+CHAIN_ID = 137
+FUNDER_ADDRESS = founder_address
+
+# =========================================================================
+# STRATEGY PARAMETERS
+# =========================================================================
+INITIAL_BALANCE = 50.0         # Starting tracked balance
+BET_PCT = 0.99                 # Use 99% of tracked balance per trade
+MIN_BET = 5                    # Polymarket minimum bet
+MAX_BET = 2000                 # Safety cap
+
+# ── Entry conditions ──
+ENTRY_DELAY = 150              # Seconds into window before considering entry (2.5 min)
+MIN_DISTANCE = 0.03            # BTC must be ≥ this far from threshold (relative)
+                               # e.g. if threshold = $100,000, min distance = $3,000
+MAX_VOL = 0.0015               # Max 5-min realized vol (stdev of 1s log returns)
+                               # ~0.0015 = moves ±0.15% per second → roughly ±0.35% in 5min
+                               # Normal quiet market: 0.0005-0.0010
+                               # Active market: 0.0020+
+MIN_MID_PRICE = 0.87           # Only enter if Polymarket mid ≥ this (side is winning)
+MAX_ENTRY_PRICE = 0.95         # Don't buy above this (not enough upside to $1)
+
+# ── Safety ──
+MIN_STOP_SELL = 0.50           # Don't sell below this — hold for resolution
+EXIT_CUTOFF_SECS = 15          # Sell at bid this many secs before window end
+                               # (shorter than btc80 since we enter late anyway)
+
+# ── Polymarket fee formula ──
+CRYPTO_FEE_RATE = 0.25
+CRYPTO_FEE_EXPONENT = 2
+
+# ── Timing ──
+TICK_INTERVAL = 0.25           # 250ms main loop tick
+ORDER_POLL_SECS = 1.0          # How often to poll share balance
+BUY_FILL_TIMEOUT = 15          # Max seconds waiting for GTC buy fill
+RESOLUTION_GRACE = 15          # Seconds after window end to check resolution
+NO_MATCH_BACKOFF = 10          # Seconds backoff after "no match" error
+
+# ── Volatility computation ──
+VOL_WINDOW = 300               # Seconds of price history for vol computation
+VOL_MIN_SAMPLES = 30           # Minimum 1s candles needed to compute vol
+
+# ── Data files ──
+LOG_FILE = "theta_log.txt"
+TRADE_LOG = "theta_trades.json"
+
+DRY_RUN = "--dry-run" in sys.argv
+
+
+# =========================================================================
+# LOGGING
+# =========================================================================
+def log(msg):
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+    line = f"[{ts}] {msg}"
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
+    print(line)
+
+
+# =========================================================================
+# CLOB CLIENT
+# =========================================================================
+client = ClobClient(
+    host=HOST,
+    key=private_key,
+    chain_id=CHAIN_ID,
+    signature_type=1,
+    funder=FUNDER_ADDRESS,
+)
+client.set_api_creds(client.create_or_derive_api_creds())
+
+
+def get_usdc_balance():
+    try:
+        ba = client.get_balance_allowance(
+            params=BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL, token_id="", signature_type=1
+            )
+        )
+        return float(ba.get("balance", 0)) / 1e6
+    except Exception as e:
+        log(f"  ⚠ Balance error: {e}")
+        return None
+
+
+def get_share_balance(token_id):
+    """Get on-chain share balance for a conditional token."""
+    try:
+        client.update_balance_allowance(
+            params=BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=1,
+            )
+        )
+        ba = client.get_balance_allowance(
+            params=BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=1,
+            )
+        )
+        return float(ba.get("balance", 0)) / 1e6
+    except Exception:
+        return None
+
+
+def compute_taker_fee(shares, price):
+    if price <= 0 or price >= 1:
+        return 0.0
+    fee_shares = shares * CRYPTO_FEE_RATE * (price * (1 - price)) ** CRYPTO_FEE_EXPONENT
+    return round(fee_shares * price, 4)
+
+
+# =========================================================================
+# BINANCE BTC PRICE FEED
+# =========================================================================
+class BinanceFeed:
+    """Real-time BTC/USDT price via Binance websocket (1s kline).
+
+    Stores 1-second close prices for rolling volatility computation.
+    Also tracks the current BTC price for threshold distance checks.
+    """
+
+    def __init__(self):
+        self._price = None              # Latest BTC/USDT price
+        self._prices = deque(maxlen=VOL_WINDOW)  # (timestamp, price) pairs
+        self._lock = threading.Lock()
+        self._connected = False
+
+    def start(self):
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def _run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._ws_loop())
+
+    async def _ws_loop(self):
+        import websockets
+        while True:
+            try:
+                async with websockets.connect(
+                    BINANCE_WS_URL, close_timeout=5, open_timeout=10
+                ) as ws:
+                    self._connected = True
+                    log("  🔌 Binance WS connected")
+
+                    while True:
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                        except asyncio.TimeoutError:
+                            # Send ping to keep alive
+                            await ws.ping()
+                            continue
+
+                        try:
+                            data = json.loads(msg)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+                        # Binance kline format: data["k"]["c"] = close price
+                        k = data.get("k")
+                        if k:
+                            try:
+                                close = float(k["c"])
+                                ts = time.time()
+                                with self._lock:
+                                    self._price = close
+                                    self._prices.append((ts, close))
+                            except (ValueError, KeyError):
+                                pass
+
+            except Exception as e:
+                self._connected = False
+                log(f"  ⚠ Binance WS error: {e}, reconnecting in 2s...")
+                await asyncio.sleep(2)
+
+    @property
+    def price(self):
+        """Current BTC/USDT price."""
+        with self._lock:
+            return self._price
+
+    @property
+    def connected(self):
+        return self._connected
+
+    def realized_vol(self):
+        """Compute realized volatility as stdev of 1-second log returns.
+
+        Returns (vol, n_samples) or (None, 0) if not enough data.
+        vol is annualized-ish but we just use the raw stdev for thresholding.
+        """
+        with self._lock:
+            prices = list(self._prices)
+
+        if len(prices) < VOL_MIN_SAMPLES:
+            return None, len(prices)
+
+        # Compute log returns
+        log_returns = []
+        for i in range(1, len(prices)):
+            dt = prices[i][0] - prices[i - 1][0]
+            if dt > 5:  # Skip gaps > 5s (reconnection)
+                continue
+            if prices[i - 1][1] > 0:
+                lr = math.log(prices[i][1] / prices[i - 1][1])
+                log_returns.append(lr)
+
+        if len(log_returns) < VOL_MIN_SAMPLES:
+            return None, len(log_returns)
+
+        mean = sum(log_returns) / len(log_returns)
+        variance = sum((r - mean) ** 2 for r in log_returns) / len(log_returns)
+        vol = math.sqrt(variance)
+
+        return vol, len(log_returns)
+
+    def distance_from_round(self, threshold_price):
+        """How far BTC is from a threshold price, as a fraction.
+
+        Returns (distance_fraction, btc_price) or (None, None).
+        distance_fraction > 0 means BTC is ABOVE threshold.
+        distance_fraction < 0 means BTC is BELOW threshold.
+        """
+        p = self.price
+        if p is None or threshold_price is None or threshold_price <= 0:
+            return None, None
+        return (p - threshold_price) / threshold_price, p
+
+
+# =========================================================================
+# POLYMARKET WEBSOCKET FEED (reused from btc80)
+# =========================================================================
+class PolymarketFeed:
+    """Real-time Polymarket book data via WebSocket."""
+
+    def __init__(self):
+        self._prices = {}
+        self._lock = threading.Lock()
+        self._wanted = set()
+        self._active = set()
+        self._connected = False
+        self._force_reconnect = False
+
+    def start(self):
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def _run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._ws_loop())
+
+    async def _ws_loop(self):
+        import websockets
+        while True:
+            try:
+                async with websockets.connect(
+                    WS_MARKET_URL, close_timeout=5, open_timeout=10
+                ) as ws:
+                    self._connected = True
+                    self._active = set()
+                    log("  🔌 Polymarket WS connected")
+                    last_ping = time.time()
+                    last_sub_time = 0.0
+
+                    while True:
+                        with self._lock:
+                            wanted = set(self._wanted)
+
+                        if self._force_reconnect:
+                            self._force_reconnect = False
+                            break
+
+                        changed = wanted != self._active
+                        stale = (time.time() - last_sub_time) > 5
+
+                        if (changed or stale) and wanted:
+                            if changed and self._active:
+                                self._active = set()
+                                self._force_reconnect = True
+                                break
+
+                            await ws.send(json.dumps({
+                                "type": "market",
+                                "assets_ids": list(wanted),
+                            }))
+                            last_sub_time = time.time()
+                            if changed:
+                                log(f"  📡 Subscribed to {len(wanted)} tokens")
+                            self._active = wanted
+
+                        if time.time() - last_ping > 10:
+                            try:
+                                await ws.send("ping")
+                                last_ping = time.time()
+                            except Exception:
+                                break
+
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=0.05)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        try:
+                            data = json.loads(msg)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                        self._handle(data)
+
+            except Exception as e:
+                self._connected = False
+                log(f"  ⚠ Polymarket WS error: {e}, reconnecting in 2s...")
+                await asyncio.sleep(2)
+
+    def _handle(self, data):
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    self._handle(item)
+            return
+        if not isinstance(data, dict):
+            return
+        etype = data.get("event_type", "")
+        if etype == "best_bid_ask":
+            self._on_bba(data)
+        elif etype == "book":
+            self._on_book(data)
+        elif etype == "price_change":
+            self._on_price_change(data)
+
+    def _on_bba(self, data):
+        asset_id = data.get("asset_id", "")
+        if not asset_id:
+            return
+        try:
+            bid = float(data.get("best_bid", 0))
+            ask = float(data.get("best_ask", 0))
+        except (ValueError, TypeError):
+            return
+        with self._lock:
+            self._prices[asset_id] = {"best_bid": bid, "best_ask": ask, "ts": time.time()}
+
+    def _on_book(self, data):
+        asset_id = data.get("asset_id", "")
+        if not asset_id:
+            return
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        best_bid = max((float(b["price"]) for b in bids), default=0)
+        best_ask = min((float(a["price"]) for a in asks), default=0)
+        with self._lock:
+            self._prices[asset_id] = {"best_bid": best_bid, "best_ask": best_ask, "ts": time.time()}
+
+    def _on_price_change(self, data):
+        for pc in data.get("price_changes", []):
+            asset_id = pc.get("asset_id", "")
+            if not asset_id:
+                continue
+            try:
+                best_bid = float(pc.get("best_bid", 0))
+                best_ask = float(pc.get("best_ask", 0))
+            except (ValueError, TypeError):
+                continue
+            if best_bid > 0 or best_ask > 0:
+                with self._lock:
+                    existing = self._prices.get(asset_id, {})
+                    self._prices[asset_id] = {
+                        "best_bid": best_bid if best_bid > 0 else existing.get("best_bid", 0),
+                        "best_ask": best_ask if best_ask > 0 else existing.get("best_ask", 0),
+                        "ts": time.time(),
+                    }
+
+    def subscribe(self, token_ids):
+        with self._lock:
+            self._wanted = set(token_ids)
+
+    def get_price(self, token_id):
+        """Returns (best_bid, best_ask, age_seconds) or (None, None, None)."""
+        with self._lock:
+            data = self._prices.get(token_id)
+        if not data:
+            return None, None, None
+        return data["best_bid"], data["best_ask"], time.time() - data["ts"]
+
+    def mid_price(self, token_id):
+        """Returns mid-price or None."""
+        bid, ask, age = self.get_price(token_id)
+        if bid and ask and bid > 0 and ask > 0 and (age is None or age < 10):
+            return (bid + ask) / 2.0
+        return None
+
+    @property
+    def connected(self):
+        return self._connected
+
+
+# =========================================================================
+# MARKET DISCOVERY — BTC 5-minute
+# =========================================================================
+def discover_btc_market():
+    """Fetch current active BTC 5m up/down market from Polymarket.
+    Returns dict with epoch, start, end, up_token, down_token, threshold or None."""
+    now = datetime.now(timezone.utc)
+    interval = 5
+    aligned = (now.minute // interval) * interval
+    window_start = now.replace(minute=aligned, second=0, microsecond=0)
+    window_end = window_start + timedelta(minutes=interval)
+
+    if now >= window_end:
+        return None
+
+    epoch = int(window_start.timestamp())
+    slug = f"btc-updown-{interval}m-{epoch}"
+
+    try:
+        resp = requests.get(f"{GAMMA_API}/events/slug/{slug}", timeout=10)
+        if resp.status_code != 200:
+            return None
+        event = resp.json()
+        for m in event.get("markets", []):
+            if m.get("closed"):
+                continue
+            tokens = json.loads(m.get("clobTokenIds", "[]"))
+            outcomes = json.loads(m.get("outcomes", "[]"))
+            if len(tokens) != 2 or len(outcomes) != 2:
+                continue
+
+            up_idx = next((i for i, o in enumerate(outcomes) if "up" in o.lower()), 0)
+            down_idx = 1 - up_idx
+
+            # Extract threshold from market description
+            # Markets are like "Will BTC be above $100,000 at 12:05 UTC?"
+            threshold = _parse_threshold(m.get("question", "") or m.get("description", ""))
+
+            return {
+                "epoch": epoch,
+                "start": window_start,
+                "end": window_end,
+                "up_token": tokens[up_idx],
+                "down_token": tokens[down_idx],
+                "threshold": threshold,
+            }
+    except Exception as e:
+        log(f"  ⚠ Discovery error: {e}")
+    return None
+
+
+def _parse_threshold(text):
+    """Extract BTC threshold price from market question text.
+    e.g. 'Will the price of BTC be above $84,500.00 at ...' → 84500.0"""
+    import re
+    # Match dollar amounts like $84,500.00 or $100,000
+    match = re.search(r'\$([0-9,]+(?:\.[0-9]+)?)', text)
+    if match:
+        try:
+            return float(match.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return None
+
+
+# =========================================================================
+# THETA BOT
+# =========================================================================
+class ThetaBot:
+    """Late-entry volatility-filtered BTC 5-min binary scalper.
+
+    Core logic:
+      - Wait 2.5 min into each window
+      - Check Binance BTC vol + distance from threshold
+      - If low vol + comfortable distance → buy winning side on Polymarket
+      - Hold to resolution → collect $1/share on win
+    """
+
+    def __init__(self, poly, binance):
+        self.poly = poly
+        self.binance = binance
+        self.tracked_balance = INITIAL_BALANCE
+        self.position = None
+        self.pending_buy = None
+        self.current_window = None
+        self.trade_count = 0
+        self.win_count = 0
+        self.total_pnl = 0.0
+        self._no_match_until = 0
+        self._entered_this_window = False  # Only one entry per window
+        self._skip_reason = ""             # Why we skipped (for dashboard)
+
+    def update_market(self, window):
+        """Update current window and subscribe to tokens."""
+        old_epoch = self.current_window["epoch"] if self.current_window else None
+        self.current_window = window
+        if window and window["epoch"] != old_epoch:
+            # Cancel pending buy from old window
+            if self.pending_buy and old_epoch is not None:
+                log("  ⚠ Window changing — canceling pending buy")
+                self._cancel_pending_buy_and_handle_partial("window change")
+            # Emergency close if holding from old window
+            if self.position and old_epoch is not None:
+                log("  ⚠ Window changing while holding — emergency close!")
+                self._execute_sell()
+            tokens = [window["up_token"], window["down_token"]]
+            self.poly.subscribe(tokens)
+            self._entered_this_window = False
+            self._skip_reason = ""
+            self._low_bal_logged = False
+            if old_epoch is not None:
+                log(f"  🔄 New window (threshold={window.get('threshold')})")
+
+    # ─── MAIN TICK ────────────────────────────────────────────────────
+
+    def tick(self):
+        """Main tick: manage position/pending, or evaluate entry."""
+        if self.position:
+            self._manage_position()
+            return
+
+        if self.pending_buy:
+            self._manage_pending_buy()
+            return
+
+        # No position — evaluate entry
+        if not self.current_window:
+            return
+        if self._entered_this_window:
+            return
+
+        now_utc = datetime.now(timezone.utc)
+        if now_utc >= self.current_window["end"]:
+            return
+
+        secs_into_window = (now_utc - self.current_window["start"]).total_seconds()
+        secs_left = (self.current_window["end"] - now_utc).total_seconds()
+
+        # Too early — haven't waited long enough
+        if secs_into_window < ENTRY_DELAY:
+            self._skip_reason = f"waiting ({secs_into_window:.0f}/{ENTRY_DELAY}s)"
+            return
+
+        # Too late — in the exit cutoff zone
+        if secs_left <= EXIT_CUTOFF_SECS:
+            self._skip_reason = "exit cutoff zone"
+            return
+
+        # No-match backoff
+        if time.time() < self._no_match_until:
+            self._skip_reason = "no-match backoff"
+            return
+
+        # ── Check volatility ──
+        vol, n_samples = self.binance.realized_vol()
+        if vol is None:
+            self._skip_reason = f"vol: need {VOL_MIN_SAMPLES} samples (have {n_samples})"
+            return
+        if vol > MAX_VOL:
+            self._skip_reason = f"vol too high: {vol:.6f} > {MAX_VOL}"
+            return
+
+        # ── Check BTC distance from threshold ──
+        threshold = self.current_window.get("threshold")
+        if threshold is None:
+            self._skip_reason = "no threshold parsed"
+            return
+
+        dist, btc_price = self.binance.distance_from_round(threshold)
+        if dist is None:
+            self._skip_reason = "no BTC price"
+            return
+
+        abs_dist = abs(dist)
+        if abs_dist < MIN_DISTANCE:
+            self._skip_reason = f"too close: BTC ${btc_price:,.0f} vs ${threshold:,.0f} ({dist:+.4f})"
+            return
+
+        # ── Determine which side to buy ──
+        # dist > 0 → BTC above threshold → UP wins
+        # dist < 0 → BTC below threshold → DOWN wins
+        if dist > 0:
+            side = "UP"
+            token = self.current_window["up_token"]
+        else:
+            side = "DOWN"
+            token = self.current_window["down_token"]
+
+        # ── Check Polymarket mid price ──
+        mid = self.poly.mid_price(token)
+        if mid is None:
+            self._skip_reason = "no Polymarket price"
+            return
+        if mid < MIN_MID_PRICE:
+            self._skip_reason = f"mid too low: {mid:.3f} < {MIN_MID_PRICE}"
+            return
+        if mid > MAX_ENTRY_PRICE:
+            self._skip_reason = f"mid too high: {mid:.3f} > {MAX_ENTRY_PRICE} (not enough upside)"
+            return
+
+        # ── All conditions met — enter! ──
+        log(f"  ✅ ENTRY SIGNAL: BTC {side}")
+        log(f"     BTC=${btc_price:,.2f} thresh=${threshold:,.0f} dist={dist:+.4f}")
+        log(f"     vol={vol:.6f} (max={MAX_VOL})")
+        log(f"     mid={mid:.3f} | {secs_into_window:.0f}s in, {secs_left:.0f}s left")
+        self._enter(token, side, mid)
+
+    # ─── ENTRY ────────────────────────────────────────────────────────
+
+    def _enter(self, token_id, side, mid):
+        """Place a GTC limit buy at the current ask price (fill instantly)."""
+        self._entered_this_window = True
+
+        real_balance = get_usdc_balance()
+        if real_balance is None:
+            return
+
+        # Reality checks (same as btc80)
+        if real_balance < MIN_BET and self.tracked_balance > INITIAL_BALANCE:
+            log(f"  ⚠ Reality check: real=${real_balance:.2f} — resetting tracked")
+            self.tracked_balance = INITIAL_BALANCE
+        if self.tracked_balance < MIN_BET and real_balance >= MIN_BET:
+            log(f"  ⚠ Reverse reality check: tracked=${self.tracked_balance:.2f} — resetting")
+            self.tracked_balance = INITIAL_BALANCE
+
+        effective = min(self.tracked_balance, real_balance)
+        bet = round(effective * BET_PCT)
+        bet = min(bet, MAX_BET, int(real_balance))
+        if bet < MIN_BET:
+            if not hasattr(self, '_low_bal_logged') or not self._low_bal_logged:
+                log(f"  ⚠ Balance too low (tracked=${self.tracked_balance:.2f}, "
+                    f"real=${real_balance:.2f}) — skipping")
+                self._low_bal_logged = True
+            return
+
+        # Buy at the ask price (fills instantly) — but cap at MAX_ENTRY_PRICE
+        _, ask, _ = self.poly.get_price(token_id)
+        if ask is None or ask <= 0:
+            buy_price = round(mid, 2)
+        else:
+            buy_price = round(min(ask, MAX_ENTRY_PRICE), 2)
+
+        shares_to_buy = round(bet / buy_price, 2)
+
+        log(f"  ⚡ BTC {side}: {shares_to_buy:.1f}sh @ {buy_price} "
+            f"(${bet} | tracked=${self.tracked_balance:.2f})")
+
+        if DRY_RUN:
+            log(f"  🧪 DRY RUN — buy {shares_to_buy:.1f}sh @ {buy_price}")
+            self.position = {
+                "token_id": token_id,
+                "side": side,
+                "entry_price": buy_price,
+                "shares": shares_to_buy,
+                "cost": bet,
+                "entry_time": time.time(),
+                "limit_order_id": None,
+                "usdc_snapshot": real_balance - bet,
+                "last_poll": 0,
+                "dry_run": True,
+                "crash_held": False,
+            }
+            return
+
+        # ── Place GTC limit buy at ask (fills instantly) ──
+        pre_buy_bal = get_share_balance(token_id) or 0
+        try:
+            order_args = OrderArgs(
+                price=buy_price,
+                size=shares_to_buy,
+                side=BUY,
+                token_id=token_id,
+            )
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, OrderType.GTC)
+
+            order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
+            raw_taking = resp.get("takingAmount", 0) if isinstance(resp, dict) else 0
+            try:
+                taking = float(raw_taking) if raw_taking != "" else 0
+            except (ValueError, TypeError):
+                taking = 0
+
+            if not order_id and taking <= 0:
+                log(f"  ⚠ GTC buy rejected: {resp}")
+                return
+
+            self.pending_buy = {
+                "order_id": order_id,
+                "token_id": token_id,
+                "side": side,
+                "bet": bet,
+                "buy_price": buy_price,
+                "shares_requested": shares_to_buy,
+                "placed_at": time.time(),
+                "pre_buy_bal": pre_buy_bal,
+                "last_poll": 0,
+            }
+
+            if order_id:
+                log(f"  📋 GTC buy placed (order={order_id[:12]}...)")
+
+            if taking > 0 and not order_id:
+                log(f"  ✅ GTC buy filled instantly! {taking:.1f}sh")
+                self._on_buy_filled(taking)
+
+        except Exception as e:
+            err_str = str(e)
+            if 'no match' in err_str.lower():
+                self._no_match_until = time.time() + NO_MATCH_BACKOFF
+                log(f"  ⚠ Buy error: no match — backing off {NO_MATCH_BACKOFF}s")
+                return
+
+            log(f"  ⚠ Buy error: {e}")
+            self._no_match_until = time.time() + NO_MATCH_BACKOFF
+            time.sleep(2)
+            new_shares = 0
+            for attempt in range(5):
+                share_bal = get_share_balance(token_id) or 0
+                new_shares = share_bal - pre_buy_bal
+                if new_shares >= 1.0:
+                    break
+                log(f"  ⚠ Share check {attempt+1}/5: bal={share_bal}, new={new_shares:.1f}")
+                time.sleep(2)
+
+            if new_shares >= 1.0:
+                log(f"  ⚡ Shares detected ({new_shares:.1f}sh) despite error — treating as fill")
+                cost = round(new_shares * buy_price, 2)
+                self.pending_buy = {
+                    "order_id": "",
+                    "token_id": token_id,
+                    "side": side,
+                    "bet": cost,
+                    "buy_price": buy_price,
+                    "shares_requested": new_shares,
+                    "placed_at": time.time(),
+                    "pre_buy_bal": pre_buy_bal,
+                    "last_poll": 0,
+                }
+                self._on_buy_filled(new_shares)
+
+    # ─── PENDING BUY MANAGEMENT ───────────────────────────────────────
+
+    def _cancel_pending_buy_and_handle_partial(self, reason):
+        """Cancel pending GTC buy and handle any partial fill."""
+        pb = self.pending_buy
+        if not pb:
+            return
+        token_id = pb["token_id"]
+
+        try:
+            client.cancel(pb["order_id"])
+            log(f"  ❌ Canceled GTC buy ({reason})")
+        except Exception:
+            pass
+
+        time.sleep(2)
+        new_shares = 0
+        share_bal = None
+        for attempt in range(5):
+            share_bal = get_share_balance(token_id)
+            if share_bal is not None:
+                new_shares = share_bal - pb["pre_buy_bal"]
+                if new_shares >= 1.0:
+                    break
+            log(f"  ⚠ Share balance check {attempt+1}/5: bal={share_bal}, new={new_shares:.1f}")
+            time.sleep(2)
+
+        if share_bal is None:
+            log("  ⚠ Could not read share balance after cancel — assuming filled")
+            new_shares = pb["shares_requested"]
+
+        partial_cost = round(new_shares * pb["buy_price"], 2)
+
+        if new_shares >= 1.0 and partial_cost >= MIN_BET:
+            log(f"  ⚡ Partial fill: {new_shares:.1f}sh (${partial_cost:.2f}) — treating as entry")
+            self._on_buy_filled(new_shares)
+        else:
+            if new_shares > 0:
+                log(f"  ⚠ Tiny partial fill ({new_shares:.1f}sh) — ignoring")
+            self.pending_buy = None
+
+    def _manage_pending_buy(self):
+        """Poll for GTC buy fill."""
+        pb = self.pending_buy
+        if not pb:
+            return
+
+        now = time.time()
+        token_id = pb["token_id"]
+
+        if now - pb["placed_at"] > BUY_FILL_TIMEOUT:
+            log(f"  ⚠ GTC buy timed out after {BUY_FILL_TIMEOUT}s")
+            self._cancel_pending_buy_and_handle_partial("timeout")
+            return
+
+        if now - pb.get("last_poll", 0) < ORDER_POLL_SECS:
+            return
+        pb["last_poll"] = now
+
+        share_bal = get_share_balance(token_id)
+        if share_bal is None:
+            return
+
+        new_shares = share_bal - pb["pre_buy_bal"]
+        if new_shares >= pb["shares_requested"] - 1.0:
+            log(f"  ✅ GTC buy filled! {new_shares:.1f}sh @ {pb['buy_price']}")
+            self._on_buy_filled(new_shares)
+
+    def _on_buy_filled(self, actual_shares):
+        """Called when GTC buy is filled — record position, hold to resolution."""
+        pb = self.pending_buy
+        if not pb:
+            return
+
+        if actual_shares > pb["shares_requested"] * 1.05:
+            log(f"  ⚠ Share balance inflated: {actual_shares:.1f}sh — capping")
+            actual_shares = pb["shares_requested"]
+
+        token_id = pb["token_id"]
+        side = pb["side"]
+        buy_price = pb["buy_price"]
+        actual_cost = round(actual_shares * buy_price, 2)
+        self.pending_buy = None
+
+        usdc_snap = get_usdc_balance() or 0
+
+        self.position = {
+            "token_id": token_id,
+            "side": side,
+            "entry_price": buy_price,
+            "shares": actual_shares,
+            "cost": actual_cost,
+            "entry_time": time.time(),
+            "limit_order_id": None,  # No GTC sell — hold to resolution
+            "usdc_snapshot": usdc_snap,
+            "last_poll": 0,
+            "dry_run": False,
+            "crash_held": False,
+        }
+        log(f"  📊 Position opened: {actual_shares:.1f}sh BTC {side} @ {buy_price}")
+        log(f"     Holding to resolution (target: $1.00/share)")
+
+    # ─── POSITION MANAGEMENT ─────────────────────────────────────────
+
+    def _manage_position(self):
+        """Monitor for resolution or exit cutoff. NO stop loss — hold to resolution."""
+        pos = self.position
+        if not pos:
+            return
+
+        token_id = pos["token_id"]
+        now = time.time()
+
+        # ── DRY RUN ──
+        if pos.get("dry_run"):
+            mid = self.poly.mid_price(token_id)
+            if mid is None:
+                return
+            if self.current_window and datetime.now(timezone.utc) > self.current_window["end"] + timedelta(seconds=5):
+                resolved_price = 1.0 if mid > 0.50 else 0.0
+                revenue = pos["shares"] * resolved_price
+                pnl = revenue - pos["cost"]
+                log(f"  📊 RESOLVED: BTC {pos['side']} → {'WIN' if resolved_price > 0 else 'LOSS'}")
+                log(f"  🧪 DRY RUN — PnL ${pnl:+.2f}")
+                self._handle_exit(revenue, pnl, resolved_price, "resolved")
+            return
+
+        # ── Crash-held: skip all checks, just wait for resolution ──
+        if pos.get("crash_held"):
+            if now - pos.get("last_poll", 0) >= ORDER_POLL_SECS:
+                pos["last_poll"] = now
+                share_bal = get_share_balance(token_id)
+                if share_bal is not None and share_bal < 1.0:
+                    # Shares gone = resolved
+                    # Check USDC to see if we won
+                    usdc_now = get_usdc_balance()
+                    usdc_before = pos.get("usdc_snapshot", 0)
+                    if usdc_now is not None and usdc_now > usdc_before + pos["cost"] * 0.5:
+                        proceeds = pos["shares"] * 1.0
+                        pnl = proceeds - pos["cost"]
+                        log(f"  🎉 RESOLVED WIN (crash held): PnL ${pnl:+.2f}")
+                        self._handle_exit(proceeds, pnl, 1.0, "resolved")
+                    else:
+                        pnl = -pos["cost"]
+                        log(f"  ❌ RESOLVED LOSS (crash held): PnL ${pnl:+.2f}")
+                        self._handle_exit(0, pnl, 0, "resolved")
+            return
+
+        # ── EXIT CUTOFF: sell before window end ──
+        if self.current_window:
+            secs_left = (self.current_window["end"] - datetime.now(timezone.utc)).total_seconds()
+            if 0 < secs_left <= EXIT_CUTOFF_SECS:
+                log(f"  ⏰ EXIT CUTOFF: {secs_left:.0f}s left — selling to avoid crash zone")
+                self._execute_sell()
+                return
+
+        # ── Check if shares gone (resolution) ──
+        if now - pos.get("last_poll", 0) >= ORDER_POLL_SECS:
+            pos["last_poll"] = now
+            share_bal = get_share_balance(token_id)
+            if share_bal is not None and share_bal < 1.0:
+                # Shares redeemed — determine win/loss by USDC change
+                usdc_now = get_usdc_balance()
+                usdc_before = pos.get("usdc_snapshot", 0)
+                if usdc_now is not None and usdc_now > usdc_before + pos["cost"] * 0.5:
+                    proceeds = pos["shares"] * 1.0
+                    pnl = proceeds - pos["cost"]
+                    log(f"  🎉 RESOLVED WIN: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
+                else:
+                    proceeds = 0.0
+                    pnl = -pos["cost"]
+                    log(f"  ❌ RESOLVED LOSS: PnL ${pnl:+.2f}")
+                self._handle_exit(proceeds, pnl, 0, "resolved")
+                return
+
+        # ── Check window resolution ──
+        if self.current_window:
+            secs_past_end = (datetime.now(timezone.utc) - self.current_window["end"]).total_seconds()
+            if secs_past_end > RESOLUTION_GRACE:
+                log(f"  📊 Window ended {secs_past_end:.0f}s ago — checking resolution")
+                share_bal = get_share_balance(token_id)
+                if share_bal is not None and share_bal < 1.0:
+                    usdc_now = get_usdc_balance()
+                    usdc_before = pos.get("usdc_snapshot", 0)
+                    if usdc_now is not None and usdc_now > usdc_before + pos["cost"] * 0.5:
+                        proceeds = pos["shares"] * 1.0
+                        pnl = proceeds - pos["cost"]
+                        log(f"  🎉 RESOLVED WIN: proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
+                    else:
+                        pnl = -pos["cost"]
+                        log(f"  ❌ RESOLVED LOSS: PnL ${pnl:+.2f}")
+                    self._handle_exit(proceeds if 'proceeds' in dir() else 0, pnl, 0, "resolved")
+                else:
+                    log(f"  ⚠ Window ended but still have {share_bal:.1f}sh — forcing sell")
+                    self._execute_sell()
+
+    # ─── SELL EXECUTION ───────────────────────────────────────────────
+
+    def _execute_sell(self):
+        """Sell all shares at bid-1¢. Used only for EXIT_CUTOFF and emergency close."""
+        pos = self.position
+        if not pos:
+            return
+
+        token_id = pos["token_id"]
+
+        # Crash check
+        bid, _, _ = self.poly.get_price(token_id)
+        if bid is not None and bid < MIN_STOP_SELL:
+            log(f"  ⚠ Bid={bid:.2f} < {MIN_STOP_SELL} — holding for resolution")
+            pos["crash_held"] = True
+            return
+
+        share_bal = get_share_balance(token_id)
+        if share_bal is not None and share_bal < 1.0:
+            log(f"  ℹ No shares to sell")
+            usdc_now = get_usdc_balance()
+            usdc_before = pos.get("usdc_snapshot", 0)
+            if usdc_now is not None and usdc_now > usdc_before + pos["cost"] * 0.5:
+                proceeds = pos["shares"] * 1.0
+                pnl = proceeds - pos["cost"]
+                self._handle_exit(proceeds, pnl, 1.0, "resolved")
+            else:
+                self._handle_exit(0, -pos["cost"], 0, "sell_no_shares")
+            return
+
+        sell_amount = share_bal if share_bal is not None else pos["shares"]
+
+        sell_price = round(bid - 0.01, 2) if bid and bid > 0.03 else 0.02
+        log(f"  📤 Selling {sell_amount:.1f}sh BTC {pos['side']} @ {sell_price} (bid={bid})")
+
+        try:
+            order_args = OrderArgs(
+                price=sell_price,
+                size=sell_amount,
+                side=SELL,
+                token_id=token_id,
+            )
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, OrderType.GTC)
+        except Exception as e:
+            err_str = str(e).lower()
+            if 'price' in err_str and 'max' in err_str:
+                log(f"  ✅ Market resolved in our favor")
+                pnl = pos["shares"] * 1.0 - pos["cost"]
+                self._handle_exit(pos["shares"], pnl, 1.0, "resolved")
+                return
+            if 'no match' in err_str or 'orderbook' in err_str:
+                log(f"  ⚠ Market closed — shares may auto-redeem")
+                self._handle_exit(0, -pos["cost"], 0, "sell_expired")
+                return
+            if 'not enough balance' in err_str:
+                time.sleep(1)
+                remaining = get_share_balance(token_id)
+                if remaining is not None and remaining < 1.0:
+                    log(f"  ✅ Shares already sold/resolved")
+                    proceeds = sell_amount * sell_price
+                    fee = compute_taker_fee(sell_amount, sell_price)
+                    proceeds -= fee
+                    pnl = proceeds - pos["cost"]
+                    self._handle_exit(proceeds, pnl, sell_price, "sell")
+                    return
+            log(f"  ⚠ Sell error: {e}")
+            log(f"  ❌ Sell failed — holding for resolution")
+            return
+
+        # Parse response
+        order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
+        raw_taking = resp.get("takingAmount", 0) if isinstance(resp, dict) else 0
+        try:
+            taking = float(raw_taking) if raw_taking != "" else 0
+        except (ValueError, TypeError):
+            taking = 0
+        raw_making = resp.get("makingAmount", 0) if isinstance(resp, dict) else 0
+        try:
+            making = float(raw_making) if raw_making != "" else 0
+        except (ValueError, TypeError):
+            making = 0
+
+        # Instant fill
+        if taking > 0 and not order_id:
+            actual_shares = making if making > 0 else sell_amount
+            actual_price = round(taking / actual_shares, 4) if actual_shares > 0 else 0
+            pnl = taking - pos["cost"]
+            log(f"  💰 Sold {actual_shares:.1f}sh @ ~{actual_price:.3f} → PnL ${pnl:+.2f}")
+            self._handle_exit(taking, pnl, actual_price, "sell")
+            return
+
+        # GTC resting — wait up to 60s
+        if order_id:
+            log(f"  📋 Sell placed (order={order_id[:12]}...)")
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                remaining = get_share_balance(token_id)
+                if remaining is not None and remaining < 1.0:
+                    proceeds = sell_amount * sell_price
+                    fee = compute_taker_fee(sell_amount, sell_price)
+                    proceeds -= fee
+                    pnl = proceeds - pos["cost"]
+                    log(f"  💰 Sell filled → PnL ${pnl:+.2f}")
+                    self._handle_exit(proceeds, pnl, sell_price, "sell")
+                    return
+                time.sleep(2)
+            # Not filled — leave resting
+            log(f"  ⚠ Not filled in 60s — leaving sell resting")
+            proceeds = sell_amount * sell_price
+            fee = compute_taker_fee(sell_amount, sell_price)
+            proceeds -= fee
+            pnl = proceeds - pos["cost"]
+            self._handle_exit(proceeds, pnl, sell_price, "sell_resting")
+            return
+
+        # Ambiguous
+        log(f"  ⚠ Ambiguous sell response: {resp}")
+        time.sleep(2)
+        remaining = get_share_balance(token_id)
+        if remaining is not None and remaining < 1.0:
+            proceeds = sell_amount * sell_price
+            fee = compute_taker_fee(sell_amount, sell_price)
+            proceeds -= fee
+            pnl = proceeds - pos["cost"]
+            self._handle_exit(proceeds, pnl, sell_price, "sell")
+            return
+
+        log(f"  ❌ Sell failed — holding for resolution")
+
+    # ─── EXIT HANDLING ────────────────────────────────────────────────
+
+    def _handle_exit(self, proceeds, pnl, sell_price, reason):
+        """Record trade, update balance, clear position."""
+        pos = self.position
+        if not pos:
+            return
+
+        self.trade_count += 1
+        if pnl > 0:
+            self.win_count += 1
+        self.total_pnl += pnl
+
+        # Update tracked balance
+        self.tracked_balance += pnl
+        if self.tracked_balance < MIN_BET:
+            self.tracked_balance = INITIAL_BALANCE
+            log(f"  💼 Tracked balance reset to ${INITIAL_BALANCE:.2f}")
+        else:
+            log(f"  💼 Tracked balance: ${self.tracked_balance:.2f}")
+
+        self.position = None
+
+        # Log trade
+        entry = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "side": pos["side"],
+            "entry_price": pos["entry_price"],
+            "exit_price": sell_price,
+            "shares": pos["shares"],
+            "cost": pos["cost"],
+            "pnl": round(pnl, 4),
+            "hold_secs": round(time.time() - pos["entry_time"], 1),
+            "reason": reason,
+            "tracked_balance": round(self.tracked_balance, 2),
+            "dry_run": pos.get("dry_run", False),
+        }
+
+        trades = []
+        if os.path.exists(TRADE_LOG):
+            try:
+                with open(TRADE_LOG) as f:
+                    trades = json.load(f)
+            except Exception:
+                pass
+        trades.append(entry)
+        with open(TRADE_LOG, "w") as f:
+            json.dump(trades, f, indent=2)
+
+        result = "W" if pnl > 0 else "L"
+        log(f"  📊 Trade #{self.trade_count}: {result} ${pnl:+.2f} | "
+            f"session {self.win_count}/{self.trade_count} | "
+            f"cumulative ${self.total_pnl:+.2f}")
+
+    def get_status(self):
+        """One-line status for dashboard."""
+        if self.position:
+            pos = self.position
+            hold = time.time() - pos["entry_time"]
+            mid = self.poly.mid_price(pos["token_id"]) or 0
+            return (f"HOLDING BTC {pos['side']} | entry={pos['entry_price']:.3f} "
+                    f"now={mid:.3f} | hold={hold:.0f}s | wait for resolution")
+        if self.pending_buy:
+            pb = self.pending_buy
+            wait = time.time() - pb["placed_at"]
+            return (f"PENDING BUY BTC {pb['side']} | {pb['shares_requested']:.1f}sh @ "
+                    f"{pb['buy_price']} | waiting {wait:.0f}s")
+        if self._skip_reason:
+            return f"SCANNING | skip: {self._skip_reason}"
+        return "SCANNING..."
+
+
+# =========================================================================
+# MAIN
+# =========================================================================
+def main():
+    mode = "DRY" if DRY_RUN else "LIVE"
+    log(f"═══ Theta Bot ═══ [{mode}]")
+    log(f"Strategy: Late-entry vol-filtered BTC binary scalper")
+    log(f"  Entry: {ENTRY_DELAY}s into window | min_dist={MIN_DISTANCE} | max_vol={MAX_VOL}")
+    log(f"  Price: mid {MIN_MID_PRICE}-{MAX_ENTRY_PRICE} | hold to resolution")
+    log(f"  Safety: exit_cutoff={EXIT_CUTOFF_SECS}s | min_stop_sell={MIN_STOP_SELL}")
+    log(f"  Balance: ${INITIAL_BALANCE:.2f} start | {BET_PCT*100:.0f}% per trade")
+    log("")
+
+    # Start feeds
+    binance = BinanceFeed()
+    binance.start()
+
+    poly = PolymarketFeed()
+    poly.start()
+
+    bot = ThetaBot(poly, binance)
+
+    log("Waiting for WS connections...")
+    for _ in range(30):
+        if poly.connected and binance.connected:
+            break
+        time.sleep(1)
+
+    if not poly.connected:
+        log("⚠ Polymarket WS not connected after 30s")
+    if not binance.connected:
+        log("⚠ Binance WS not connected after 30s")
+
+    balance = get_usdc_balance()
+    if balance:
+        log(f"Real USDC balance: ${balance:.2f}")
+    log(f"Tracked balance: ${bot.tracked_balance:.2f}")
+
+    # Wait for vol data to accumulate
+    log(f"Accumulating {VOL_MIN_SAMPLES}s of BTC price data for volatility...")
+    log("")
+
+    last_discovery = 0
+    discovery_interval = 15
+
+    while True:
+        try:
+            now = time.time()
+
+            if now - last_discovery > discovery_interval:
+                window = discover_btc_market()
+                if window:
+                    old_epoch = bot.current_window["epoch"] if bot.current_window else None
+                    if window["epoch"] != old_epoch:
+                        bot.update_market(window)
+                last_discovery = now
+
+            bot.tick()
+
+            # Dashboard
+            now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            poly_ws = "🟢" if poly.connected else "🔴"
+            bn_ws = "🟢" if binance.connected else "🔴"
+            status = bot.get_status()
+
+            btc_price = binance.price
+            vol, n_samples = binance.realized_vol()
+
+            up_mid = down_mid = None
+            threshold = None
+            if bot.current_window:
+                up_mid = poly.mid_price(bot.current_window["up_token"])
+                down_mid = poly.mid_price(bot.current_window["down_token"])
+                threshold = bot.current_window.get("threshold")
+
+            secs_in = secs_left = 0
+            if bot.current_window:
+                now_utc = datetime.now(timezone.utc)
+                secs_in = (now_utc - bot.current_window["start"]).total_seconds()
+                secs_left = (bot.current_window["end"] - now_utc).total_seconds()
+
+            print(f"\033[2J\033[H", end="")
+            print(f"═══ Theta Bot [{mode}] ═══  {now_str} UTC")
+            print(f"{'─' * 70}")
+            print(f"  Polymarket {poly_ws}  |  Binance {bn_ws}")
+            print(f"  BTC: ${btc_price:,.2f}" if btc_price else "  BTC: --")
+            if threshold:
+                dist = (btc_price - threshold) / threshold if btc_price else 0
+                print(f"  Threshold: ${threshold:,.0f}  |  Distance: {dist:+.4f}")
+            print(f"  Vol: {vol:.6f} ({n_samples} samples)" if vol else
+                  f"  Vol: accumulating ({n_samples}/{VOL_MIN_SAMPLES} samples)")
+            if vol:
+                vol_ok = "✅" if vol <= MAX_VOL else "❌"
+                print(f"  Vol filter: {vol_ok} (max={MAX_VOL})")
+            print(f"{'─' * 70}")
+            if up_mid or down_mid:
+                print(f"  UP={up_mid:.3f}" if up_mid else "  UP=--", end="  |  ")
+                print(f"DOWN={down_mid:.3f}" if down_mid else "DOWN=--")
+            print(f"  Window: {secs_in:.0f}s in / {secs_left:.0f}s left"
+                  f"  (entry after {ENTRY_DELAY}s)")
+            print(f"  {status}")
+            print(f"{'─' * 70}")
+            print(f"  Balance: ${bot.tracked_balance:.2f}")
+            print(f"  Trades: {bot.trade_count} | Wins: {bot.win_count} | "
+                  f"PnL: ${bot.total_pnl:+.2f}")
+            print(f"  Log: {LOG_FILE} | Trades: {TRADE_LOG}")
+            print(f"  Press Ctrl+C to stop")
+
+            time.sleep(TICK_INTERVAL)
+
+        except KeyboardInterrupt:
+            log(f"\nStopping...")
+            if bot.pending_buy:
+                bot._cancel_pending_buy_and_handle_partial("shutdown")
+            if bot.position and not bot.position.get("dry_run"):
+                log("  Closing open position...")
+                bot._execute_sell()
+            bal = get_usdc_balance()
+            if bal:
+                log(f"Final USDC balance: ${bal:.2f}")
+            log(f"Tracked balance: ${bot.tracked_balance:.2f}")
+            log(f"Trades: {bot.trade_count} | Wins: {bot.win_count} | "
+                f"PnL: ${bot.total_pnl:+.2f}")
+            break
+        except Exception as e:
+            log(f"⚠ Main loop error: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
