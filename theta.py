@@ -1570,7 +1570,7 @@ def main():
     log(f"  Entry: {ENTRY_DELAY}s into window | z≥{MIN_Z_SCORE} | max_vol={MAX_VOL}")
     log(f"  Price: max_entry={MAX_ENTRY_PRICE} | hold to resolution")
     log(f"  Safety: min_stop_sell={MIN_STOP_SELL} | min_entry_secs={MIN_ENTRY_SECS_LEFT}")
-    log(f"  Balance: ${INITIAL_BALANCE:.2f} start | {BET_PCT*100:.0f}% per trade")
+    log(f"  Balance: ${INITIAL_BALANCE:.2f} start | Kelly adaptive (default={DEFAULT_BET_PCT*100:.0f}%)")
     log("")
 
     # Init tick CSV
