@@ -74,12 +74,12 @@ MAX_BET = 2000                 # Safety cap
 # ── Entry conditions ──
 ENTRY_DELAY = 30               # Seconds into window before considering entry
                                # Just enough for Polymarket books to stabilize — z-score handles the rest
-MIN_Z_SCORE = 1.5              # Unified entry threshold — z = |dist| / (vol × √secs_left)
+MIN_Z_SCORE = 1.3              # Unified entry threshold — z = |dist| / (vol × √secs_left)
                                # z > 1.5 ≈ 87% confidence price stays on this side
                                # Trades more often than z=2.0 (97.7%), still strong edge
 MAX_VOL = 0.0030               # ABSOLUTE ceiling — never trade above this no matter what
                                # (extreme events: flash crash, CPI, etc.)
-VOL_PERCENTILE = 50            # Enter only when vol is in the bottom N% of recent history
+VOL_PERCENTILE = 70            # Enter only when vol is in the bottom N% of recent history
                                # 50 = "calmer than median" — p30 was too strict (blocked 100% of ticks)
 MAX_ENTRY_PRICE = 0.93         # Don't buy above this — at z=1.5 (87%), EV is negative above ~0.93
 
