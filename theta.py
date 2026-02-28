@@ -66,7 +66,7 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-INITIAL_BALANCE = 50.0         # Starting tracked balance
+INITIAL_BALANCE = 100.0         # Starting tracked balance
 DEFAULT_BET_PCT = 0.35         # Fallback bet % before enough data for Kelly
 MIN_KELLY_TRADES = 10          # Minimum trades before Kelly kicks in
 KELLY_LOOKBACK = 50            # Use last N trades only (rolling window)
