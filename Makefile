@@ -47,7 +47,7 @@ claim:
 	$(PY) claimer.py
 
 claim-loop:
-	$(PY) claimer.py --loop 120
+	$(PY) claimer.py --loop 30
 
 claim-batch:
 	$(PY) claimer.py --batch 10
