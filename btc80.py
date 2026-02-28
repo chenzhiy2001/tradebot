@@ -62,6 +62,7 @@ ENTRY_MID = 0.80              # Buy when either BTC side mid-price reaches this
 LIMIT_BUY_PRICE = 0.80        # GTC limit buy price (fixed entry)
 LIMIT_SELL_PRICE = 0.99       # GTC limit sell price (take profit)
 STOP_LOSS_MID = 0.75          # FOK sell if mid drops to this (stop loss)
+MIN_STOP_SELL = 0.50          # Don't sell below this — hold for resolution instead
 BUY_FILL_TIMEOUT = 120        # Max seconds to wait for GTC buy to fill
 
 # Polymarket fee formula (5m crypto)
@@ -859,13 +860,20 @@ class BTC80Bot:
 
     def _execute_stop_loss(self):
         """Cancel GTC limit sell, then sell all shares at current bid.
-        Simple: sell at bid → wait → retry at new bid → give up."""
+        Simple: sell at bid → wait → retry at new bid → give up.
+        If bid < MIN_STOP_SELL, skip selling entirely — hold for resolution."""
         pos = self.position
         if not pos:
             return
 
         token_id = pos["token_id"]
         side = pos["side"]
+
+        # ── 0. Crash check — if bid is too low, don't sell, just hold ──
+        bid, _, _ = self.poly.get_price(token_id)
+        if bid is not None and bid < MIN_STOP_SELL:
+            log(f"  ⚠ Bid={bid:.2f} < {MIN_STOP_SELL} — price crashed, holding for resolution")
+            return
 
         # ── 1. Cancel take-profit GTC limit sell ──
         if pos.get("limit_order_id"):
@@ -898,9 +906,13 @@ class BTC80Bot:
             return
 
         # ── 4. Sell at bid — up to 3 attempts ──
+        #      Re-check bid each attempt; if it crashes below MIN_STOP_SELL, abort.
         for attempt in range(3):
             # Get current bid for sell price
             bid, _, _ = self.poly.get_price(token_id)
+            if bid is not None and bid < MIN_STOP_SELL:
+                log(f"  ⚠ Bid={bid:.2f} crashed below {MIN_STOP_SELL} — aborting sell, holding for resolution")
+                return
             if attempt == 0:
                 sell_price = round(bid, 2) if bid and bid > 0.02 else STOP_LOSS_MID
             else:
