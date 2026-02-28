@@ -61,7 +61,6 @@ MAX_BET = 2000                  # Safety cap
 ENTRY_MID = 0.85              # Buy when either BTC side mid-price reaches this
 LIMIT_BUY_PRICE = 0.85        # GTC limit buy (at ask → fills instantly)
 LIMIT_SELL_PRICE = 0.95       # GTC limit sell price (take profit)
-STOP_LOSS_MID = 0.82          # Sell if mid drops to this (tighter stop, less slippage)
 MIN_STOP_SELL = 0.50          # Don't sell below this — hold for resolution instead
 BUY_FILL_TIMEOUT = 20         # Max seconds — should fill instantly at 0.87
 EXIT_CUTOFF_SECS = 30         # Sell at bid this many secs before window end to avoid crash zone
@@ -682,13 +681,6 @@ class BTC80Bot:
             self._cancel_pending_buy_and_handle_partial("timeout")
             return
 
-        # Stop-loss check: if price crashed, cancel buy and dump any partial fill
-        mid = self.poly.mid_price(token_id)
-        if mid is not None and mid <= STOP_LOSS_MID:
-            log(f"  🛑 Price crashed to {mid:.3f} while waiting for buy fill")
-            self._cancel_pending_buy_and_handle_partial("price crash")
-            return
-
         # Poll for fill every ORDER_POLL_SECS
         if now - pb.get("last_poll", 0) < ORDER_POLL_SECS:
             return
@@ -723,27 +715,7 @@ class BTC80Bot:
         actual_cost = round(actual_shares * LIMIT_BUY_PRICE, 2)
         self.pending_buy = None
 
-        # ── Check if price already crashed ──
-        mid_now = self.poly.mid_price(token_id)
-        if mid_now is not None and mid_now <= STOP_LOSS_MID:
-            log(f"  🛑 Price crashed to {mid_now:.3f} after buy fill — immediate stop loss")
-            usdc_snap = get_usdc_balance() or 0
-            self.position = {
-                "token_id": token_id,
-                "side": side,
-                "entry_price": LIMIT_BUY_PRICE,
-                "shares": actual_shares,
-                "cost": actual_cost,
-                "entry_time": time.time(),
-                "limit_order_id": None,
-                "usdc_snapshot": usdc_snap,
-                "last_poll": 0,
-                "dry_run": False,
-            }
-            self._execute_stop_loss()
-            return
-
-        # ── Place GTC limit sell at 0.99 ──
+        # ── Place GTC limit sell ──
         limit_order_id = None
         try:
             order_args = OrderArgs(
@@ -761,7 +733,7 @@ class BTC80Bot:
             else:
                 log(f"  ⚠ GTC limit response: {limit_resp}")
         except Exception as e:
-            log(f"  ⚠ GTC limit error: {e} — will rely on stop-loss only")
+            log(f"  ⚠ GTC limit error: {e} — will rely on exit cutoff")
 
         # ── Record USDC snapshot ──
         usdc_snap = get_usdc_balance() or 0
@@ -782,7 +754,7 @@ class BTC80Bot:
     # ─── POSITION MANAGEMENT ─────────────────────────────────────────
 
     def _manage_position(self):
-        """Monitor for stop loss, GTC fill, or window resolution."""
+        """Monitor for GTC fill, exit cutoff, or window resolution."""
         pos = self.position
         if not pos:
             return
@@ -795,14 +767,6 @@ class BTC80Bot:
         if pos.get("dry_run"):
             mid = self.poly.mid_price(token_id)
             if mid is None:
-                return
-            if mid <= STOP_LOSS_MID:
-                log(f"  🛑 STOP LOSS: BTC {side} mid={mid:.3f} ≤ {STOP_LOSS_MID}")
-                fee = compute_taker_fee(pos["shares"], mid)
-                revenue = pos["shares"] * mid - fee
-                pnl = revenue - pos["cost"]
-                log(f"  🧪 DRY RUN — Sold {pos['shares']:.1f}sh @ ~{mid:.3f} → PnL ${pnl:+.2f}")
-                self._handle_exit(revenue, pnl, mid, "stop_loss")
                 return
             if mid >= LIMIT_SELL_PRICE:
                 log(f"  🎉 LIMIT FILL: BTC {side} mid={mid:.3f} ≥ {LIMIT_SELL_PRICE}")
@@ -834,13 +798,6 @@ class BTC80Bot:
                     pnl = -pos["cost"]
                     log(f"  ❌ RESOLVED LOSS (crash held): PnL ${pnl:+.2f}")
                     self._handle_exit(proceeds, pnl, 0, "resolved")
-            return
-
-        # ── LIVE: Check stop loss (fastest priority) ──
-        mid = self.poly.mid_price(token_id)
-        if mid is not None and mid <= STOP_LOSS_MID:
-            log(f"  🛑 STOP LOSS: BTC {side} mid={mid:.3f} ≤ {STOP_LOSS_MID}")
-            self._execute_stop_loss()
             return
 
         # ── EXIT CUTOFF: sell before crash zone (last ~60s of window) ──
@@ -1180,7 +1137,7 @@ class BTC80Bot:
             change = mid - pos["entry_price"] if mid else 0
             return (f"HOLDING BTC {pos['side']} | entry={pos['entry_price']:.3f} "
                     f"now={mid:.3f} Δ{change:+.3f} | hold={hold:.0f}s | "
-                    f"stop≤{STOP_LOSS_MID} limit={LIMIT_SELL_PRICE}")
+                    f"limit={LIMIT_SELL_PRICE}")
         if self.pending_buy:
             pb = self.pending_buy
             wait = time.time() - pb["placed_at"]
@@ -1195,9 +1152,9 @@ class BTC80Bot:
 def main():
     mode = "DRY" if DRY_RUN else "LIVE"
     log(f"═══ BTC80 Bot ═══ [{mode}]")
-    log(f"Strategy: GTC buy BTC side at {LIMIT_BUY_PRICE} → limit sell {LIMIT_SELL_PRICE} / stop {STOP_LOSS_MID}")
+    log(f"Strategy: GTC buy BTC side at {LIMIT_BUY_PRICE} → limit sell {LIMIT_SELL_PRICE} (no stop loss)")
     log(f"Balance: ${INITIAL_BALANCE:.2f} start | 99% per trade | reset when > book depth")
-    log(f"Stop-sell: 3 attempts at bid | no-match backoff: {NO_MATCH_BACKOFF}s")
+    log(f"Exit cutoff: {EXIT_CUTOFF_SECS}s before window end | no-match backoff: {NO_MATCH_BACKOFF}s")
     log("")
 
     poly = PolymarketFeed()
