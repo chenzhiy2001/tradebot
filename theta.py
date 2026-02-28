@@ -86,7 +86,7 @@ MAX_VOL = 0.0030               # ABSOLUTE ceiling — never trade above this no 
                                # (extreme events: flash crash, CPI, etc.)
 VOL_PERCENTILE = 70            # Enter only when vol is in the bottom N% of recent history
                                # 50 = "calmer than median" — p30 was too strict (blocked 100% of ticks)
-MAX_ENTRY_PRICE = 0.93         # Don't buy above this — at z=1.5 (87%), EV is negative above ~0.93
+MAX_ENTRY_PRICE = 0.88         # Don't buy above this — 51-trade analysis: ≤0.88 = 89% WR +$3.26 avg; 0.85-0.93 = all 5 losses
 
 # ── Safety ──
 MIN_STOP_SELL = 0.50           # Don't sell below this — hold for resolution
