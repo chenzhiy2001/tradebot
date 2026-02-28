@@ -81,8 +81,7 @@ MAX_VOL = 0.0030               # ABSOLUTE ceiling — never trade above this no 
                                # (extreme events: flash crash, CPI, etc.)
 VOL_PERCENTILE = 50            # Enter only when vol is in the bottom N% of recent history
                                # 50 = "calmer than median" — p30 was too strict (blocked 100% of ticks)
-MIN_MID_PRICE = 0.87           # Only enter if Polymarket mid ≥ this (side is winning)
-MAX_ENTRY_PRICE = 0.95         # Don't buy above this (not enough upside to $1)
+MAX_ENTRY_PRICE = 0.93         # Don't buy above this — at z=1.5 (87%), EV is negative above ~0.93
 
 # ── Safety ──
 MIN_STOP_SELL = 0.50           # Don't sell below this — hold for resolution
@@ -830,13 +829,6 @@ class ThetaBot:
         if mid is None:
             self._skip_reason = "no Polymarket price"
             return
-        if mid < MIN_MID_PRICE:
-            self._skip_reason = f"mid too low: {mid:.3f} < {MIN_MID_PRICE}"
-            self._log_eval(secs_left=secs_left, vol=vol, vol_thresh=vol_thresh,
-                           btc_price=btc_price, threshold=threshold, dist=dist,
-                           z=z, up_mid=up_mid, down_mid=down_mid,
-                           action="skip", reason="mid_too_low")
-            return
         if mid > MAX_ENTRY_PRICE:
             self._skip_reason = f"mid too high: {mid:.3f} > {MAX_ENTRY_PRICE} (not enough upside)"
             self._log_eval(secs_left=secs_left, vol=vol, vol_thresh=vol_thresh,
@@ -1427,7 +1419,7 @@ def main():
     log(f"═══ Theta Bot ═══ [{mode}]")
     log(f"Strategy: Late-entry vol-filtered BTC binary scalper")
     log(f"  Entry: {ENTRY_DELAY}s into window | z≥{MIN_Z_SCORE} | max_vol={MAX_VOL}")
-    log(f"  Price: mid {MIN_MID_PRICE}-{MAX_ENTRY_PRICE} | hold to resolution")
+    log(f"  Price: max_entry={MAX_ENTRY_PRICE} | hold to resolution")
     log(f"  Safety: min_stop_sell={MIN_STOP_SELL} | min_entry_secs={MIN_ENTRY_SECS_LEFT}")
     log(f"  Balance: ${INITIAL_BALANCE:.2f} start | {BET_PCT*100:.0f}% per trade")
     log("")
