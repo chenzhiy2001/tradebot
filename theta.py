@@ -249,6 +249,7 @@ class ChainlinkFeed:
                     log("  🔗 Chainlink RTDS connected (Polymarket resolution source)")
 
                     last_ping = time.time()
+                    last_data = time.time()
 
                     while True:
                         # Keep alive — RTDS needs pings every ~5s
@@ -258,6 +259,11 @@ class ChainlinkFeed:
                                 last_ping = time.time()
                             except Exception:
                                 break
+
+                        # Staleness check — if no price data for 30s, force reconnect
+                        if time.time() - last_data > 30:
+                            log("  ⚠ Chainlink RTDS stale (no data 30s) — reconnecting")
+                            break
 
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=1)
@@ -281,6 +287,7 @@ class ChainlinkFeed:
                                     with self._lock:
                                         self._price = price_val
                                         self._prices.append((ts, price_val))
+                                    last_data = time.time()
                                 except (ValueError, TypeError):
                                     pass
 
