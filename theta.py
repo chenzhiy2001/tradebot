@@ -1316,8 +1316,8 @@ class ThetaBot:
                 self._handle_exit(pos["shares"], pnl, 1.0, "resolved", pos=pos)
                 return
             if 'no match' in err_str or 'orderbook' in err_str:
-                log(f"  ⚠ Market closed — shares may auto-redeem")
-                self._handle_exit(0, -pos["cost"], 0, "sell_expired", pos=pos)
+                log(f"  ⚠ Market closed — determining outcome via Chainlink")
+                self._resolve_by_chainlink(pos)
                 return
             if 'not enough balance' in err_str:
                 time.sleep(1)
