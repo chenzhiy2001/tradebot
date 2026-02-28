@@ -599,6 +599,14 @@ class BTC80Bot:
                         "last_poll": 0,
                     }
                     self._on_buy_filled(new_shares)
+                else:
+                    # No shares for THIS token, but USDC may have been consumed
+                    # by a prior buy that wasn't detected — sync to real balance
+                    usdc_now = get_usdc_balance()
+                    if usdc_now is not None and usdc_now < self.tracked_balance - 2:
+                        log(f"  ⚠ Tracked ${self.tracked_balance:.2f} vs "
+                            f"real ${usdc_now:.2f} — syncing to real USDC")
+                        self.tracked_balance = usdc_now
             else:
                 log(f"  ⚠ Buy error: {e}")
                 # If pending_buy was already stored (order placed but parsing
@@ -621,21 +629,36 @@ class BTC80Bot:
         except Exception:
             pass
 
-        # Check if any shares were partially filled
-        time.sleep(1)  # Brief pause for on-chain state to settle
-        share_bal = None
-        for attempt in range(3):
+        # Check if any shares were partially filled.
+        # On-chain settlement can lag — use USDC cross-check as secondary signal.
+        time.sleep(2)  # Wait for on-chain state to settle
+
+        new_shares = 0
+        for attempt in range(5):
             share_bal = get_share_balance(token_id)
             if share_bal is not None:
-                break
-            log(f"  ⚠ get_share_balance returned None (attempt {attempt+1}/3)")
+                new_shares = share_bal - pb["pre_buy_bal"]
+                if new_shares >= 1.0:
+                    break
+            if attempt == 0:
+                # First check failed — cross-check USDC to see if money was spent
+                usdc_now = get_usdc_balance()
+                if usdc_now is not None:
+                    usdc_expected = self.tracked_balance  # what we should have
+                    usdc_spent = usdc_expected - usdc_now
+                    if usdc_spent > 2.0:
+                        log(f"  ⚠ USDC dropped ${usdc_spent:.2f} "
+                            f"(${usdc_expected:.2f}→${usdc_now:.2f}) — "
+                            f"shares likely bought, retrying balance...")
+                    else:
+                        # USDC matches expectations — no fill happened
+                        break
             time.sleep(1)
-        if share_bal is None:
-            log("  ⚠ Could not read share balance after cancel — assuming filled")
-            # Assume the order filled fully to avoid orphaned positions
-            share_bal = pb["pre_buy_bal"] + pb["shares"]
 
-        new_shares = share_bal - pb["pre_buy_bal"]
+        if share_bal is None and new_shares < 1.0:
+            log("  ⚠ Could not read share balance after cancel — assuming filled")
+            new_shares = pb["shares_requested"]
+
         partial_cost = round(new_shares * LIMIT_BUY_PRICE, 2)
 
         if new_shares >= 1.0 and partial_cost >= MIN_BET:
