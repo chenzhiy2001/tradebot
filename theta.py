@@ -67,12 +67,12 @@ FUNDER_ADDRESS = founder_address
 # STRATEGY PARAMETERS
 # =========================================================================
 INITIAL_BALANCE = 50.0         # Starting tracked balance
-BET_PCT = 0.25                 # 25% per trade — gathering live data, scale up once validated
+BET_PCT = 0.50                 # 50% per trade — validated on 15/15 win streak
 MIN_BET = 5                    # Polymarket minimum bet
 MAX_BET = 2000                 # Safety cap
 
 # ── Entry conditions ──
-ENTRY_DELAY = 30               # Seconds into window before considering entry
+ENTRY_DELAY = 15               # Seconds into window before considering entry
                                # Just enough for Polymarket books to stabilize — z-score handles the rest
 MIN_Z_SCORE = 1.3              # Unified entry threshold — z = |dist| / (vol × √secs_left)
                                # z > 1.5 ≈ 87% confidence price stays on this side
