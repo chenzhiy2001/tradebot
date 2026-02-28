@@ -961,103 +961,93 @@ class BTC80Bot:
                 self._handle_exit(0, -pos["cost"], 0, "stop_loss_no_shares")
             return
 
-        # ── 4. Sell at bid — up to 3 attempts ──
-        #      Re-check bid each attempt; if it crashes below MIN_STOP_SELL, abort.
-        for attempt in range(3):
-            # Get current bid for sell price
-            bid, _, _ = self.poly.get_price(token_id)
-            if bid is not None and bid < MIN_STOP_SELL:
-                log(f"  ⚠ Bid={bid:.2f} crashed below {MIN_STOP_SELL} — aborting sell, holding for resolution")
+        # ── 4. Sell — single GTC at bid-0.01 (undercut), wait up to 60s ──
+        #      Selling AT bid just sits on the ask; undercutting by 1¢ gets taken.
+        #      If not filled in 60s, leave order resting (don't cancel — it will
+        #      fill or redeem at window resolution).
+        bid, _, _ = self.poly.get_price(token_id)
+        if bid is not None and bid < MIN_STOP_SELL:
+            log(f"  ⚠ Bid={bid:.2f} crashed below {MIN_STOP_SELL} — aborting sell, holding for resolution")
+            pos["crash_held"] = True
+            return
+
+        # Undercut bid by 1¢ to be taken quickly
+        sell_price = round(bid - 0.01, 2) if bid and bid > 0.03 else 0.02
+        log(f"  📤 Stop-sell {sell_amount:.1f}sh BTC {side} @ {sell_price} (bid={bid})")
+
+        try:
+            order_args = OrderArgs(
+                price=sell_price,
+                size=sell_amount,
+                side=SELL,
+                token_id=token_id,
+            )
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, OrderType.GTC)
+        except Exception as e:
+            err_str = str(e).lower()
+            if 'price' in err_str and 'max' in err_str:
+                log(f"  ✅ Market resolved in our favor")
+                pnl = pos["shares"] * 1.0 - pos["cost"]
+                self._handle_exit(pos["shares"], pnl, 1.0, "stop_loss_resolved")
                 return
-            if attempt == 0:
-                sell_price = round(bid, 2) if bid and bid > 0.02 else STOP_LOSS_MID
+            if 'no match' in err_str or 'orderbook' in err_str:
+                log(f"  ⚠ Market closed — shares may auto-redeem")
+                self._handle_exit(0, -pos["cost"], 0, "stop_loss_expired")
+                return
+            if 'not enough balance' in err_str:
+                time.sleep(1)
+                remaining = get_share_balance(token_id)
+                if remaining is not None and remaining < 1.0:
+                    log(f"  ✅ Shares already sold")
+                    proceeds = sell_amount * sell_price
+                    fee = compute_taker_fee(sell_amount, sell_price)
+                    proceeds -= fee
+                    total = proceeds + gtc_partial_proceeds
+                    pnl = total - pos["cost"]
+                    self._handle_exit(total, pnl, sell_price, "stop_loss")
+                    return
+            log(f"  ⚠ Sell error: {e}")
+            # Fall through to "all attempts failed"
+            log(f"  ❌ Stop loss sell failed")
+            real_bal = get_usdc_balance()
+            if real_bal is not None and real_bal >= MIN_BET:
+                log(f"  🔄 Real USDC=${real_bal:.2f} — syncing tracked balance")
+                self._handle_exit(0, -pos["cost"], 0, "stop_loss_failed_reset")
+                self.tracked_balance = real_bal
+                log(f"  💼 Tracked balance (synced): ${self.tracked_balance:.2f}")
             else:
-                sell_price = round(bid - 0.01, 2) if bid and bid > 0.02 else 0.01
-            log(f"  📤 Stop-sell {sell_amount:.1f}sh BTC {side} @ {sell_price} (attempt {attempt+1}, bid={bid})")
+                self._handle_exit(0, -pos["cost"], 0, "stop_loss_failed")
+            return
 
-            try:
-                order_args = OrderArgs(
-                    price=sell_price,
-                    size=sell_amount,
-                    side=SELL,
-                    token_id=token_id,
-                )
-                signed_order = client.create_order(order_args)
-                resp = client.post_order(signed_order, OrderType.GTC)
-            except Exception as e:
-                err_str = str(e).lower()
-                if 'price' in err_str and 'max' in err_str:
-                    log(f"  ✅ Market resolved in our favor")
-                    pnl = pos["shares"] * 1.0 - pos["cost"]
-                    self._handle_exit(pos["shares"], pnl, 1.0, "stop_loss_resolved")
-                    return
-                if 'no match' in err_str or 'orderbook' in err_str:
-                    log(f"  ⚠ Market closed — shares may auto-redeem")
-                    self._handle_exit(0, -pos["cost"], 0, "stop_loss_expired")
-                    return
-                if 'not enough balance' in err_str:
-                    time.sleep(1)
-                    remaining = get_share_balance(token_id)
-                    if remaining is not None and remaining < 1.0:
-                        log(f"  ✅ Shares already sold")
-                        proceeds = sell_amount * sell_price
-                        fee = compute_taker_fee(sell_amount, sell_price)
-                        proceeds -= fee
-                        total = proceeds + gtc_partial_proceeds
-                        pnl = total - pos["cost"]
-                        self._handle_exit(total, pnl, sell_price, "stop_loss")
-                        return
-                log(f"  ⚠ Sell error (attempt {attempt+1}): {e}")
-                time.sleep(1)
-                continue
+        # Parse response
+        order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
+        raw_taking = resp.get("takingAmount", 0) if isinstance(resp, dict) else 0
+        raw_making = resp.get("makingAmount", 0) if isinstance(resp, dict) else 0
+        try:
+            taking = float(raw_taking) if raw_taking != "" else 0
+        except (ValueError, TypeError):
+            taking = 0
+        try:
+            making = float(raw_making) if raw_making != "" else 0
+        except (ValueError, TypeError):
+            making = 0
 
-            # Parse response
-            order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
-            raw_taking = resp.get("takingAmount", 0) if isinstance(resp, dict) else 0
-            raw_making = resp.get("makingAmount", 0) if isinstance(resp, dict) else 0
-            try:
-                taking = float(raw_taking) if raw_taking != "" else 0
-            except (ValueError, TypeError):
-                taking = 0
-            try:
-                making = float(raw_making) if raw_making != "" else 0
-            except (ValueError, TypeError):
-                making = 0
+        # Instant fill
+        if taking > 0 and not order_id:
+            actual_shares = making if making > 0 else sell_amount
+            actual_price = round(taking / actual_shares, 4) if actual_shares > 0 else 0
+            total = taking + gtc_partial_proceeds
+            pnl = total - pos["cost"]
+            log(f"  💰 Sold {actual_shares:.1f}sh @ ~{actual_price:.3f} → PnL ${pnl:+.2f}")
+            self._handle_exit(total, pnl, actual_price, "stop_loss")
+            return
 
-            # Instant fill
-            if taking > 0 and not order_id:
-                actual_shares = making if making > 0 else sell_amount
-                actual_price = round(taking / actual_shares, 4) if actual_shares > 0 else 0
-                total = taking + gtc_partial_proceeds
-                pnl = total - pos["cost"]
-                log(f"  💰 Sold {actual_shares:.1f}sh @ ~{actual_price:.3f} → PnL ${pnl:+.2f}")
-                self._handle_exit(total, pnl, actual_price, "stop_loss")
-                return
-
-            # GTC resting — wait up to 10s
-            if order_id:
-                log(f"  📋 Stop-sell placed (order={order_id[:12]}...)")
-                deadline = time.time() + 10
-                filled = False
-                while time.time() < deadline:
-                    remaining = get_share_balance(token_id)
-                    if remaining is not None and remaining < 1.0:
-                        proceeds = sell_amount * sell_price
-                        fee = compute_taker_fee(sell_amount, sell_price)
-                        proceeds -= fee
-                        total = proceeds + gtc_partial_proceeds
-                        pnl = total - pos["cost"]
-                        log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, GTC=${gtc_partial_proceeds:.2f}, PnL ${pnl:+.2f}")
-                        self._handle_exit(total, pnl, sell_price, "stop_loss")
-                        return
-                    time.sleep(2)
-                # Not filled — cancel and retry
-                try:
-                    client.cancel(order_id)
-                    log(f"  ⚠ Not filled in 10s — canceling (attempt {attempt+1})")
-                except Exception:
-                    pass
-                time.sleep(1)
+        # GTC resting — wait up to 60s
+        if order_id:
+            log(f"  📋 Stop-sell placed (order={order_id[:12]}...)")
+            deadline = time.time() + 60
+            while time.time() < deadline:
                 remaining = get_share_balance(token_id)
                 if remaining is not None and remaining < 1.0:
                     proceeds = sell_amount * sell_price
@@ -1065,28 +1055,38 @@ class BTC80Bot:
                     proceeds -= fee
                     total = proceeds + gtc_partial_proceeds
                     pnl = total - pos["cost"]
-                    log(f"  💰 Filled during cancel → PnL ${pnl:+.2f}")
+                    log(f"  💰 Stop-sell filled — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
                     self._handle_exit(total, pnl, sell_price, "stop_loss")
                     return
-                continue
+                time.sleep(2)
+            # Still not filled after 60s — leave the GTC order resting
+            # (it will fill eventually or shares resolve at window end)
+            log(f"  ⚠ Not filled in 60s — leaving GTC sell resting")
+            proceeds = sell_amount * sell_price
+            fee = compute_taker_fee(sell_amount, sell_price)
+            proceeds -= fee
+            total = proceeds + gtc_partial_proceeds
+            pnl = total - pos["cost"]
+            log(f"  💰 Assuming fill at {sell_price} — proceeds=${proceeds:.2f}, PnL ${pnl:+.2f}")
+            self._handle_exit(total, pnl, sell_price, "stop_loss_resting")
+            return
 
-            # Ambiguous response — check shares
-            log(f"  ⚠ Ambiguous response: {resp}")
-            time.sleep(1)
-            remaining = get_share_balance(token_id)
-            if remaining is not None and remaining < 1.0:
-                proceeds = sell_amount * sell_price
-                fee = compute_taker_fee(sell_amount, sell_price)
-                proceeds -= fee
-                total = proceeds + gtc_partial_proceeds
-                pnl = total - pos["cost"]
-                log(f"  ✅ Shares gone — filled silently → PnL ${pnl:+.2f}")
-                self._handle_exit(total, pnl, sell_price, "stop_loss")
-                return
-            time.sleep(1)
+        # Ambiguous response — check shares
+        log(f"  ⚠ Ambiguous response: {resp}")
+        time.sleep(2)
+        remaining = get_share_balance(token_id)
+        if remaining is not None and remaining < 1.0:
+            proceeds = sell_amount * sell_price
+            fee = compute_taker_fee(sell_amount, sell_price)
+            proceeds -= fee
+            total = proceeds + gtc_partial_proceeds
+            pnl = total - pos["cost"]
+            log(f"  ✅ Shares gone — filled silently → PnL ${pnl:+.2f}")
+            self._handle_exit(total, pnl, sell_price, "stop_loss")
+            return
 
-        # ── 5. All attempts failed — sync from real balance ──
-        log(f"  ❌ Stop loss sell failed after 3 attempts")
+        # ── 5. Couldn't even place order — sync from real balance ──
+        log(f"  ❌ Stop loss sell failed")
         real_bal = get_usdc_balance()
         if real_bal is not None and real_bal >= MIN_BET:
             log(f"  🔄 Real USDC=${real_bal:.2f} — syncing tracked balance")
