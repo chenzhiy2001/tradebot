@@ -465,6 +465,11 @@ class BTC80Bot:
         if now_utc >= self.current_window["end"]:
             return
 
+        # No new entries in the crash zone (last EXIT_CUTOFF_SECS of window)
+        secs_left = (self.current_window["end"] - now_utc).total_seconds()
+        if secs_left <= EXIT_CUTOFF_SECS:
+            return
+
         # No-match backoff: skip entry attempts for a while after market goes dead
         if time.time() < self._no_match_until:
             return
