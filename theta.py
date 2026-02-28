@@ -67,7 +67,7 @@ FUNDER_ADDRESS = founder_address
 # STRATEGY PARAMETERS
 # =========================================================================
 INITIAL_BALANCE = 50.0         # Starting tracked balance
-BET_PCT = 0.99                 # Use 99% of tracked balance per trade
+BET_PCT = 0.25                 # 25% per trade — gathering live data, scale up once validated
 MIN_BET = 5                    # Polymarket minimum bet
 MAX_BET = 2000                 # Safety cap
 
