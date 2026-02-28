@@ -1186,7 +1186,7 @@ class ThetaBot:
 
         # Determine outcome
         if threshold and cl_price:
-            if side == "Up":
+            if side == "UP":
                 won = cl_price > threshold
             else:
                 won = cl_price < threshold
