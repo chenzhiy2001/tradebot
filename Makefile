@@ -112,8 +112,8 @@ btc80_logs_backup:
 
 theta_logs_backup:
 	mkdir -p archives
-	zip -j -9 archives/theta_logs_$$(date +%Y%m%d_%H%M%S).zip theta_log.txt theta_trades.json
-	rm -f theta_log.txt theta_trades.json
+	zip -j -9 archives/theta_logs_$$(date +%Y%m%d_%H%M%S).zip theta_log.txt theta_trades.json theta_ticks.csv
+	rm -f theta_log.txt theta_trades.json theta_ticks.csv
 
 git_logs_backup:
 	git add .
