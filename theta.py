@@ -16,7 +16,7 @@ Strategy:
      - If both → buy the winning side at ask, hold to resolution ($1.00).
      - If vol high, z-score low, or price near threshold → skip the window.
   4. No selling needed — just hold to resolution. Winner gets $1/share.
-     Only EXIT_CUTOFF sell + crash_held as safety nets.
+     Only crash_held as safety net (refuses to sell into crashed book).
 
 Edge:
   Polymarket prices reflect AVERAGE volatility. By entering LATE and
@@ -74,9 +74,9 @@ MAX_BET = 2000                 # Safety cap
 # ── Entry conditions ──
 ENTRY_DELAY = 30               # Seconds into window before considering entry
                                # Just enough for Polymarket books to stabilize — z-score handles the rest
-MIN_Z_SCORE = 2.0              # Unified entry threshold — z = |dist| / (vol × √secs_left)
-                               # z > 2.0 ≈ 97.7% confidence price stays on this side
-                               # Replaces fixed MIN_DISTANCE — adapts to vol + time remaining
+MIN_Z_SCORE = 1.5              # Unified entry threshold — z = |dist| / (vol × √secs_left)
+                               # z > 1.5 ≈ 87% confidence price stays on this side
+                               # Trades more often than z=2.0 (97.7%), still strong edge
 MAX_VOL = 0.0030               # ABSOLUTE ceiling — never trade above this no matter what
                                # (extreme events: flash crash, CPI, etc.)
 VOL_PERCENTILE = 50            # Enter only when vol is in the bottom N% of recent history
@@ -86,8 +86,8 @@ MAX_ENTRY_PRICE = 0.95         # Don't buy above this (not enough upside to $1)
 
 # ── Safety ──
 MIN_STOP_SELL = 0.50           # Don't sell below this — hold for resolution
-EXIT_CUTOFF_SECS = 15          # Sell at bid this many secs before window end
-                               # (shorter than btc80 since we enter late anyway)
+MIN_ENTRY_SECS_LEFT = 15       # Don't enter with fewer than this many seconds left
+                               # (not enough time for order to fill)
 
 # ── Polymarket fee formula ──
 CRYPTO_FEE_RATE = 0.25
@@ -741,9 +741,9 @@ class ThetaBot:
             self._skip_reason = f"waiting ({secs_into_window:.0f}/{ENTRY_DELAY}s)"
             return
 
-        # Too late — in the exit cutoff zone
-        if secs_left <= EXIT_CUTOFF_SECS:
-            self._skip_reason = "exit cutoff zone"
+        # Too late — not enough time for order to fill
+        if secs_left <= MIN_ENTRY_SECS_LEFT:
+            self._skip_reason = "too late for entry"
             return
 
         # No-match backoff
@@ -1167,14 +1167,6 @@ class ThetaBot:
                         self._handle_exit(0, pnl, 0, "resolved")
             return
 
-        # ── EXIT CUTOFF: sell before window end ──
-        if self.current_window:
-            secs_left = (self.current_window["end"] - datetime.now(timezone.utc)).total_seconds()
-            if 0 < secs_left <= EXIT_CUTOFF_SECS:
-                log(f"  ⏰ EXIT CUTOFF: {secs_left:.0f}s left — selling to avoid crash zone")
-                self._execute_sell()
-                return
-
         # ── Check if shares gone (resolution) ──
         if now - pos.get("last_poll", 0) >= ORDER_POLL_SECS:
             pos["last_poll"] = now
@@ -1218,7 +1210,7 @@ class ThetaBot:
     # ─── SELL EXECUTION ───────────────────────────────────────────────
 
     def _execute_sell(self):
-        """Sell all shares at bid-1¢. Used only for EXIT_CUTOFF and emergency close."""
+        """Sell all shares at bid-1¢. Used only for emergency close."""
         pos = self.position
         if not pos:
             return
@@ -1431,7 +1423,7 @@ def main():
     log(f"Strategy: Late-entry vol-filtered BTC binary scalper")
     log(f"  Entry: {ENTRY_DELAY}s into window | z≥{MIN_Z_SCORE} | max_vol={MAX_VOL}")
     log(f"  Price: mid {MIN_MID_PRICE}-{MAX_ENTRY_PRICE} | hold to resolution")
-    log(f"  Safety: exit_cutoff={EXIT_CUTOFF_SECS}s | min_stop_sell={MIN_STOP_SELL}")
+    log(f"  Safety: min_stop_sell={MIN_STOP_SELL} | min_entry_secs={MIN_ENTRY_SECS_LEFT}")
     log(f"  Balance: ${INITIAL_BALANCE:.2f} start | {BET_PCT*100:.0f}% per trade")
     log("")
 
