@@ -58,12 +58,12 @@ BET_PCT = 0.99                # Use 99% of tracked balance per trade
 MIN_BET = 5                   # Polymarket minimum bet
 MAX_BET = 2000                  # Safety cap
 
-ENTRY_MID = 0.80              # Buy when either BTC side mid-price reaches this
-LIMIT_BUY_PRICE = 0.80        # GTC limit buy price (fixed entry)
-LIMIT_SELL_PRICE = 0.99       # GTC limit sell price (take profit)
-STOP_LOSS_MID = 0.75          # FOK sell if mid drops to this (stop loss)
+ENTRY_MID = 0.85              # Buy when either BTC side mid-price reaches this
+LIMIT_BUY_PRICE = 0.87        # GTC limit buy (at/above ask → fills instantly)
+LIMIT_SELL_PRICE = 0.93       # GTC limit sell price (realistic take profit)
+STOP_LOSS_MID = 0.80          # Sell if mid drops to this (stop loss)
 MIN_STOP_SELL = 0.50          # Don't sell below this — hold for resolution instead
-BUY_FILL_TIMEOUT = 120        # Max seconds to wait for GTC buy to fill
+BUY_FILL_TIMEOUT = 20         # Max seconds — should fill instantly at 0.87
 EXIT_CUTOFF_SECS = 30         # Sell at bid this many secs before window end to avoid crash zone
 
 # Polymarket fee formula (5m crypto)
@@ -414,7 +414,7 @@ def discover_btc_market():
 # BTC80 BOT
 # =========================================================================
 class BTC80Bot:
-    """Buy BTC side at 80¢, limit sell at 99¢, stop loss at 60¢."""
+    """Scalp BTC side: buy at 87¢ when mid≥85¢, sell at 93¢, stop at 80¢."""
 
     def __init__(self, poly):
         self.poly = poly
@@ -1149,7 +1149,7 @@ class BTC80Bot:
             wait = time.time() - pb["placed_at"]
             return (f"PENDING BUY BTC {pb['side']} | {pb['shares_requested']:.1f}sh @ "
                     f"{LIMIT_BUY_PRICE} | waiting {wait:.0f}s")
-        return "SCANNING for BTC side ≥ 0.80..."
+        return "SCANNING for BTC side ≥ 0.85..."
 
 
 # =========================================================================
