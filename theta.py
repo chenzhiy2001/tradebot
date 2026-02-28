@@ -10,10 +10,11 @@ Strategy:
   3. Compute rolling 5-min realized volatility (stdev of 1s returns via Binance).
   3. For each Polymarket BTC 5-min window:
      - Wait until ENTRY_DELAY seconds into the window (let uncertainty fade).
-     - Check: is BTC comfortably on one side? (distance from threshold)
-     - Check: is realized volatility low enough?
+     - Check: is realized volatility low? (adaptive percentile + absolute ceiling)
+     - Check: is z-score high enough? z = |dist| / (vol × √t_remaining)
+       z > 2.0 ≈ 97.7% — unifies distance, vol, and time into one metric
      - If both → buy the winning side at ask, hold to resolution ($1.00).
-     - If vol is high or price near threshold → skip the window.
+     - If vol high, z-score low, or price near threshold → skip the window.
   4. No selling needed — just hold to resolution. Winner gets $1/share.
      Only EXIT_CUTOFF sell + crash_held as safety nets.
 
@@ -72,12 +73,13 @@ MAX_BET = 2000                 # Safety cap
 
 # ── Entry conditions ──
 ENTRY_DELAY = 150              # Seconds into window before considering entry (2.5 min)
-MIN_DISTANCE = 0.03            # BTC must be ≥ this far from threshold (relative)
-                               # e.g. if threshold = $100,000, min distance = $3,000
-MAX_VOL = 0.0015               # Max 5-min realized vol (stdev of 1s log returns)
-                               # ~0.0015 = moves ±0.15% per second → roughly ±0.35% in 5min
-                               # Normal quiet market: 0.0005-0.0010
-                               # Active market: 0.0020+
+MIN_Z_SCORE = 2.0              # Unified entry threshold — z = |dist| / (vol × √secs_left)
+                               # z > 2.0 ≈ 97.7% confidence price stays on this side
+                               # Replaces fixed MIN_DISTANCE — adapts to vol + time remaining
+MAX_VOL = 0.0030               # ABSOLUTE ceiling — never trade above this no matter what
+                               # (extreme events: flash crash, CPI, etc.)
+VOL_PERCENTILE = 30            # Enter only when vol is in the bottom N% of recent history
+                               # 30 = "calmer than 70% of recent observations"
 MIN_MID_PRICE = 0.87           # Only enter if Polymarket mid ≥ this (side is winning)
 MAX_ENTRY_PRICE = 0.95         # Don't buy above this (not enough upside to $1)
 
@@ -100,6 +102,8 @@ NO_MATCH_BACKOFF = 10          # Seconds backoff after "no match" error
 # ── Volatility computation ──
 VOL_WINDOW = 300               # Seconds of price history for vol computation
 VOL_MIN_SAMPLES = 30           # Minimum 1s candles needed to compute vol
+VOL_HISTORY_SIZE = 360         # Rolling buffer of vol measurements for adaptive threshold
+                               # At 5s sample interval = ~30 min of history
 
 # ── Data files ──
 LOG_FILE = "theta_log.txt"
@@ -299,6 +303,8 @@ class BinanceFeed:
     def __init__(self):
         self._price = None
         self._prices = deque(maxlen=VOL_WINDOW)
+        self._vol_history = deque(maxlen=VOL_HISTORY_SIZE)  # rolling vol measurements
+        self._last_vol_sample = 0  # timestamp of last vol sample
         self._lock = threading.Lock()
         self._connected = False
 
@@ -386,6 +392,30 @@ class BinanceFeed:
         vol = math.sqrt(variance)
 
         return vol, len(log_returns)
+
+    def record_vol_sample(self):
+        """Sample current vol into history buffer (call every ~5s from main loop)."""
+        vol, n = self.realized_vol()
+        if vol is not None:
+            with self._lock:
+                self._vol_history.append(vol)
+
+    def vol_threshold(self):
+        """Compute adaptive vol threshold = Nth percentile of recent vol history.
+
+        Returns (threshold, n_history) or (None, 0) if not enough history.
+        When vol < threshold, market is calmer than usual → good to enter.
+        """
+        with self._lock:
+            history = sorted(self._vol_history)
+
+        if len(history) < 20:  # Need at least ~100s of history
+            return None, len(history)
+
+        # Compute the VOL_PERCENTILE-th percentile
+        idx = int(len(history) * VOL_PERCENTILE / 100.0)
+        idx = max(0, min(idx, len(history) - 1))
+        return history[idx], len(history)
 
 
 # =========================================================================
@@ -714,8 +744,20 @@ class ThetaBot:
         if vol is None:
             self._skip_reason = f"vol: need {VOL_MIN_SAMPLES} samples (have {n_samples})"
             return
+
+        # Absolute ceiling — never trade in extreme vol
         if vol > MAX_VOL:
-            self._skip_reason = f"vol too high: {vol:.6f} > {MAX_VOL}"
+            self._skip_reason = f"vol extreme: {vol:.6f} > {MAX_VOL} (abs ceiling)"
+            return
+
+        # Adaptive threshold — vol must be in the bottom N% of recent history
+        vol_thresh, n_hist = self.binance.vol_threshold()
+        if vol_thresh is None:
+            self._skip_reason = f"vol history: need 20+ samples (have {n_hist})"
+            return
+        if vol > vol_thresh:
+            self._skip_reason = (f"vol not calm: {vol:.6f} > p{VOL_PERCENTILE}={vol_thresh:.6f} "
+                                 f"({n_hist} samples)")
             return
 
         # ── Check BTC distance from threshold (from Chainlink — resolution source) ──
@@ -730,8 +772,15 @@ class ThetaBot:
             return
 
         abs_dist = abs(dist)
-        if abs_dist < MIN_DISTANCE:
-            self._skip_reason = f"too close: BTC ${btc_price:,.0f} vs ${threshold:,.0f} ({dist:+.4f})"
+
+        # ── Z-score: unified distance + vol + time metric ──
+        # z = |distance| / (vol × √secs_left)
+        # Higher z → price is further away in vol-adjusted terms → safer entry
+        # z > 2.0 ≈ 97.7% confidence price stays on the winning side
+        z = abs_dist / (vol * math.sqrt(secs_left)) if secs_left > 0 else 0.0
+        if z < MIN_Z_SCORE:
+            self._skip_reason = (f"z-score low: {z:.2f} < {MIN_Z_SCORE} "
+                                 f"(dist={dist:+.4f} vol={vol:.6f} t={secs_left:.0f}s)")
             return
 
         # ── Determine which side to buy ──
@@ -759,7 +808,7 @@ class ThetaBot:
         # ── All conditions met — enter! ──
         log(f"  ✅ ENTRY SIGNAL: BTC {side}")
         log(f"     BTC=${btc_price:,.2f} thresh=${threshold:,.0f} dist={dist:+.4f}")
-        log(f"     vol={vol:.6f} (max={MAX_VOL})")
+        log(f"     z-score={z:.2f} (min={MIN_Z_SCORE}) | vol={vol:.6f} | t={secs_left:.0f}s")
         log(f"     mid={mid:.3f} | {secs_into_window:.0f}s in, {secs_left:.0f}s left")
         self._enter(token, side, mid)
 
@@ -1302,7 +1351,7 @@ def main():
     mode = "DRY" if DRY_RUN else "LIVE"
     log(f"═══ Theta Bot ═══ [{mode}]")
     log(f"Strategy: Late-entry vol-filtered BTC binary scalper")
-    log(f"  Entry: {ENTRY_DELAY}s into window | min_dist={MIN_DISTANCE} | max_vol={MAX_VOL}")
+    log(f"  Entry: {ENTRY_DELAY}s into window | z≥{MIN_Z_SCORE} | max_vol={MAX_VOL}")
     log(f"  Price: mid {MIN_MID_PRICE}-{MAX_ENTRY_PRICE} | hold to resolution")
     log(f"  Safety: exit_cutoff={EXIT_CUTOFF_SECS}s | min_stop_sell={MIN_STOP_SELL}")
     log(f"  Balance: ${INITIAL_BALANCE:.2f} start | {BET_PCT*100:.0f}% per trade")
@@ -1368,6 +1417,12 @@ def main():
 
             btc_price = chainlink.price
             vol, n_samples = binance.realized_vol()
+            vol_thresh, n_hist = binance.vol_threshold()
+
+            # Sample vol into history every ~5s
+            if now - getattr(main, '_last_vol_sample', 0) >= 5:
+                binance.record_vol_sample()
+                main._last_vol_sample = now
 
             up_mid = down_mid = None
             threshold = None
@@ -1389,12 +1444,22 @@ def main():
             print(f"  BTC: ${btc_price:,.2f}" if btc_price else "  BTC: --")
             if threshold:
                 dist = (btc_price - threshold) / threshold if btc_price else 0
-                print(f"  Threshold: ${threshold:,.0f}  |  Distance: {dist:+.4f}")
+                # Compute live z-score for dashboard
+                z_str = "--"
+                if vol and secs_left > 0:
+                    z_live = abs(dist) / (vol * math.sqrt(secs_left))
+                    z_ok = "✅" if z_live >= MIN_Z_SCORE else "❌"
+                    z_str = f"{z_ok} {z_live:.2f} (min={MIN_Z_SCORE})"
+                print(f"  Threshold: ${threshold:,.0f}  |  Distance: {dist:+.4f}  |  Z: {z_str}")
             print(f"  Vol: {vol:.6f} ({n_samples} samples)" if vol else
                   f"  Vol: accumulating ({n_samples}/{VOL_MIN_SAMPLES} samples)")
-            if vol:
-                vol_ok = "✅" if vol <= MAX_VOL else "❌"
-                print(f"  Vol filter: {vol_ok} (max={MAX_VOL})")
+            if vol and vol_thresh:
+                vol_ok = "✅" if vol <= vol_thresh and vol <= MAX_VOL else "❌"
+                print(f"  Vol filter: {vol_ok} curr={vol:.6f} "
+                      f"p{VOL_PERCENTILE}={vol_thresh:.6f} ceil={MAX_VOL} "
+                      f"({n_hist} hist)")
+            elif vol:
+                print(f"  Vol filter: ⏳ building history ({n_hist}/20)")
             print(f"{'─' * 70}")
             if up_mid or down_mid:
                 print(f"  UP={up_mid:.3f}" if up_mid else "  UP=--", end="  |  ")
