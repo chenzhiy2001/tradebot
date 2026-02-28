@@ -59,9 +59,9 @@ MIN_BET = 5                   # Polymarket minimum bet
 MAX_BET = 2000                  # Safety cap
 
 ENTRY_MID = 0.85              # Buy when either BTC side mid-price reaches this
-LIMIT_BUY_PRICE = 0.87        # GTC limit buy (at/above ask → fills instantly)
-LIMIT_SELL_PRICE = 0.93       # GTC limit sell price (realistic take profit)
-STOP_LOSS_MID = 0.80          # Sell if mid drops to this (stop loss)
+LIMIT_BUY_PRICE = 0.85        # GTC limit buy (at ask → fills instantly)
+LIMIT_SELL_PRICE = 0.95       # GTC limit sell price (take profit)
+STOP_LOSS_MID = 0.82          # Sell if mid drops to this (tighter stop, less slippage)
 MIN_STOP_SELL = 0.50          # Don't sell below this — hold for resolution instead
 BUY_FILL_TIMEOUT = 20         # Max seconds — should fill instantly at 0.87
 EXIT_CUTOFF_SECS = 30         # Sell at bid this many secs before window end to avoid crash zone
