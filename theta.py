@@ -68,37 +68,25 @@ FUNDER_ADDRESS = founder_address
 # =========================================================================
 INITIAL_BALANCE = 100.0         # Starting tracked balance
 
-# ── Tiered bet sizing (entry price → bet%) ──
-# Tier BOUNDARIES are structural (cheap = more upside), kept fixed.
-# Tier BET PERCENTAGES are adaptive — per-tier Kelly from trade history.
-# These are just initial defaults before enough data per tier.
-BET_TIERS = [
-    (0.80, 0.50),              # ≤$0.80: initial 50% — high edge expected
-    (0.88, 0.15),              # ≤$0.88: initial 15% — marginal zone
-    (0.95, 0.05),              # ≤$0.95: initial 5% — thin payoff, Kelly will size
-]
-MIN_TIER_TRADES = 5            # Min trades in a tier before adapting its bet%
-DEFAULT_BET_PCT = 0.05        # Fallback if no tier matches
-KELLY_LOOKBACK = 50            # Use last N trades only (rolling window)
-KELLY_FRACTION = 0.5           # Use half-Kelly for safety (0.5 = half, 1.0 = full)
-MIN_BET_PCT = 0.05             # Floor — never bet less than 5%
-MAX_BET_PCT = 0.60             # Ceiling — never bet more than 60%
+# ── Flat bet sizing ──
+# Flat % of tracked balance. The edge is thin (~5% above breakeven).
+# Aggressive sizing (tiers, Kelly) amplified losses. Keep it simple.
+BET_PCT = 0.15                 # 15% of tracked balance per trade
 MIN_BET = 5                    # Polymarket minimum bet
 MAX_BET = 2000                 # Safety cap
 
 # ── Entry conditions ──
 ENTRY_DELAY = 10               # Seconds into window before considering entry
                                # Earlier entry = cheaper prices, more time for fill
-MIN_Z_SCORE = 1.3              # Unified entry threshold — z = |dist| / (vol × √secs_left)
+MIN_Z_SCORE = 1.5              # Unified entry threshold — z = |dist| / (vol × √secs_left)
                                # z > 1.5 ≈ 87% confidence price stays on this side
-                               # Trades more often than z=2.0 (97.7%), still strong edge
+                               # Proven profitable in sessions 165321, 180242, 203840
 MAX_VOL = 0.0030               # ABSOLUTE ceiling — never trade above this no matter what
                                # (extreme events: flash crash, CPI, etc.)
 VOL_PERCENTILE = 70            # Enter only when vol is in the bottom N% of recent history
                                # 50 = "calmer than median" — p30 was too strict (blocked 100% of ticks)
-# No hard MAX_ENTRY_PRICE — adaptive per-tier Kelly handles sizing.
-# Entries above the highest tier are still blocked (mid > 0.95 = no upside).
-MAX_ENTRY_PRICE = max(p for p, _ in BET_TIERS)
+MAX_ENTRY_PRICE = 0.93         # Hard cutoff — the 0.85-0.93 zone is where the real edge lives
+                               # Above 0.93, payoff is too thin: even 95% WR barely breaks even
 
 # ── Safety ──
 MIN_STOP_SELL = 0.50           # Don't sell below this — hold for resolution
@@ -723,11 +711,10 @@ class ThetaBot:
         self._entered_this_window = False  # Only one entry per window
         self._skip_reason = ""             # Why we skipped (for dashboard)
 
-    # ─── ADAPTIVE PER-TIER KELLY ──────────────────────────────────────
+    # ─── TRADE HISTORY ──────────────────────────────────────────────
 
     def _load_trade_history(self):
-        """Bootstrap trade history from saved log (theta_trades.json).
-        Each entry includes entry_price so we can compute per-tier Kelly."""
+        """Bootstrap trade history from saved log (theta_trades.json)."""
         if not os.path.exists(TRADE_LOG):
             return
         try:
@@ -743,88 +730,12 @@ class ThetaBot:
                         "entry_price": entry_price,
                     })
             if self.trade_history:
-                tier_info = self._tier_summary()
-                log(f"  📈 Loaded {len(self.trade_history)} trades for per-tier Kelly:")
-                for label, info in tier_info.items():
-                    log(f"     {label}: {info['n']} trades, {info['wr']:.0%} WR → bet={info['bet_pct']:.0%}")
+                wins = sum(1 for h in self.trade_history if h["win_frac"] > 0)
+                log(f"  📈 Loaded {len(self.trade_history)} trades "
+                    f"({wins}W/{len(self.trade_history)-wins}L, "
+                    f"{wins/len(self.trade_history):.0%} WR)")
         except Exception as e:
-            log(f"  ⚠ Could not load trade history for Kelly: {e}")
-
-    def _get_tier_for_price(self, entry_price):
-        """Return the tier index and (max_price, default_pct) for a given entry price."""
-        for i, (max_price, default_pct) in enumerate(sorted(BET_TIERS)):
-            if entry_price <= max_price:
-                return i, max_price, default_pct
-        return len(BET_TIERS) - 1, BET_TIERS[-1][0], DEFAULT_BET_PCT
-
-    def _compute_tier_kelly(self, tier_idx, tier_max_price, tier_default_pct):
-        """Compute Kelly-optimal bet% for a specific price tier.
-
-        Uses only trades whose entry_price falls in this tier.
-        Returns half-Kelly clamped to [MIN_BET_PCT, MAX_BET_PCT].
-        Falls back to tier default if not enough data.
-
-        Kelly formula for binary outcomes:
-          f* = p - q/b
-        where p = win rate, q = 1-p, b = avg_win / avg_loss.
-        """
-        # Filter history to trades in this tier
-        prev_max = sorted(BET_TIERS)[tier_idx - 1][0] if tier_idx > 0 else 0
-        tier_trades = [
-            h for h in self.trade_history[-KELLY_LOOKBACK:]
-            if prev_max < h["entry_price"] <= tier_max_price
-        ]
-
-        if len(tier_trades) < MIN_TIER_TRADES:
-            return tier_default_pct  # not enough data, use default
-
-        wins = [h["win_frac"] for h in tier_trades if h["win_frac"] > 0]
-        losses = [h["win_frac"] for h in tier_trades if h["win_frac"] <= 0]
-
-        if not wins or not losses:
-            # All wins → bet aggressively (but capped); all losses → minimum
-            if not losses:
-                return min(tier_default_pct * 1.5, MAX_BET_PCT)
-            return MIN_BET_PCT
-
-        p = len(wins) / len(tier_trades)
-        q = 1 - p
-        avg_win = sum(wins) / len(wins)
-        avg_loss = sum(abs(l) for l in losses) / len(losses)
-
-        if avg_loss == 0:
-            return tier_default_pct
-
-        b = avg_win / avg_loss
-        kelly = p - q / b
-
-        if kelly <= 0:
-            return MIN_BET_PCT  # Negative edge in this tier
-
-        kelly *= KELLY_FRACTION
-        return max(MIN_BET_PCT, min(MAX_BET_PCT, kelly))
-
-    def _get_adaptive_bet_pct(self, entry_price):
-        """Get the adaptive bet% for a given entry price.
-        Computes per-tier Kelly if enough data, else uses tier default."""
-        tier_idx, tier_max, tier_default = self._get_tier_for_price(entry_price)
-        return self._compute_tier_kelly(tier_idx, tier_max, tier_default)
-
-    def _tier_summary(self):
-        """Generate a summary dict of each tier's computed bet% for logging."""
-        summary = {}
-        for i, (max_p, default_pct) in enumerate(sorted(BET_TIERS)):
-            prev_max = sorted(BET_TIERS)[i - 1][0] if i > 0 else 0
-            tier_trades = [
-                h for h in self.trade_history[-KELLY_LOOKBACK:]
-                if prev_max < h["entry_price"] <= max_p
-            ]
-            n = len(tier_trades)
-            wr = sum(1 for h in tier_trades if h["win_frac"] > 0) / n if n > 0 else 0
-            bet = self._compute_tier_kelly(i, max_p, default_pct)
-            label = f"≤${max_p:.2f}"
-            summary[label] = {"n": n, "wr": wr, "bet_pct": bet}
-        return summary
+            log(f"  ⚠ Could not load trade history: {e}")
 
     def update_market(self, window):
         """Update current window and subscribe to tokens."""
@@ -1056,17 +967,14 @@ class ThetaBot:
 
         effective = min(self.tracked_balance, real_balance)
 
-        # ── Tiered bet sizing: per-tier Kelly from observed data ──
-        # First get the actual buy price so we know which tier
+        # ── Flat bet sizing: fixed % of tracked balance ──
         _, ask, _ = self.poly.get_price(token_id)
         if ask is None or ask <= 0:
             buy_price = round(mid, 2)
         else:
             buy_price = round(ask, 2)
 
-        bet_pct = self._get_adaptive_bet_pct(buy_price)
-
-        bet = round(effective * bet_pct)
+        bet = round(effective * BET_PCT)
         bet = min(bet, MAX_BET, int(real_balance))
         if bet < MIN_BET:
             if not hasattr(self, '_low_bal_logged') or not self._low_bal_logged:
@@ -1078,8 +986,7 @@ class ThetaBot:
         shares_to_buy = round(bet / buy_price, 2)
 
         log(f"  ⚡ BTC {side}: {shares_to_buy:.1f}sh @ {buy_price} "
-            f"(${bet} | tier_kelly={bet_pct:.0%} "
-            f"| tracked=${self.tracked_balance:.2f})")
+            f"(${bet} | {BET_PCT:.0%} of ${self.tracked_balance:.2f})")
 
         if DRY_RUN:
             log(f"  🧪 DRY RUN — buy {shares_to_buy:.1f}sh @ {buy_price}")
@@ -1544,7 +1451,7 @@ class ThetaBot:
             self.win_count += 1
         self.total_pnl += pnl
 
-        # Update per-tier Kelly history with entry_price
+        # Update trade history
         cost = pos.get("cost", 0)
         if cost > 0:
             self.trade_history.append({
@@ -1632,8 +1539,7 @@ def main():
     log(f"═══ Theta Bot ═══ [{mode}]")
     log(f"Strategy: Late-entry vol-filtered BTC binary scalper")
     log(f"  Entry: {ENTRY_DELAY}s into window | z≥{MIN_Z_SCORE} | max_vol={MAX_VOL}")
-    tiers_str = " / ".join(f"≤{p}→{int(pct*100)}%" for p, pct in BET_TIERS)
-    log(f"  Tiers (defaults): {tiers_str} — adapts via per-tier Kelly")
+    log(f"  Bet: flat {BET_PCT:.0%} of balance | max_entry={MAX_ENTRY_PRICE}")
     log(f"  Safety: min_stop_sell={MIN_STOP_SELL} | min_entry_secs={MIN_ENTRY_SECS_LEFT}")
     log(f"  Balance: ${INITIAL_BALANCE:.2f} start")
     log("")
