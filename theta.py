@@ -74,7 +74,7 @@ INITIAL_BALANCE = 100.0         # Starting tracked balance
 # Sweep over 96 trades: 25-30% is the sweet spot (best risk-adjusted).
 # 34% is peak profit but 66% max drawdown. 25% gets 90% of the upside
 # with only 52% drawdown and is robust across all trade orderings.
-BET_PCT = 0.30                 # 30% of tracked balance per trade
+BET_PCT = 0.35                 # 35% of tracked balance per trade
 MIN_BET = 5                    # Polymarket minimum bet
 MAX_BET = 2000                 # Safety cap
 
