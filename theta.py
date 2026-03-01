@@ -90,6 +90,9 @@ VOL_PERCENTILE = 70            # Enter only when vol is in the bottom N% of rece
                                # 50 = "calmer than median" — p30 was too strict (blocked 100% of ticks)
 MAX_ENTRY_PRICE = 0.93         # Hard cutoff — the 0.85-0.93 zone is where the real edge lives
                                # Above 0.93, payoff is too thin: even 95% WR barely breaks even
+MIN_DIST = 0.001               # Min |distance| from threshold (as fraction of BTC price)
+                               # Trades with |dist| < 0.001 had 78% WR → below breakeven
+                               # Trades with |dist| ≥ 0.001 had 94% WR across 164 trades
 
 # ── Safety ──
 MIN_STOP_SELL = 0.50           # Don't sell below this — hold for resolution
@@ -889,6 +892,15 @@ class ThetaBot:
                            action="skip", reason="z_score_low")
             return
 
+        if abs_dist < MIN_DIST:
+            self._skip_reason = (f"|dist| too small: {abs_dist:.5f} < {MIN_DIST} "
+                                 f"(BTC too close to threshold — 78% WR zone)")
+            self._log_eval(secs_left=secs_left, vol=vol, vol_thresh=vol_thresh,
+                           btc_price=btc_price, threshold=threshold, dist=dist,
+                           z=z, up_mid=up_mid, down_mid=down_mid,
+                           action="skip", reason="dist_too_small")
+            return
+
         # ── Determine which side to buy ──
         # dist > 0 → BTC above threshold → UP wins
         # dist < 0 → BTC below threshold → DOWN wins
@@ -1541,7 +1553,7 @@ def main():
     mode = "DRY" if DRY_RUN else "LIVE"
     log(f"═══ Theta Bot ═══ [{mode}]")
     log(f"Strategy: Late-entry vol-filtered BTC binary scalper")
-    log(f"  Entry: {ENTRY_DELAY}s into window | z≥{MIN_Z_SCORE} | max_vol={MAX_VOL}")
+    log(f"  Entry: {ENTRY_DELAY}s into window | z≥{MIN_Z_SCORE} | |dist|≥{MIN_DIST} | max_vol={MAX_VOL}")
     log(f"  Bet: flat {BET_PCT:.0%} of balance | max_entry={MAX_ENTRY_PRICE}")
     log(f"  Safety: min_stop_sell={MIN_STOP_SELL} | min_entry_secs={MIN_ENTRY_SECS_LEFT}")
     log(f"  Balance: ${INITIAL_BALANCE:.2f} start")
