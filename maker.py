@@ -70,9 +70,12 @@ TICK_SIZE            = 0.01   # Polymarket price tick
 # ── Execution ──
 FILL_TIMEOUT         = 8      # seconds to wait for limit fill
 CANCEL_ADVERSE_MOVE  = 0.02   # cancel pending order if mid moves 2c against us
+CANCEL_VERIFY_DELAY  = 1.0    # seconds to wait after cancel before checking fills
+CANCEL_VERIFY_RETRIES = 3     # number of balance checks after cancel
 EXIT_PROFIT_TARGET   = 0.02   # post limit sell at entry + this (2c)
 EXIT_STOP_LOSS       = 0.08   # wide SL: only for catastrophic moves (8c)
 EXIT_TIMEOUT         = 25     # main exit: sell at market after N seconds
+GHOST_SWEEP_INTERVAL = 5      # check for ghost positions every N seconds
 COOLDOWN_PER_TOKEN   = 12     # don't re-enter same token for N seconds
 COOLDOWN_PER_MARKET  = 10     # don't re-enter same market for N seconds
 WS_WARMUP           = 8       # seconds after WS connect before firing signals
@@ -580,7 +583,9 @@ class MakerBot:
         self.token_to_market = {}   # token_id -> market dict
         self.last_discovery = 0
         self.last_status = 0
+        self.last_ghost_sweep = 0
         self.balance = 0
+        self._known_tokens = set()  # all tokens we've ever posted orders for
 
     def run(self):
         log(f"{'=' * 60}")
@@ -652,6 +657,11 @@ class MakerBot:
                 f"pnl=${self.pm.total_pnl:+.2f} | "
                 f"open={self.pm.n_open}/{MAX_CONCURRENT} | "
                 f"markets={len(self.markets)}")
+
+        # Ghost sweep: find and sell shares the bot lost track of
+        if now - self.last_ghost_sweep > GHOST_SWEEP_INTERVAL:
+            self.last_ghost_sweep = now
+            self._ghost_sweep()
 
         # Check exits for open positions
         self._check_exits()
@@ -771,6 +781,7 @@ class MakerBot:
                 return
 
             log(f"    📝 Limit {side} posted: {order_id[:16]}...")
+            self._known_tokens.add(token_id)  # track for ghost sweep
             self.pm.open_position(
                 token_id, market["condition_id"], side,
                 entry_price, shares, bet, order_id=order_id)
@@ -809,17 +820,25 @@ class MakerBot:
                         client.cancel(order_id)
                     except Exception:
                         pass
-                    # Check if we got filled in the meantime
-                    bal = get_share_balance(token_id) or 0
-                    filled = bal - pre_bal
+                    # CRITICAL: wait and RETRY balance check — API has latency!
+                    # Single check was causing ghost positions (shares arrive after check)
+                    filled = 0
+                    for retry in range(CANCEL_VERIFY_RETRIES):
+                        time.sleep(CANCEL_VERIFY_DELAY)
+                        bal = get_share_balance(token_id) or 0
+                        filled = bal - pre_bal
+                        if filled > 0.5:
+                            break
+
                     if filled > 0.5:
-                        log(f"    ⚠ Adverse fill: {filled:.1f}sh, mid already at {mid:.2f}")
+                        log(f"    ⚠ Adverse fill detected: {filled:.1f}sh (retry), mid={mid:.2f}")
                         with self.pm._lock:
                             pos = self.pm.positions.get(token_id)
                             if pos:
                                 pos["shares"] = filled
                                 pos["status"] = "filled"
-                        # Don't post a TP that won't fill — mark for timeout exit
+                        # Immediately sell these adversely-filled shares
+                        self._sell_shares_now(token_id, filled, reason="adverse_fill")
                         return
                     else:
                         self.pm.close_position(token_id, entry_price, "cancelled_adverse")
@@ -1025,11 +1044,108 @@ class MakerBot:
             log(f"    {'🛑' if trade['pnl'] < 0 else '💰'} Exit: "
                 f"pnl=${trade['pnl']:+.4f} hold={trade['hold_secs']:.1f}s ({reason})")
 
+    def _sell_shares_now(self, token_id, shares, reason="ghost"):
+        """Immediately sell shares at best bid. Used for adverse fills and ghost cleanup."""
+        if DRY_RUN:
+            log(f"    🧹 DRY: would sell {shares:.1f}sh ({reason})")
+            self.pm.close_position(token_id, 0, reason)
+            return
+
+        # Cancel any open orders for this token first
+        cancel_all_orders(token_id)
+
+        bal = get_share_balance(token_id) or 0
+        if bal < MIN_SHARES:
+            if bal > 0:
+                log(f"    ⚠ {bal:.1f}sh dust ({reason}), can't sell < {MIN_SHARES}")
+            self.pm.close_position(token_id, 0, reason)
+            return
+
+        try:
+            signal = self.tracker.get_signal(token_id)
+            sell_price = round(signal["bb"], 2) if signal else 0.01
+            sell_price = max(sell_price, 0.01)
+
+            order_args = OrderArgs(
+                price=sell_price,
+                size=round(bal, 2),
+                side=SELL,
+                token_id=token_id,
+            )
+            signed = client.create_order(order_args)
+            resp = client.post_order(signed, OrderType.GTC)
+            log(f"    🧹 Sold {bal:.1f}sh @ {sell_price} ({reason})")
+        except Exception as e:
+            log(f"    ⚠ Sell error ({reason}): {e}")
+
+        self.pm.close_position(token_id, sell_price if 'sell_price' in dir() else 0, reason)
+
+    def _ghost_sweep(self):
+        """
+        CRITICAL: Scan ALL tokens we've ever traded for unexpected share balances.
+        This catches shares from orders that the bot thinks it cancelled but actually filled.
+        """
+        if DRY_RUN:
+            return
+
+        # Check all known tokens (ones we've posted orders for)
+        positions = self.pm.get_positions()
+        for token_id in list(self._known_tokens):
+            # Skip tokens we already have a tracked position for
+            if token_id in positions:
+                continue
+
+            try:
+                bal = get_share_balance(token_id) or 0
+            except Exception:
+                continue
+
+            if bal >= MIN_SHARES:
+                log(f"    👻 GHOST: {bal:.1f}sh found on {token_id[:20]}... — selling!")
+                self._sell_shares_now(token_id, bal, reason="ghost_sweep")
+            elif bal > 0.5:
+                log(f"    👻 Ghost dust: {bal:.1f}sh on {token_id[:20]}... (< min)")
+
     def _cleanup(self):
-        """Cancel all orders on shutdown."""
-        if not DRY_RUN:
-            log("  Cancelling all open orders...")
-            cancel_all_orders()
+        """Cancel all orders and sell ALL held shares on shutdown."""
+        if DRY_RUN:
+            return
+
+        log("  🧹 Cleanup: cancelling all open orders...")
+        cancel_all_orders()
+        time.sleep(1)  # let cancels propagate
+
+        # Sell ALL shares on ALL known tokens
+        sold_any = False
+        for token_id in list(self._known_tokens) | set(self.token_to_market.keys()):
+            try:
+                bal = get_share_balance(token_id) or 0
+            except Exception:
+                continue
+
+            if bal >= MIN_SHARES:
+                log(f"  🧹 Cleanup: selling {bal:.1f}sh on {token_id[:20]}...")
+                try:
+                    signal = self.tracker.get_signal(token_id)
+                    sell_price = round(signal["bb"], 2) if signal else 0.01
+                    sell_price = max(sell_price, 0.01)
+                    order_args = OrderArgs(
+                        price=sell_price,
+                        size=round(bal, 2),
+                        side=SELL,
+                        token_id=token_id,
+                    )
+                    signed = client.create_order(order_args)
+                    client.post_order(signed, OrderType.GTC)
+                    log(f"    📤 Sold {bal:.1f}sh @ {sell_price}")
+                    sold_any = True
+                except Exception as e:
+                    log(f"    ⚠ Cleanup sell error: {e}")
+            elif bal > 0.5:
+                log(f"  ⚠ Cleanup: {bal:.1f}sh dust on {token_id[:20]}... (< min, can't sell)")
+
+        if not sold_any:
+            log("  ✅ No ghost shares found")
 
 
 # =========================================================================
