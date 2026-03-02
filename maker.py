@@ -61,9 +61,11 @@ MIN_DEPTH            = 200    # minimum total depth ($) to trust signal
 MAX_SPREAD           = 0.03   # skip if spread > 3c (too illiquid)
 
 # ── Position sizing ──
-BASE_BET             = 15     # $ per trade
+BASE_BET             = 20     # $ per trade (ensure >5 shares even at high prices)
 MAX_BET              = 40     # cap per trade
-BET_FRACTION         = 0.15   # fraction of balance per trade
+BET_FRACTION         = 0.20   # fraction of balance per trade
+MIN_SHARES           = 5      # Polymarket minimum order size
+TICK_SIZE            = 0.01   # Polymarket price tick
 
 # ── Execution ──
 FILL_TIMEOUT         = 8      # seconds to wait for limit fill
@@ -711,25 +713,30 @@ class MakerBot:
         imb = signal["imbalance"]
         ofi = signal["ofi"]
 
-        # Determine entry price: post at best bid (maker)
+        # Determine entry price: post at best bid (maker), rounded to tick
         if side == "BUY":
-            entry_price = bb  # post at best bid
+            entry_price = math.floor(bb / TICK_SIZE) * TICK_SIZE  # round DOWN for bids
         else:
-            entry_price = ba  # post at best ask
+            entry_price = math.ceil(ba / TICK_SIZE) * TICK_SIZE   # round UP for asks
+        entry_price = round(entry_price, 2)  # fix float precision
 
-        if entry_price <= 0 or entry_price >= 1:
+        if entry_price <= 0.01 or entry_price >= 0.99:
             return
 
-        # Position sizing
+        # Position sizing — ensure we always get >= MIN_SHARES
         self.balance = get_usdc_balance() or self.balance
         if self.balance < MIN_BALANCE:
             return
 
         bet = min(BASE_BET, self.balance * BET_FRACTION, MAX_BET)
-        if bet < 2:
-            return
-
         shares = round(bet / entry_price, 2)
+
+        # Enforce minimum shares (Polymarket requires >= 5)
+        if shares < MIN_SHARES:
+            shares = MIN_SHARES
+            bet = shares * entry_price
+            if bet > self.balance - MIN_BALANCE:
+                return  # can't afford min shares
 
         crypto = market["crypto"]
         secs = (market["window_end"] - datetime.now(timezone.utc)).total_seconds()
@@ -834,14 +841,21 @@ class MakerBot:
         if exit_price > 0.99:
             exit_price = 0.99
 
+        # Enforce minimum shares for exit order
+        if shares < MIN_SHARES:
+            log(f"    ⚠ Only {shares:.1f}sh filled (min={MIN_SHARES}), "
+                f"will rely on stop-loss/timeout for exit")
+            return
+
         if DRY_RUN:
-            log(f"    🎯 DRY: exit limit sell @ {exit_price}")
+            log(f"    🎯 DRY: exit limit sell @ {exit_price} ({shares:.1f}sh)")
             return
 
         try:
+            exit_shares = round(shares, 2)
             order_args = OrderArgs(
                 price=exit_price,
-                size=shares,
+                size=exit_shares,
                 side=SELL,
                 token_id=token_id,
             )
@@ -850,7 +864,7 @@ class MakerBot:
             exit_oid = resp.get("orderID", "") if isinstance(resp, dict) else ""
 
             if exit_oid:
-                log(f"    🎯 Exit limit sell @ {exit_price}: {exit_oid[:16]}...")
+                log(f"    🎯 Exit limit sell @ {exit_price} ({exit_shares:.1f}sh): {exit_oid[:16]}...")
                 with self.pm._lock:
                     pos = self.pm.positions.get(token_id)
                     if pos:
@@ -866,6 +880,15 @@ class MakerBot:
         now = time.time()
 
         for token_id, pos in positions.items():
+            # CRITICAL: don't check exits until fill is confirmed
+            # (prevents race condition where SL triggers before fill monitor runs)
+            if pos["status"] not in ("filled",):
+                # Only force-cancel if the entry order has been sitting way too long
+                if now - pos["entry_time"] > FILL_TIMEOUT + 5:
+                    self.pm.close_position(token_id, pos["entry_price"], "stale_unfilled")
+                    log(f"    🗑 Removed stale unfilled position")
+                continue
+
             hold_time = now - pos["entry_time"]
             entry = pos["entry_price"]
 
@@ -907,6 +930,7 @@ class MakerBot:
 
             # Stop loss — market sell immediately
             if price_change <= -EXIT_STOP_LOSS:
+                log(f"    📉 SL trigger: mid={current_mid:.2f} entry={entry:.2f} Δ={price_change:+.3f}")
                 self._force_exit(token_id, pos, "stop_loss")
 
             # Timeout — market sell
@@ -931,20 +955,25 @@ class MakerBot:
 
             # Market sell remaining shares
             bal = get_share_balance(token_id) or 0
-            if bal > 0.5:
+            if bal >= MIN_SHARES:
                 try:
-                    from py_clob_client import MarketOrderArgs
-                    mo = MarketOrderArgs(
-                        token_id=token_id,
-                        amount=bal,
+                    # Use a limit sell at best_bid (still maker) for fast exit
+                    signal = self.tracker.get_signal(token_id)
+                    sell_price = round(signal["bb"], 2) if signal else round(pos["entry_price"] - EXIT_STOP_LOSS, 2)
+                    sell_price = max(sell_price, 0.01)
+                    order_args = OrderArgs(
+                        price=sell_price,
+                        size=round(bal, 2),
                         side=SELL,
-                        order_type=OrderType.FAK,
+                        token_id=token_id,
                     )
-                    signed = client.create_market_order(mo)
-                    client.post_order(signed, OrderType.FAK)
-                    log(f"    📤 Market sold {bal:.1f}sh")
+                    signed = client.create_order(order_args)
+                    resp = client.post_order(signed, OrderType.GTC)
+                    log(f"    📤 Exit sell {bal:.1f}sh @ {sell_price}")
                 except Exception as e:
                     log(f"    ⚠ Market sell error: {e}")
+            elif bal > 0:
+                log(f"    ⚠ {bal:.1f}sh < min {MIN_SHARES}, cannot sell (dust)")
 
         # Get approximate exit price from book
         signal = self.tracker.get_signal(token_id)
