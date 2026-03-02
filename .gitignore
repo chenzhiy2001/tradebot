@@ -25,3 +25,5 @@ btc80_trades.json
 theta_log.txt
 theta_trades.json
 theta_ticks.csv
+maker_log.txt
+maker_trades.json

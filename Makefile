@@ -115,6 +115,11 @@ theta_logs_backup:
 	zip -j -9 archives/theta_logs_$$(date +%Y%m%d_%H%M%S).zip theta_log.txt theta_trades.json theta_ticks.csv
 	rm -f theta_log.txt theta_trades.json theta_ticks.csv
 
+maker_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/maker_logs_$$(date +%Y%m%d_%H%M%S).zip maker_log.txt maker_trades.json
+	rm -f maker_log.txt maker_trades.json
+
 git_logs_backup:
 	git add .
 	git commit -m "backup logs"
