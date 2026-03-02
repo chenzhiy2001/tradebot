@@ -69,11 +69,12 @@ TICK_SIZE            = 0.01   # Polymarket price tick
 
 # ── Execution ──
 FILL_TIMEOUT         = 8      # seconds to wait for limit fill
+CANCEL_ADVERSE_MOVE  = 0.02   # cancel pending order if mid moves 2c against us
 EXIT_PROFIT_TARGET   = 0.02   # post limit sell at entry + this (2c)
-EXIT_STOP_LOSS       = 0.03   # market exit if price drops this much (3c)
-EXIT_TIMEOUT         = 30     # max hold seconds before forced exit
-COOLDOWN_PER_TOKEN   = 10     # don't re-enter same token for N seconds
-COOLDOWN_PER_MARKET  = 8      # don't re-enter same market for N seconds
+EXIT_STOP_LOSS       = 0.08   # wide SL: only for catastrophic moves (8c)
+EXIT_TIMEOUT         = 25     # main exit: sell at market after N seconds
+COOLDOWN_PER_TOKEN   = 12     # don't re-enter same token for N seconds
+COOLDOWN_PER_MARKET  = 10     # don't re-enter same market for N seconds
 WS_WARMUP           = 8       # seconds after WS connect before firing signals
 
 # ── Risk ──
@@ -786,14 +787,44 @@ class MakerBot:
     def _monitor_fill(self, token_id, order_id, entry_price, shares):
         """
         Monitor if our limit order gets filled.
-        If filled → post limit exit.
-        If timeout → cancel order.
+        Key anti-adverse-selection logic:
+          - Cancel order if mid moves against us before fill
+          - On fill, check if mid is still favorable before posting TP
+          - If fill detected but mid already blown, sell immediately
         """
         start = time.time()
         pre_bal = get_share_balance(token_id) or 0
 
         while time.time() - start < FILL_TIMEOUT:
-            time.sleep(0.5)
+            time.sleep(0.3)  # faster polling: 300ms
+
+            # ── ANTI-ADVERSE-SELECTION: cancel if price moved against us ──
+            signal = self.tracker.get_signal(token_id)
+            if signal:
+                mid = signal["mid"]
+                # If mid dropped below entry - threshold, cancel order
+                if mid < entry_price - CANCEL_ADVERSE_MOVE:
+                    log(f"    🛡 Cancel: mid={mid:.2f} < entry={entry_price:.2f} - {CANCEL_ADVERSE_MOVE}")
+                    try:
+                        client.cancel(order_id)
+                    except Exception:
+                        pass
+                    # Check if we got filled in the meantime
+                    bal = get_share_balance(token_id) or 0
+                    filled = bal - pre_bal
+                    if filled > 0.5:
+                        log(f"    ⚠ Adverse fill: {filled:.1f}sh, mid already at {mid:.2f}")
+                        with self.pm._lock:
+                            pos = self.pm.positions.get(token_id)
+                            if pos:
+                                pos["shares"] = filled
+                                pos["status"] = "filled"
+                        # Don't post a TP that won't fill — mark for timeout exit
+                        return
+                    else:
+                        self.pm.close_position(token_id, entry_price, "cancelled_adverse")
+                        log(f"    🛡 Cancelled before fill (adverse move)")
+                        return
 
             # Check if we have shares now
             bal = get_share_balance(token_id) or 0
@@ -807,6 +838,13 @@ class MakerBot:
                     if pos:
                         pos["shares"] = actual_shares
                         pos["status"] = "filled"
+
+                # Check if fill is still favorable
+                signal = self.tracker.get_signal(token_id)
+                if signal and signal["mid"] < entry_price - CANCEL_ADVERSE_MOVE:
+                    log(f"    ⚠ Fill is stale: mid={signal['mid']:.2f} vs entry={entry_price}")
+                    # Don't post TP — let timeout/SL handle it
+                    return
 
                 # Post exit order
                 self._post_exit(token_id, entry_price, actual_shares)
@@ -928,13 +966,16 @@ class MakerBot:
             if pos["side"] == "SELL":
                 price_change = -price_change
 
-            # Stop loss — market sell immediately
+            # Catastrophic stop loss only (8c) — safety net
             if price_change <= -EXIT_STOP_LOSS:
                 log(f"    📉 SL trigger: mid={current_mid:.2f} entry={entry:.2f} Δ={price_change:+.3f}")
                 self._force_exit(token_id, pos, "stop_loss")
 
-            # Timeout — market sell
+            # Primary exit: timeout — sell at market
+            # This is the MAIN exit mechanism. Signal says price should revert,
+            # so we hold for the full timeout and sell wherever mid is.
             elif hold_time > EXIT_TIMEOUT:
+                log(f"    ⏰ Timeout exit: mid={current_mid:.2f} entry={entry:.2f} Δ={price_change:+.3f}")
                 self._force_exit(token_id, pos, "timeout")
 
             # TP is handled by the limit exit order (passive)
