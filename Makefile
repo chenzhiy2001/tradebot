@@ -120,6 +120,11 @@ maker_logs_backup:
 	zip -j -9 archives/maker_logs_$$(date +%Y%m%d_%H%M%S).zip maker_log.txt maker_trades.json
 	rm -f maker_log.txt maker_trades.json
 
+strategy_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/strategy_logs_$$(date +%Y%m%d_%H%M%S).zip strategy_log.txt strategy_trades.json data.json strategy_perf.json
+	rm -f strategy_log.txt strategy_trades.json data.json strategy_perf.json
+
 git_logs_backup:
 	git add .
 	git commit -m "backup logs"

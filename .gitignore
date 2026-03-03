@@ -27,3 +27,7 @@ theta_trades.json
 theta_ticks.csv
 maker_log.txt
 maker_trades.json
+strategy_log.txt
+strategy_trades.json
+data.json
+strategy_perf.json
