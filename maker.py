@@ -1005,17 +1005,12 @@ class MakerBot:
         """Force exit via cancel + market sell."""
         log(f"    🚨 Force exit ({reason}): {token_id[:20]}...")
 
-        # Cancel any open exit order
-        if pos.get("exit_order_id"):
-            try:
-                client.cancel(pos["exit_order_id"])
-            except Exception:
-                pass
-
         if not DRY_RUN:
+            # Cancel ALL orders for this token (both entry and exit orders)
             cancel_all_orders(token_id)
+            time.sleep(1)  # wait for cancels to propagate
 
-            # Market sell remaining shares
+            # Check actual balance — TP exit may have already sold our shares
             bal = get_share_balance(token_id) or 0
             if bal >= MIN_SHARES:
                 try:
@@ -1136,7 +1131,7 @@ class MakerBot:
 
         # Sell ALL shares on ALL known tokens
         sold_any = False
-        for token_id in list(self._known_tokens) | set(self.token_to_market.keys()):
+        for token_id in set(self._known_tokens) | set(self.token_to_market.keys()):
             try:
                 bal = get_share_balance(token_id) or 0
             except Exception:
