@@ -825,7 +825,7 @@ class MakerBot:
                     bal = get_share_balance(token_id) or 0
                     if bal >= MIN_SHARES:
                         log(f"    ⚠ GHOST FILL DETECTED! {bal:.1f}sh from failed order — selling!")
-                        self._sell_shares_now(token_id, bal, reason="ghost_order_error")
+                        self._sell_all_shares(token_id, reason="ghost_order_error")
             except Exception:
                 pass  # ghost sweep will catch it later
 
@@ -901,9 +901,10 @@ class MakerBot:
                                 pos["status"] = "filled"
                         # Immediately sell — but NOT if shutting down (cleanup handles it)
                         if not self._shutting_down:
-                            self._sell_shares_now(token_id, filled, reason="adverse_fill")
+                            self._sell_all_shares(token_id, reason="adverse_fill")
                         else:
-                            log(f"    ⚠ Shutting down — skipping adverse sell, cleanup will handle")
+                            log(f"    ⚠ Shutting down — cleanup will handle {filled:.1f}sh")
+                        self.pm.close_position(token_id, mid, "adverse_fill")
                         return
                     else:
                         if not cancel_ok:
@@ -1087,45 +1088,11 @@ class MakerBot:
             # TP is handled by the limit exit order (passive)
 
     def _force_exit(self, token_id, pos, reason):
-        """Force exit via cancel + market sell."""
+        """Force exit via cancel + sell-with-retry."""
         log(f"    🚨 Force exit ({reason}): {token_id[:20]}...")
 
         if not DRY_RUN:
-            # Cancel ALL orders for this token (both entry and exit orders)
-            cancel_all_orders(token_id)
-            time.sleep(1)  # wait for cancels to propagate
-
-            # Check actual balance — TP exit may have already sold our shares
-            # Retry sell on failure (allowance/balance may need time to update)
-            sell_succeeded = False
-            for attempt in range(3):
-                bal = get_share_balance(token_id) or 0
-                if bal < MIN_SHARES:
-                    if bal > 0 and attempt == 0:
-                        log(f"    ⚠ {bal:.1f}sh < min {MIN_SHARES}, cannot sell (dust)")
-                    break  # no shares or dust
-
-                try:
-                    signal = self.tracker.get_signal(token_id)
-                    sell_price = round(signal["bb"], 2) if signal else round(pos["entry_price"] - EXIT_STOP_LOSS, 2)
-                    sell_price = max(sell_price, 0.01)
-                    order_args = OrderArgs(
-                        price=sell_price,
-                        size=round(bal, 2),
-                        side=SELL,
-                        token_id=token_id,
-                    )
-                    signed = client.create_order(order_args)
-                    resp = client.post_order(signed, OrderType.GTC)
-                    log(f"    📤 Exit sell {bal:.1f}sh @ {sell_price}")
-                    self._pending_sells[token_id] = time.time()
-                    sell_succeeded = True
-                    break
-                except Exception as e:
-                    log(f"    ⚠ Market sell error (attempt {attempt+1}): {e}")
-                    # Wait longer for allowance to update, then retry
-                    cancel_all_orders(token_id)  # re-cancel in case orders re-appeared
-                    time.sleep(2)
+            self._sell_all_shares(token_id, reason=reason)
 
         # Get approximate exit price from book
         signal = self.tracker.get_signal(token_id)
@@ -1136,126 +1103,96 @@ class MakerBot:
             log(f"    {'🛑' if trade['pnl'] < 0 else '💰'} Exit: "
                 f"pnl=${trade['pnl']:+.4f} hold={trade['hold_secs']:.1f}s ({reason})")
 
-    def _sell_shares_now(self, token_id, shares, reason="ghost"):
-        """Immediately sell shares at best bid. Used for adverse fills and ghost cleanup."""
-        # Don't sell during shutdown — cleanup handles everything
-        if self._shutting_down:
-            log(f"    ⚠ Shutting down — skipping _sell_shares_now ({reason}), cleanup handles it")
-            return
+    def _sell_all_shares(self, token_id, max_retries=8, reason="sell"):
+        """
+        THE core sell function. Retries until all shares are gone.
+        Polymarket runs on Polygon blockchain — operations are SLOW.
+        The ONLY reliable approach is: cancel → wait → check → sell @ 0.01 → repeat.
+        
+        Sells at 0.01 every time — on a CLOB this matches against best bids first
+        (acts as a market sell), so we always get the best available price.
+        
+        Returns total shares sold.
+        """
         if DRY_RUN:
-            log(f"    🧹 DRY: would sell {shares:.1f}sh ({reason})")
-            self.pm.close_position(token_id, 0, reason)
-            return
+            return 0
 
-        # Check if there's already a pending sell for this token (avoid self-sabotage)
-        pending_ts = self._pending_sells.get(token_id, 0)
-        if time.time() - pending_ts < 30:
-            log(f"    ⏳ Pending sell exists for {token_id[:16]} ({reason}), skipping")
-            return
-
-        # Cancel ALL BUY orders for this token first (frees locked shares)
-        # NOTE: We check for existing sell orders and avoid cancelling them
-        existing_sells = []
-        try:
-            open_orders = get_open_orders(token_id)
-            existing_sells = [o for o in open_orders if o.get("side") == "SELL"]
-            buy_orders = [o for o in open_orders if o.get("side") == "BUY"]
-            # Only cancel BUY orders to avoid killing our own pending sells
-            for bo in buy_orders:
-                try:
-                    client.cancel(bo.get("id", bo.get("orderID", "")))
-                except Exception:
-                    pass
-        except Exception:
-            # Fallback: cancel all for this token
+        total_sold = 0
+        for attempt in range(max_retries):
+            # Step 1: Cancel ALL orders for this token (frees locked shares)
             cancel_all_orders(token_id)
+            
+            # Step 2: Wait for blockchain to propagate
+            # First attempt: short wait. Later: longer waits.
+            wait = 2 if attempt == 0 else 3
+            time.sleep(wait)
 
-        # If there's already a SELL order posted, don't post another
-        if existing_sells:
-            log(f"    ⏳ Existing sell order found for {token_id[:16]} ({reason}), skipping")
-            self._pending_sells[token_id] = time.time()
-            return
+            # Step 3: Check actual balance
+            bal = get_share_balance(token_id) or 0
+            if bal < MIN_SHARES:
+                if bal > 0.5 and attempt == 0:
+                    log(f"    ⚠ {bal:.1f}sh dust on {token_id[:16]} (< min {MIN_SHARES})")
+                if total_sold > 0:
+                    log(f"    ✅ All shares sold for {token_id[:16]} ({total_sold:.1f}sh total, {attempt+1} attempts)")
+                return total_sold
 
-        time.sleep(1.5)  # CRITICAL: wait for cancel to propagate and unlock shares
+            # Step 4: Post sell at 0.01 (market sell — matches best bids first)
+            try:
+                order_args = OrderArgs(
+                    price=0.01,
+                    size=round(bal, 2),
+                    side=SELL,
+                    token_id=token_id,
+                )
+                signed = client.create_order(order_args)
+                resp = client.post_order(signed, OrderType.GTC)
+                log(f"    📤 Sell {bal:.1f}sh @ market ({reason}, attempt {attempt+1})")
+                total_sold += bal
+                self._pending_sells[token_id] = time.time()
+            except Exception as e:
+                log(f"    ⚠ Sell error ({reason}, attempt {attempt+1}): {e}")
+                # Don't give up — the balance/allowance index is slow
+                continue
 
-        # Re-check balance AFTER cancel propagation
+            # Step 5: Wait for sell to execute, then check if residual remains
+            time.sleep(3)
+            
+            # Check if shares remain (partial fill on GTC)
+            residual = get_share_balance(token_id) or 0
+            if residual < MIN_SHARES:
+                if total_sold > 0:
+                    log(f"    ✅ All shares sold for {token_id[:16]} ({total_sold:.1f}sh total, {attempt+1} attempts)")
+                return total_sold
+            else:
+                log(f"    ⚠ Residual {residual:.1f}sh after sell — retrying...")
+                # Loop back: cancel the partially-filled sell order, re-sell the rest
+
+        # Exhausted retries
         bal = get_share_balance(token_id) or 0
-        if bal < MIN_SHARES:
-            if bal > 0.5:
-                log(f"    ⚠ {bal:.1f}sh dust ({reason}), can't sell < {MIN_SHARES}")
-            self.pm.close_position(token_id, 0, reason)
-            return
-
-        sell_price = 0.01
-        try:
-            signal = self.tracker.get_signal(token_id)
-            sell_price = round(signal["bb"], 2) if signal else 0.01
-            sell_price = max(sell_price, 0.01)
-
-            order_args = OrderArgs(
-                price=sell_price,
-                size=round(bal, 2),
-                side=SELL,
-                token_id=token_id,
-            )
-            signed = client.create_order(order_args)
-            resp = client.post_order(signed, OrderType.GTC)
-            log(f"    🧹 Sold {bal:.1f}sh @ {sell_price} ({reason})")
-            # Track this pending sell to prevent ghost sweep self-sabotage
-            self._pending_sells[token_id] = time.time()
-            # Success — clear any previous failure count
-            self._ghost_fail_count.pop(token_id, None)
-        except Exception as e:
-            log(f"    ⚠ Sell error ({reason}): {e}")
-            # Track failure for backoff
-            self._ghost_fail_count[token_id] = self._ghost_fail_count.get(token_id, 0) + 1
-
-        self.pm.close_position(token_id, sell_price, reason)
+        if bal >= MIN_SHARES:
+            log(f"    ❌ FAILED to sell {bal:.1f}sh on {token_id[:16]} after {max_retries} attempts!")
+        return total_sold
 
     def _ghost_sweep(self):
         """
-        CRITICAL: Scan ALL tokens we've ever traded for unexpected share balances.
-        This catches shares from orders that the bot thinks it cancelled but actually filled.
-        Now also respects pending sell orders to avoid self-sabotage.
+        Scan ALL tokens we've ever traded for unexpected share balances.
+        Simple approach: if we find shares and don't have a tracked position, sell them.
         """
         if DRY_RUN:
             return
 
-        # Check all known tokens (ones we've posted orders for)
         positions = self.pm.get_positions()
-        self._sweep_count = getattr(self, '_sweep_count', 0) + 1
         now = time.time()
-
-        # Clean up expired pending sells (>60s old)
-        expired = [tid for tid, ts in self._pending_sells.items() if now - ts > 60]
-        for tid in expired:
-            del self._pending_sells[tid]
 
         for token_id in list(self._known_tokens):
             # Skip tokens we already have a tracked position for
             if token_id in positions:
                 continue
 
-            # CRITICAL: Skip tokens with a recent pending sell (prevents self-sabotage)
+            # Skip tokens with a recent pending sell (give it time to complete)
             pending_ts = self._pending_sells.get(token_id, 0)
-            if now - pending_ts < 30:
-                # But check if the sell order is actually still open
-                try:
-                    open_orders = get_open_orders(token_id)
-                    has_sell = any(o.get("side") == "SELL" for o in open_orders) if open_orders else False
-                    if has_sell:
-                        continue  # sell order still alive, don't interfere
-                    else:
-                        # Sell order filled or cancelled — clear pending and check balance
-                        log(f"    👻 Pending sell completed for {token_id[:16]}, checking residual...")
-                        del self._pending_sells[token_id]
-                except Exception:
-                    continue  # if can't check, better to skip
-
-            # Backoff: skip tokens that keep failing
-            fails = self._ghost_fail_count.get(token_id, 0)
-            if fails >= 2 and self._sweep_count % 6 != 0:
-                continue  # only retry every 30s after repeated failures
+            if now - pending_ts < 15:
+                continue
 
             try:
                 bal = get_share_balance(token_id) or 0
@@ -1263,24 +1200,10 @@ class MakerBot:
                 continue
 
             if bal >= MIN_SHARES:
-                # Double-check: is there already a sell order for this token?
-                try:
-                    open_orders = get_open_orders(token_id)
-                    has_sell = any(o.get("side") == "SELL" for o in open_orders) if open_orders else False
-                    if has_sell:
-                        log(f"    👻 Ghost {bal:.1f}sh on {token_id[:16]} but sell order exists, skipping")
-                        self._pending_sells[token_id] = now  # track it
-                        continue
-                except Exception:
-                    pass
-
                 log(f"    👻 GHOST: {bal:.1f}sh found on {token_id[:20]}... — selling!")
-                self._sell_shares_now(token_id, bal, reason="ghost_sweep")
+                self._sell_all_shares(token_id, reason="ghost_sweep")
             elif bal > 0.5:
                 log(f"    👻 Ghost dust: {bal:.1f}sh on {token_id[:20]}... (< min)")
-            elif bal < 0.1 and token_id in self._ghost_fail_count:
-                # Balance is 0 now — clear the failure counter
-                del self._ghost_fail_count[token_id]
 
     def _cleanup(self):
         """Cancel all orders and sell ALL held shares on shutdown."""
@@ -1289,56 +1212,39 @@ class MakerBot:
 
         log("  🧹 Cleanup: cancelling all open orders...")
         cancel_all_orders()
-        time.sleep(3)  # MUST wait long enough for:
-        # 1. Cancel to propagate server-side
-        # 2. Balance/allowance index to update
-        # 3. In-flight _monitor_fill threads to see _shutting_down and stop
+        time.sleep(3)  # wait for blockchain to propagate
 
-        # Sell ALL shares on ALL known tokens — THREE passes for reliability
-        sold_any = False
         all_tokens = set(self._known_tokens) | set(self.token_to_market.keys())
 
-        for pass_num in range(3):
-            if pass_num > 0:
-                # Re-cancel before each retry pass (threads may have posted new orders)
-                cancel_all_orders()
-                time.sleep(3)
-                log(f"  🧹 Cleanup pass {pass_num + 1}: re-checking all tokens...")
+        # Sell ALL shares on ALL known tokens — just use _sell_all_shares which retries
+        sold_any = False
+        for token_id in all_tokens:
+            try:
+                bal = get_share_balance(token_id) or 0
+            except Exception:
+                continue
 
-            for token_id in all_tokens:
-                try:
-                    bal = get_share_balance(token_id) or 0
-                except Exception:
-                    continue
+            if bal >= MIN_SHARES:
+                log(f"  🧹 Cleanup: {bal:.1f}sh on {token_id[:20]}...")
+                sold = self._sell_all_shares(token_id, max_retries=10, reason="cleanup")
+                if sold > 0:
+                    sold_any = True
+            elif bal > 0.5:
+                log(f"  ⚠ Cleanup: {bal:.1f}sh dust on {token_id[:20]}... (< min)")
 
+        # Final check after all sells propagate
+        time.sleep(3)
+        for token_id in all_tokens:
+            try:
+                bal = get_share_balance(token_id) or 0
                 if bal >= MIN_SHARES:
-                    log(f"  🧹 Cleanup: selling {bal:.1f}sh on {token_id[:20]}...")
-                    for sell_attempt in range(2):
-                        try:
-                            signal = self.tracker.get_signal(token_id)
-                            sell_price = round(signal["bb"], 2) if signal else 0.01
-                            sell_price = max(sell_price, 0.01)
-                            order_args = OrderArgs(
-                                price=sell_price,
-                                size=round(bal, 2),
-                                side=SELL,
-                                token_id=token_id,
-                            )
-                            signed = client.create_order(order_args)
-                            client.post_order(signed, OrderType.GTC)
-                            log(f"    📤 Sold {bal:.1f}sh @ {sell_price}")
-                            sold_any = True
-                            break  # success
-                        except Exception as e:
-                            log(f"    ⚠ Cleanup sell error (attempt {sell_attempt+1}): {e}")
-                            if sell_attempt == 0:
-                                cancel_all_orders(token_id)  # ensure orders are cancelled
-                                time.sleep(2)  # wait for allowance update
-                elif bal > 0.5:
-                    log(f"  ⚠ Cleanup: {bal:.1f}sh dust on {token_id[:20]}... (< min, can't sell)")
+                    log(f"  ⚠ STILL {bal:.1f}sh on {token_id[:20]} after cleanup!")
+                    self._sell_all_shares(token_id, max_retries=5, reason="cleanup_final")
+            except Exception:
+                continue
 
         if not sold_any:
-            log("  ✅ No ghost shares found")
+            log("  ✅ No shares to sell")
 
 
 # =========================================================================
