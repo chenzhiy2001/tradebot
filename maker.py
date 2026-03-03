@@ -932,8 +932,11 @@ class MakerBot:
 
                 # Re-check balance to get FINAL fill amount (including late chunks)
                 final_bal = get_share_balance(token_id) or 0
-                actual_shares = max(final_bal - pre_bal, bal - pre_bal)
-                log(f"    ✅ Filled: {actual_shares:.1f}sh @ {entry_price} (initial={bal - pre_bal:.1f}, final={final_bal - pre_bal:.1f})")
+                initial_fill = bal - pre_bal
+                final_fill = final_bal - pre_bal
+                # Use final (more recent) read, capped at ordered amount to avoid stale inflation
+                actual_shares = min(final_fill, shares) if final_fill >= MIN_SHARES else min(initial_fill, shares)
+                log(f"    ✅ Filled: {actual_shares:.1f}sh @ {entry_price} (initial={initial_fill:.1f}, final={final_fill:.1f}, ordered={shares:.1f})")
 
                 # Update position with actual fills
                 with self.pm._lock:
@@ -995,7 +998,10 @@ class MakerBot:
             return
 
         try:
-            exit_shares = round(shares, 2)
+            exit_shares = math.floor(shares * 100) / 100  # Round DOWN — never exceed actual balance
+            if exit_shares < MIN_SHARES:
+                log(f"    ⚠ {shares:.4f}sh rounds down to {exit_shares} (< min), skipping exit order")
+                return
             order_args = OrderArgs(
                 price=exit_price,
                 size=exit_shares,
@@ -1138,16 +1144,20 @@ class MakerBot:
 
             # Step 4: Post sell at 0.01 (market sell — matches best bids first)
             try:
+                sell_size = math.floor(bal * 100) / 100  # Round DOWN — never exceed actual balance
+                if sell_size < MIN_SHARES:
+                    log(f"    ⚠ {bal:.4f}sh rounds down to {sell_size} (< min {MIN_SHARES}), skipping")
+                    return total_sold
                 order_args = OrderArgs(
                     price=0.01,
-                    size=round(bal, 2),
+                    size=sell_size,
                     side=SELL,
                     token_id=token_id,
                 )
                 signed = client.create_order(order_args)
                 resp = client.post_order(signed, OrderType.GTC)
-                log(f"    📤 Sell {bal:.1f}sh @ market ({reason}, attempt {attempt+1})")
-                total_sold += bal
+                log(f"    📤 Sell {sell_size:.2f}sh @ market ({reason}, attempt {attempt+1})")
+                total_sold += sell_size
                 self._pending_sells[token_id] = time.time()
             except Exception as e:
                 log(f"    ⚠ Sell error ({reason}, attempt {attempt+1}): {e}")
