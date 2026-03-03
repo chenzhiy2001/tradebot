@@ -70,8 +70,9 @@ TICK_SIZE            = 0.01   # Polymarket price tick
 # ── Execution ──
 FILL_TIMEOUT         = 8      # seconds to wait for limit fill
 CANCEL_ADVERSE_MOVE  = 0.02   # cancel pending order if mid moves 2c against us
-CANCEL_VERIFY_DELAY  = 1.0    # seconds to wait after cancel before checking fills
-CANCEL_VERIFY_RETRIES = 3     # number of balance checks after cancel
+CANCEL_VERIFY_DELAY  = 2.0    # seconds to wait after cancel before checking fills
+CANCEL_VERIFY_RETRIES = 5     # number of balance checks after cancel
+CANCEL_VERIFY_RETRIES_SHORT = 2  # quick check when cancel succeeded (partial fill only)
 EXIT_PROFIT_TARGET   = 0.02   # post limit sell at entry + this (2c)
 EXIT_STOP_LOSS       = 0.08   # wide SL: only for catastrophic moves (8c)
 EXIT_TIMEOUT         = 25     # main exit: sell at market after N seconds
@@ -137,14 +138,25 @@ def get_share_balance(token_id):
 
 
 def cancel_all_orders(token_id=None):
-    """Cancel open orders using native CLOB API."""
+    """Cancel open orders using native CLOB API. Returns True if cancel request was accepted."""
     try:
         if token_id:
             client.cancel_market_orders(asset_id=token_id)
         else:
             client.cancel_all()
+        return True
+    except Exception as e:
+        log(f"  ⚠ cancel_all_orders failed: {e}")
+        return False
+
+
+def get_open_orders(token_id=None):
+    """Get open orders for a token. Returns list of order dicts."""
+    try:
+        params = OpenOrderParams(asset_id=token_id) if token_id else None
+        return client.get_orders(params)
     except Exception:
-        pass
+        return []
 
 
 # =========================================================================
@@ -584,6 +596,7 @@ class MakerBot:
         self.balance = 0
         self._known_tokens = set()  # all tokens we've ever posted orders for
         self._ghost_fail_count = {}  # backoff tracker for ghost sell failures
+        self._pending_sells = {}     # token_id -> timestamp of last sell order posted
 
     def run(self):
         log(f"{'=' * 60}")
@@ -814,14 +827,42 @@ class MakerBot:
                 # If mid dropped below entry - threshold, cancel order
                 if mid < entry_price - CANCEL_ADVERSE_MOVE:
                     log(f"    🛡 Cancel: mid={mid:.2f} < entry={entry_price:.2f} - {CANCEL_ADVERSE_MOVE}")
+
+                    # Try cancel — CHECK RESPONSE to know if it worked
+                    cancel_ok = False
                     try:
-                        client.cancel(order_id)
+                        resp = client.cancel(order_id)
+                        cancel_ok = True
+                        log(f"    🛡 Cancel accepted by server")
+                    except Exception as e:
+                        log(f"    ⚠ Cancel FAILED (order likely already filled): {e}")
+
+                    # Belt & suspenders: also use cancel_market_orders
+                    cancel_all_orders(token_id)
+
+                    # Determine verify window based on cancel result:
+                    #   - Cancel FAILED → order was filled → use long window (must find shares)
+                    #   - Cancel OK → might have partial fills → shorter window OK
+                    retries = CANCEL_VERIFY_RETRIES if not cancel_ok else CANCEL_VERIFY_RETRIES_SHORT
+
+                    # Also check order status via get_orders for reliability
+                    order_still_open = False
+                    try:
+                        open_orders = get_open_orders(token_id)
+                        order_still_open = any(
+                            o.get("id") == order_id or o.get("orderID") == order_id
+                            for o in open_orders
+                        ) if open_orders else False
+                        if order_still_open:
+                            log(f"    ⚠ Order STILL OPEN after cancel! Retrying...")
+                            cancel_all_orders(token_id)
+                            retries = CANCEL_VERIFY_RETRIES  # use long window
                     except Exception:
                         pass
-                    # CRITICAL: wait and RETRY balance check — API has latency!
-                    # Single check was causing ghost positions (shares arrive after check)
+
+                    # Wait and RETRY balance check — API has severe latency (5+s)
                     filled = 0
-                    for retry in range(CANCEL_VERIFY_RETRIES):
+                    for retry in range(retries):
                         time.sleep(CANCEL_VERIFY_DELAY)
                         bal = get_share_balance(token_id) or 0
                         filled = bal - pre_bal
@@ -829,7 +870,7 @@ class MakerBot:
                             break
 
                     if filled > 0.5:
-                        log(f"    ⚠ Adverse fill detected: {filled:.1f}sh (retry), mid={mid:.2f}")
+                        log(f"    ⚠ Adverse fill detected: {filled:.1f}sh (retry {retry+1}), mid={mid:.2f}")
                         with self.pm._lock:
                             pos = self.pm.positions.get(token_id)
                             if pos:
@@ -839,8 +880,14 @@ class MakerBot:
                         self._sell_shares_now(token_id, filled, reason="adverse_fill")
                         return
                     else:
-                        self.pm.close_position(token_id, entry_price, "cancelled_adverse")
-                        log(f"    🛡 Cancelled before fill (adverse move)")
+                        if not cancel_ok:
+                            # Cancel failed but no shares found — very suspicious!
+                            # Don't close position yet, let ghost sweep handle it
+                            log(f"    ⚠ Cancel failed + no shares found — ghost sweep will catch")
+                            self.pm.close_position(token_id, entry_price, "cancelled_suspicious")
+                        else:
+                            self.pm.close_position(token_id, entry_price, "cancelled_adverse")
+                            log(f"    🛡 Cancelled before fill (adverse move)")
                         return
 
             # Check if we have shares now
@@ -850,10 +897,12 @@ class MakerBot:
                 log(f"    ✅ Filled: {actual_shares:.1f}sh @ {entry_price}")
 
                 # CRITICAL: Cancel remaining BUY order to prevent more ghost fills
+                # Use BOTH cancel methods for maximum reliability
                 try:
                     client.cancel(order_id)
                 except Exception:
                     pass
+                cancel_all_orders(token_id)  # belt & suspenders: cancel ALL for this token
 
                 # Update position with actual fills
                 with self.pm._lock:
@@ -924,6 +973,8 @@ class MakerBot:
 
             if exit_oid:
                 log(f"    🎯 Exit limit sell @ {exit_price} ({exit_shares:.1f}sh): {exit_oid[:16]}...")
+                # Track pending sell to prevent ghost sweep interference
+                self._pending_sells[token_id] = time.time()
                 with self.pm._lock:
                     pos = self.pm.positions.get(token_id)
                     if pos:
@@ -1027,6 +1078,8 @@ class MakerBot:
                     signed = client.create_order(order_args)
                     resp = client.post_order(signed, OrderType.GTC)
                     log(f"    📤 Exit sell {bal:.1f}sh @ {sell_price}")
+                    # Track pending sell to prevent ghost sweep interference
+                    self._pending_sells[token_id] = time.time()
                 except Exception as e:
                     log(f"    ⚠ Market sell error: {e}")
             elif bal > 0:
@@ -1048,8 +1101,35 @@ class MakerBot:
             self.pm.close_position(token_id, 0, reason)
             return
 
-        # Cancel ALL orders for this token first (frees locked shares)
-        cancel_all_orders(token_id)
+        # Check if there's already a pending sell for this token (avoid self-sabotage)
+        pending_ts = self._pending_sells.get(token_id, 0)
+        if time.time() - pending_ts < 30:
+            log(f"    ⏳ Pending sell exists for {token_id[:16]} ({reason}), skipping")
+            return
+
+        # Cancel ALL BUY orders for this token first (frees locked shares)
+        # NOTE: We check for existing sell orders and avoid cancelling them
+        existing_sells = []
+        try:
+            open_orders = get_open_orders(token_id)
+            existing_sells = [o for o in open_orders if o.get("side") == "SELL"]
+            buy_orders = [o for o in open_orders if o.get("side") == "BUY"]
+            # Only cancel BUY orders to avoid killing our own pending sells
+            for bo in buy_orders:
+                try:
+                    client.cancel(bo.get("id", bo.get("orderID", "")))
+                except Exception:
+                    pass
+        except Exception:
+            # Fallback: cancel all for this token
+            cancel_all_orders(token_id)
+
+        # If there's already a SELL order posted, don't post another
+        if existing_sells:
+            log(f"    ⏳ Existing sell order found for {token_id[:16]} ({reason}), skipping")
+            self._pending_sells[token_id] = time.time()
+            return
+
         time.sleep(1.5)  # CRITICAL: wait for cancel to propagate and unlock shares
 
         # Re-check balance AFTER cancel propagation
@@ -1075,6 +1155,8 @@ class MakerBot:
             signed = client.create_order(order_args)
             resp = client.post_order(signed, OrderType.GTC)
             log(f"    🧹 Sold {bal:.1f}sh @ {sell_price} ({reason})")
+            # Track this pending sell to prevent ghost sweep self-sabotage
+            self._pending_sells[token_id] = time.time()
             # Success — clear any previous failure count
             self._ghost_fail_count.pop(token_id, None)
         except Exception as e:
@@ -1088,6 +1170,7 @@ class MakerBot:
         """
         CRITICAL: Scan ALL tokens we've ever traded for unexpected share balances.
         This catches shares from orders that the bot thinks it cancelled but actually filled.
+        Now also respects pending sell orders to avoid self-sabotage.
         """
         if DRY_RUN:
             return
@@ -1095,11 +1178,33 @@ class MakerBot:
         # Check all known tokens (ones we've posted orders for)
         positions = self.pm.get_positions()
         self._sweep_count = getattr(self, '_sweep_count', 0) + 1
+        now = time.time()
+
+        # Clean up expired pending sells (>60s old)
+        expired = [tid for tid, ts in self._pending_sells.items() if now - ts > 60]
+        for tid in expired:
+            del self._pending_sells[tid]
 
         for token_id in list(self._known_tokens):
             # Skip tokens we already have a tracked position for
             if token_id in positions:
                 continue
+
+            # CRITICAL: Skip tokens with a recent pending sell (prevents self-sabotage)
+            pending_ts = self._pending_sells.get(token_id, 0)
+            if now - pending_ts < 30:
+                # But check if the sell order is actually still open
+                try:
+                    open_orders = get_open_orders(token_id)
+                    has_sell = any(o.get("side") == "SELL" for o in open_orders) if open_orders else False
+                    if has_sell:
+                        continue  # sell order still alive, don't interfere
+                    else:
+                        # Sell order filled or cancelled — clear pending and check balance
+                        log(f"    👻 Pending sell completed for {token_id[:16]}, checking residual...")
+                        del self._pending_sells[token_id]
+                except Exception:
+                    continue  # if can't check, better to skip
 
             # Backoff: skip tokens that keep failing
             fails = self._ghost_fail_count.get(token_id, 0)
@@ -1112,6 +1217,17 @@ class MakerBot:
                 continue
 
             if bal >= MIN_SHARES:
+                # Double-check: is there already a sell order for this token?
+                try:
+                    open_orders = get_open_orders(token_id)
+                    has_sell = any(o.get("side") == "SELL" for o in open_orders) if open_orders else False
+                    if has_sell:
+                        log(f"    👻 Ghost {bal:.1f}sh on {token_id[:16]} but sell order exists, skipping")
+                        self._pending_sells[token_id] = now  # track it
+                        continue
+                except Exception:
+                    pass
+
                 log(f"    👻 GHOST: {bal:.1f}sh found on {token_id[:20]}... — selling!")
                 self._sell_shares_now(token_id, bal, reason="ghost_sweep")
             elif bal > 0.5:
@@ -1127,36 +1243,41 @@ class MakerBot:
 
         log("  🧹 Cleanup: cancelling all open orders...")
         cancel_all_orders()
-        time.sleep(1)  # let cancels propagate
+        time.sleep(2)  # let cancels propagate (balance API has 3-5s latency)
 
-        # Sell ALL shares on ALL known tokens
+        # Sell ALL shares on ALL known tokens — do TWO passes for late-arriving shares
         sold_any = False
-        for token_id in set(self._known_tokens) | set(self.token_to_market.keys()):
-            try:
-                bal = get_share_balance(token_id) or 0
-            except Exception:
-                continue
+        for pass_num in range(2):
+            if pass_num == 1:
+                time.sleep(3)  # extra wait for balance API to catch up
+                log("  🧹 Cleanup pass 2: checking for late shares...")
 
-            if bal >= MIN_SHARES:
-                log(f"  🧹 Cleanup: selling {bal:.1f}sh on {token_id[:20]}...")
+            for token_id in set(self._known_tokens) | set(self.token_to_market.keys()):
                 try:
-                    signal = self.tracker.get_signal(token_id)
-                    sell_price = round(signal["bb"], 2) if signal else 0.01
-                    sell_price = max(sell_price, 0.01)
-                    order_args = OrderArgs(
-                        price=sell_price,
-                        size=round(bal, 2),
-                        side=SELL,
-                        token_id=token_id,
-                    )
-                    signed = client.create_order(order_args)
-                    client.post_order(signed, OrderType.GTC)
-                    log(f"    📤 Sold {bal:.1f}sh @ {sell_price}")
-                    sold_any = True
-                except Exception as e:
-                    log(f"    ⚠ Cleanup sell error: {e}")
-            elif bal > 0.5:
-                log(f"  ⚠ Cleanup: {bal:.1f}sh dust on {token_id[:20]}... (< min, can't sell)")
+                    bal = get_share_balance(token_id) or 0
+                except Exception:
+                    continue
+
+                if bal >= MIN_SHARES:
+                    log(f"  🧹 Cleanup: selling {bal:.1f}sh on {token_id[:20]}...")
+                    try:
+                        signal = self.tracker.get_signal(token_id)
+                        sell_price = round(signal["bb"], 2) if signal else 0.01
+                        sell_price = max(sell_price, 0.01)
+                        order_args = OrderArgs(
+                            price=sell_price,
+                            size=round(bal, 2),
+                            side=SELL,
+                            token_id=token_id,
+                        )
+                        signed = client.create_order(order_args)
+                        client.post_order(signed, OrderType.GTC)
+                        log(f"    📤 Sold {bal:.1f}sh @ {sell_price}")
+                        sold_any = True
+                    except Exception as e:
+                        log(f"    ⚠ Cleanup sell error: {e}")
+                elif bal > 0.5:
+                    log(f"  ⚠ Cleanup: {bal:.1f}sh dust on {token_id[:20]}... (< min, can't sell)")
 
         if not sold_any:
             log("  ✅ No ghost shares found")
