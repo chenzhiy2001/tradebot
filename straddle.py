@@ -442,10 +442,12 @@ class StraddlePosition:
         self.up_shares = 0.0
         self.down_shares = 0.0
         self.cancelled = False
+        self.unfilled_cancelled = False  # True once we cancelled the unfilled side
         self.resolved = False
         self.outcome = None       # "Up" or "Down"
         self.pnl = 0.0
         self.created_at = time.time()
+        self._both_logged = False  # prevent spamming "BOTH FILLED"
 
     @property
     def both_filled(self):
@@ -726,23 +728,26 @@ class StraddleBot:
             return
 
         # Check fill status by querying share balance
-        if not pos.up_filled:
-            bal = get_share_balance(market["up_token"])
-            if bal is not None and bal >= 1.0:  # At least 1 share filled
+        # Keep updating share counts even after initial fill detection,
+        # because partial fills may accumulate over time.
+        up_bal = get_share_balance(market["up_token"])
+        if up_bal is not None and up_bal >= 1.0:
+            if not pos.up_filled:
                 pos.up_filled = True
-                pos.up_shares = bal
-                log(f"     ✓ Up FILLED: {bal:.1f}sh @ {pos.price} "
+                log(f"     ✓ Up FILLED: {up_bal:.1f}sh @ {pos.price} "
                     f"({market['crypto']} {market['question'][:35]})")
+            pos.up_shares = up_bal  # always update to latest balance
 
-        if not pos.down_filled:
-            bal = get_share_balance(market["down_token"])
-            if bal is not None and bal >= 1.0:
+        dn_bal = get_share_balance(market["down_token"])
+        if dn_bal is not None and dn_bal >= 1.0:
+            if not pos.down_filled:
                 pos.down_filled = True
-                pos.down_shares = bal
-                log(f"     ✓ Down FILLED: {bal:.1f}sh @ {pos.price} "
+                log(f"     ✓ Down FILLED: {dn_bal:.1f}sh @ {pos.price} "
                     f"({market['crypto']} {market['question'][:35]})")
+            pos.down_shares = dn_bal
 
-        if pos.both_filled:
+        if pos.both_filled and not pos._both_logged:
+            pos._both_logged = True
             profit = pos.up_shares + pos.down_shares - pos.cost
             log(f"  🎯 BOTH FILLED! {market['crypto']} guaranteed profit: "
                 f"${profit:.2f} (cost ${pos.cost:.2f})")
@@ -758,8 +763,9 @@ class StraddleBot:
                 pos.cancelled = True
                 self.positions.remove(pos)
                 return
-            # One filled — can't cancel, ride it out
-            if pos.one_filled:
+            # One filled — cancel the unfilled side once
+            if pos.one_filled and not pos.unfilled_cancelled:
+                pos.unfilled_cancelled = True
                 self._cancel_unfilled_side(pos)
 
         # After window ends: resolve
