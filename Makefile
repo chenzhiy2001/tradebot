@@ -125,6 +125,11 @@ strategy_logs_backup:
 	zip -j -9 archives/strategy_logs_$$(date +%Y%m%d_%H%M%S).zip strategy_log.txt strategy_trades.json data.json strategy_perf.json
 	rm -f strategy_log.txt strategy_trades.json data.json strategy_perf.json
 
+straddle_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/straddle_logs_$$(date +%Y%m%d_%H%M%S).zip straddle_log.txt straddle_trades.json
+	rm -f straddle_log.txt straddle_trades.json
+
 git_logs_backup:
 	git add .
 	git commit -m "backup logs"

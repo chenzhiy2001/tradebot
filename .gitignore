@@ -31,3 +31,5 @@ strategy_log.txt
 strategy_trades.json
 data.json
 strategy_perf.json
+straddle_log.txt
+straddle_trades.json
