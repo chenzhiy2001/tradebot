@@ -56,11 +56,11 @@ DRY_RUN = "--dry-run" in sys.argv
 # STRATEGY PARAMETERS
 # =========================================================================
 MIN_WHALE_SIZE = 1000         # Minimum accumulated $ to count as a whale trade
-BUY_AMOUNT = 25               # Our bet size per copy-trade ($)
+BUY_AMOUNT = 50               # Our bet size per copy-trade ($)
 MIN_BET = 3                   # Minimum viable bet
 ACCUM_WINDOW = 15             # Seconds to accumulate fragments from same wallet+token
 COOLDOWN_SECS = 30            # Don't re-enter same market within this window
-MAX_POSITIONS = 4             # Max concurrent positions
+MAX_POSITIONS = 6             # Max concurrent positions
 MAX_PER_WINDOW = 2            # Max new entries per 5-min window
 MAX_RISK_PCT = 0.80           # Don't risk more than 80% of balance
 
@@ -721,32 +721,36 @@ class WhaleBot:
             self._record_close(our_token, our_pos, cp, "WHALE_SELL")
             return
 
-        try:
-            actual_bal = get_share_balance(our_token)
-            if not actual_bal or actual_bal < 0.5:
-                log(f"     ⚠ No shares to sell (balance={actual_bal})")
-                self._record_close(our_token, our_pos, our_pos["entry_price"], "WHALE_SELL_EMPTY")
+        actual_bal = get_share_balance(our_token)
+        if not actual_bal or actual_bal < 0.5:
+            log(f"     ⚠ No shares to sell (balance={actual_bal})")
+            self._record_close(our_token, our_pos, our_pos["entry_price"], "WHALE_SELL_EMPTY")
+            return
+
+        sell_amt = math.floor(actual_bal * 100) / 100
+        for attempt in range(1, 4):
+            try:
+                mo = MarketOrderArgs(
+                    token_id=our_token,
+                    amount=sell_amt,
+                    side=SELL,
+                    order_type=OrderType.FAK,
+                )
+                signed = client.create_market_order(mo)
+                resp = client.post_order(signed, OrderType.FAK)
+
+                cp = get_price(our_token, side=SELL)
+                if cp <= 0:
+                    cp = sell_price
+                pnl = (cp * sell_amt) - our_pos["cost"]
+                log(f"     ✓ Sold {sell_amt:.1f}sh @ ~{cp:.2f} (P&L: ${pnl:+.2f})")
+                self._record_close(our_token, our_pos, cp, "WHALE_SELL")
                 return
 
-            sell_amt = math.floor(actual_bal * 100) / 100
-            mo = MarketOrderArgs(
-                token_id=our_token,
-                amount=sell_amt,
-                side=SELL,
-                order_type=OrderType.FAK,
-            )
-            signed = client.create_market_order(mo)
-            resp = client.post_order(signed, OrderType.FAK)
-
-            cp = get_price(our_token, side=SELL)
-            if cp <= 0:
-                cp = sell_price
-            pnl = (cp * sell_amt) - our_pos["cost"]
-            log(f"     ✓ Sold {sell_amt:.1f}sh @ ~{cp:.2f} (P&L: ${pnl:+.2f})")
-            self._record_close(our_token, our_pos, cp, "WHALE_SELL")
-
-        except Exception as e:
-            log(f"     ✗ Sell failed: {e}")
+            except Exception as e:
+                log(f"     ✗ Sell attempt {attempt}/3 failed: {e}")
+                if attempt < 3:
+                    time.sleep(1)
 
     # ─── EXECUTE BUY ─────────────────────────────────────────────────
 
