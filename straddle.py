@@ -70,12 +70,13 @@ SHARES_PER_SIDE = 15           # Shares to order per side
 MAX_PAIRS = 2                  # Max simultaneous market pairs
 MAX_TOTAL_RISK = 25.0          # Max USDC locked across all open orders
 
-# ── Volatility → price mapping ──
-# At each vol regime, what limit price to use for both sides
-# profit_per_pair = 1 - 2 * price (assumes symmetric pricing)
-DEFAULT_PRICE = 0.35           # Fallback if vol estimation fails
-MIN_LIMIT_PRICE = 0.15        # Never go below 15¢ (too unlikely to fill)
-MAX_LIMIT_PRICE = 0.42        # Never go above 42¢ (too little profit)
+# ── Volatility → spread mapping ──
+# Spread = how far below current token price to place limit buy orders
+# Higher vol → wider spread → cheaper orders → more profit per pair
+DEFAULT_SPREAD = 0.12          # Fallback spread if vol estimation fails
+MIN_SPREAD = 0.04              # Minimum spread below current price
+MAX_SPREAD = 0.35              # Maximum spread below current price
+MIN_LIMIT_PRICE = 0.05        # Floor: never place orders below 5¢
 MIN_EXPECTED_MOVE = 0.0008    # Skip if expected 5min move < 0.08% (too calm)
 
 # How far into the window to keep trying to fill
@@ -150,6 +151,16 @@ def get_share_balance(token_id):
             )
         )
         return float(ba.get("balance", 0)) / 1e6
+    except Exception:
+        return None
+
+
+def get_token_mid_price(token_id):
+    """Get current mid price from CLOB."""
+    try:
+        data = client.get_midpoint(token_id)
+        mid = float(data.get("mid", 0))
+        return mid if mid > 0 else None
     except Exception:
         return None
 
@@ -336,6 +347,14 @@ def discover_next_window():
                                    if "up" in o.lower()), 0)
                     down_idx = 1 - up_idx
 
+                    # Current token prices from Gamma API
+                    outcome_prices = json.loads(m.get("outcomePrices", "[]"))
+                    try:
+                        up_mid = float(outcome_prices[up_idx]) if len(outcome_prices) > up_idx else None
+                        down_mid = float(outcome_prices[down_idx]) if len(outcome_prices) > down_idx else None
+                    except (ValueError, TypeError):
+                        up_mid = down_mid = None
+
                     markets.append({
                         "condition_id": condition_id,
                         "question": m.get("question", ""),
@@ -348,6 +367,8 @@ def discover_next_window():
                         "tokens": tokens,
                         "up_token": tokens[up_idx],
                         "down_token": tokens[down_idx],
+                        "up_mid": up_mid,
+                        "down_mid": down_mid,
                     })
             except Exception as e:
                 log(f"  ⚠ Market fetch {slug}: {e}")
@@ -358,53 +379,49 @@ def discover_next_window():
 # =========================================================================
 # VOLATILITY → ORDER PRICE MAPPING
 # =========================================================================
-def compute_limit_price(vol_per_sqrt_sec, interval_secs=300):
-    """Map realized volatility to optimal limit order price.
+def compute_spread(vol_per_sqrt_sec, interval_secs=300):
+    """Map realized volatility to spread below current token price.
     
-    The key relationship:
-    - Expected 5-min move = σ × √300
-    - Higher vol → price tokens swing wider → our low-price limits fill more often
-    - We want to set prices where P(both fill) × profit > P(one fill) × loss
+    Spread = how many cents below the current token price to place our limit buy.
+    Higher vol → wider spread → cheaper order → more profit if both fill.
     
-    Empirical calibration (from Polymarket 5m crypto markets):
-    - vol 3e-5 (~0.05%/5min): very calm, tokens barely move → need tight prices (0.44)
-    - vol 7e-5 (~0.12%/5min): normal, moderate swings → medium prices (0.38)
-    - vol 1.5e-4 (~0.26%/5min): volatile, wide swings → wide prices (0.28)
-    - vol 3e-4 (~0.52%/5min): extreme volatility → aggressive prices (0.18)
+    The token price swings are driven by crypto price moves:
+    - Expected 5-min crypto move = σ × √300
+    - Token price roughly tracks probability of up/down outcome
+    - Higher crypto vol → wider token price swings → can place orders further away
     """
     if vol_per_sqrt_sec is None:
-        return DEFAULT_PRICE
+        return DEFAULT_SPREAD
 
     expected_move = vol_per_sqrt_sec * math.sqrt(interval_secs)
 
     # Linear interpolation between vol levels
-    # Format: (expected_move_pct, limit_price)
+    # Format: (expected_crypto_move, spread_below_current)
     breakpoints = [
-        (0.0003, 0.45),   # Nearly flat → tight spread, small profit
-        (0.0008, 0.42),   # Calm
-        (0.0015, 0.38),   # Normal
-        (0.0025, 0.33),   # Active
-        (0.0040, 0.28),   # Volatile
-        (0.0060, 0.22),   # Very volatile
-        (0.0100, 0.15),   # Extreme → widest spread
+        (0.0008, 0.05),   # Calm → 5¢ below current
+        (0.0015, 0.10),   # Normal → 10¢ below
+        (0.0025, 0.15),   # Active → 15¢ below
+        (0.0040, 0.22),   # Volatile → 22¢ below
+        (0.0060, 0.30),   # Very volatile → 30¢ below
+        (0.0100, 0.40),   # Extreme → 40¢ below
     ]
 
     # Clamp
     if expected_move <= breakpoints[0][0]:
-        return min(MAX_LIMIT_PRICE, breakpoints[0][1])
+        return MIN_SPREAD
     if expected_move >= breakpoints[-1][0]:
-        return max(MIN_LIMIT_PRICE, breakpoints[-1][1])
+        return MAX_SPREAD
 
     # Linear interpolation
     for i in range(len(breakpoints) - 1):
-        m0, p0 = breakpoints[i]
-        m1, p1 = breakpoints[i + 1]
+        m0, s0 = breakpoints[i]
+        m1, s1 = breakpoints[i + 1]
         if m0 <= expected_move <= m1:
             t = (expected_move - m0) / (m1 - m0)
-            price = p0 + t * (p1 - p0)
-            return round(max(MIN_LIMIT_PRICE, min(MAX_LIMIT_PRICE, price)), 2)
+            spread = s0 + t * (s1 - s0)
+            return round(max(MIN_SPREAD, min(MAX_SPREAD, spread)), 2)
 
-    return DEFAULT_PRICE
+    return DEFAULT_SPREAD
 
 
 def should_skip_trend(momentum, vol_per_sqrt_sec, interval_secs=300):
@@ -431,9 +448,10 @@ def should_skip_trend(momentum, vol_per_sqrt_sec, interval_secs=300):
 class StraddlePosition:
     """Tracks a dual-order position on one market."""
 
-    def __init__(self, market, price, shares):
+    def __init__(self, market, up_price, down_price, shares):
         self.market = market
-        self.price = price
+        self.up_price = up_price      # limit buy price for Up token
+        self.down_price = down_price  # limit buy price for Down token
         self.shares = shares
         self.up_order_id = None
         self.down_order_id = None
@@ -465,20 +483,20 @@ class StraddlePosition:
     def cost(self):
         cost = 0
         if self.up_filled:
-            cost += self.up_shares * self.price
+            cost += self.up_shares * self.up_price
         if self.down_filled:
-            cost += self.down_shares * self.price
+            cost += self.down_shares * self.down_price
         return cost
 
     @property
     def guaranteed_profit(self):
-        """Profit per share if both sides filled."""
-        return 1.0 - 2 * self.price
+        """Profit per share-pair if both sides filled."""
+        return 1.0 - self.up_price - self.down_price
 
     def status_str(self):
-        up = f"Up={'✓' if self.up_filled else '○'}"
-        dn = f"Dn={'✓' if self.down_filled else '○'}"
-        return f"{self.market['crypto']} {up} {dn} @{self.price} ({self.market['question'][:40]})"
+        up = f"Up={'✓' if self.up_filled else '○'}@{self.up_price:.2f}"
+        dn = f"Dn={'✓' if self.down_filled else '○'}@{self.down_price:.2f}"
+        return f"{self.market['crypto']} {up} {dn} ({self.market['question'][:40]})"
 
 
 # =========================================================================
@@ -503,7 +521,7 @@ class StraddleBot:
         log(f"\n{'='*60}")
         log(f"Straddle bot {'(DRY RUN) ' if DRY_RUN else ''}started")
         log(f"Shares/side: {SHARES_PER_SIDE}, Max pairs: {MAX_PAIRS}")
-        log(f"Price range: {MIN_LIMIT_PRICE}-{MAX_LIMIT_PRICE}, Default: {DEFAULT_PRICE}")
+        log(f"Spread range: {MIN_SPREAD}-{MAX_SPREAD}, Default: {DEFAULT_SPREAD}")
         log(f"Vol lookback: {VOL_LOOKBACK_MINUTES}min, Trend threshold: {TREND_THRESHOLD}σ")
         log(f"{'='*60}\n")
 
@@ -627,11 +645,38 @@ class StraddleBot:
                 continue
 
             # Compute order price from vol
-            limit_price = compute_limit_price(vol)
+            spread = compute_spread(vol)
+
+            # Get current token prices from CLOB
+            up_mid = get_token_mid_price(market["up_token"])
+            down_mid = get_token_mid_price(market["down_token"])
+
+            # Fall back to Gamma API prices
+            if up_mid is None:
+                up_mid = market.get("up_mid")
+            if down_mid is None:
+                down_mid = market.get("down_mid")
+
+            if up_mid is None or down_mid is None:
+                log(f"  ⊘ {crypto.upper()}: can't get current token prices")
+                continue
+
+            # Place limit buys BELOW current token prices
+            up_limit = round(max(MIN_LIMIT_PRICE, up_mid - spread), 2)
+            down_limit = round(max(MIN_LIMIT_PRICE, down_mid - spread), 2)
+
+            # Safety: total cost must < $1 for profit to exist
+            if up_limit + down_limit >= 0.95:
+                log(f"  ⊘ {crypto.upper()}: spread too tight "
+                    f"(Up@{up_limit}+Dn@{down_limit}={up_limit+down_limit:.2f}≥0.95)")
+                self._traded_epochs.add(key)
+                continue
+
+            profit_if_both = (1.0 - up_limit - down_limit) * SHARES_PER_SIDE
 
             # Check risk: both sides' capital will be locked when orders are placed
-            pair_cost = 2 * SHARES_PER_SIDE * limit_price
-            locked_capital = sum(2 * p.shares * p.price for p in self.positions)
+            pair_cost = SHARES_PER_SIDE * (up_limit + down_limit)
+            locked_capital = sum(p.shares * (p.up_price + p.down_price) for p in self.positions)
             if locked_capital + pair_cost > MAX_TOTAL_RISK:
                 log(f"  ⊘ {crypto.upper()}: capital limit "
                     f"(${locked_capital + pair_cost:.0f} > ${MAX_TOTAL_RISK:.0f})")
@@ -643,13 +688,15 @@ class StraddleBot:
             log(f"\n  📊 {crypto.upper()} window {window_start.strftime('%H:%M')}-{window_end.strftime('%H:%M')}")
             log(f"     Vol: σ/√s={vol:.2e} ({expected_move*100:.3f}%/5min, {n_samples} samples)")
             log(f"     Momentum: {disp_mom}")
-            log(f"     → Limit price: {limit_price:.2f} (profit if both fill: ${(1-2*limit_price)*SHARES_PER_SIDE:.2f})")
+            log(f"     Token mid: Up={up_mid:.2f} Down={down_mid:.2f}")
+            log(f"     → Spread: {spread:.2f} → Buy Up@{up_limit:.2f} Down@{down_limit:.2f}")
+            log(f"     → Profit if both fill: ${profit_if_both:.2f}")
 
             # Place orders
-            pos = StraddlePosition(market, limit_price, SHARES_PER_SIDE)
+            pos = StraddlePosition(market, up_limit, down_limit, SHARES_PER_SIDE)
 
             if DRY_RUN:
-                log(f"     [DRY RUN] Would place {SHARES_PER_SIDE}sh @ {limit_price} on both sides")
+                log(f"     [DRY RUN] Would place {SHARES_PER_SIDE}sh Up@{up_limit:.2f} Down@{down_limit:.2f}")
                 pos.up_order_id = "dry-up"
                 pos.down_order_id = "dry-down"
                 self.positions.append(pos)
@@ -659,14 +706,14 @@ class StraddleBot:
             try:
                 up_order = OrderArgs(
                     token_id=market["up_token"],
-                    price=limit_price,
+                    price=up_limit,
                     size=SHARES_PER_SIDE,
                     side=BUY,
                 )
                 signed = client.create_order(up_order)
                 resp = client.post_order(signed, OrderType.GTC)
                 pos.up_order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
-                log(f"     ✓ Up order placed (id: {pos.up_order_id[:12]})")
+                log(f"     ✓ Up order placed @ {up_limit:.2f} (id: {pos.up_order_id[:12]})")
             except Exception as e:
                 log(f"     ✗ Up order failed: {e}")
                 continue
@@ -675,14 +722,14 @@ class StraddleBot:
             try:
                 dn_order = OrderArgs(
                     token_id=market["down_token"],
-                    price=limit_price,
+                    price=down_limit,
                     size=SHARES_PER_SIDE,
                     side=BUY,
                 )
                 signed = client.create_order(dn_order)
                 resp = client.post_order(signed, OrderType.GTC)
                 pos.down_order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
-                log(f"     ✓ Down order placed (id: {pos.down_order_id[:12]})")
+                log(f"     ✓ Down order placed @ {down_limit:.2f} (id: {pos.down_order_id[:12]})")
             except Exception as e:
                 log(f"     ✗ Down order failed: {e}")
                 # Cancel the Up order since we couldn't complete the pair
@@ -715,11 +762,11 @@ class StraddleBot:
             if pct_elapsed >= 0.3 and not pos.up_filled:
                 pos.up_filled = True
                 pos.up_shares = pos.shares
-                log(f"     [DRY] Up filled: {pos.shares}sh @ {pos.price}")
+                log(f"     [DRY] Up filled: {pos.shares}sh @ {pos.up_price}")
             if pct_elapsed >= 0.5 and not pos.down_filled:
                 pos.down_filled = True
                 pos.down_shares = pos.shares
-                log(f"     [DRY] Down filled: {pos.shares}sh @ {pos.price}")
+                log(f"     [DRY] Down filled: {pos.shares}sh @ {pos.down_price}")
             if pct_elapsed >= 1.0:
                 # Resolve
                 import random
@@ -734,7 +781,7 @@ class StraddleBot:
         if up_bal is not None and up_bal >= 1.0:
             if not pos.up_filled:
                 pos.up_filled = True
-                log(f"     ✓ Up FILLED: {up_bal:.1f}sh @ {pos.price} "
+                log(f"     ✓ Up FILLED: {up_bal:.1f}sh @ {pos.up_price} "
                     f"({market['crypto']} {market['question'][:35]})")
             pos.up_shares = up_bal  # always update to latest balance
 
@@ -742,7 +789,7 @@ class StraddleBot:
         if dn_bal is not None and dn_bal >= 1.0:
             if not pos.down_filled:
                 pos.down_filled = True
-                log(f"     ✓ Down FILLED: {dn_bal:.1f}sh @ {pos.price} "
+                log(f"     ✓ Down FILLED: {dn_bal:.1f}sh @ {pos.down_price} "
                     f"({market['crypto']} {market['question'][:35]})")
             pos.down_shares = dn_bal
 
@@ -848,18 +895,18 @@ class StraddleBot:
             result = "BOTH"
         elif pos.up_filled:
             if won_up:
-                pnl = pos.up_shares - pos.up_shares * pos.price  # $1/share - cost
+                pnl = pos.up_shares - pos.up_shares * pos.up_price  # $1/share - cost
                 self.single_wins += 1
             else:
-                pnl = -pos.up_shares * pos.price  # Total loss
+                pnl = -pos.up_shares * pos.up_price  # Total loss
             self.single_fills += 1
             result = f"UP-only ({'won' if won_up else 'lost'})"
         elif pos.down_filled:
             if not won_up:
-                pnl = pos.down_shares - pos.down_shares * pos.price
+                pnl = pos.down_shares - pos.down_shares * pos.down_price
                 self.single_wins += 1
             else:
-                pnl = -pos.down_shares * pos.price
+                pnl = -pos.down_shares * pos.down_price
             self.single_fills += 1
             result = f"DN-only ({'won' if not won_up else 'lost'})"
         else:
@@ -889,7 +936,8 @@ class StraddleBot:
             "crypto": pos.market["crypto"],
             "question": pos.market["question"],
             "slug": pos.market["slug"],
-            "price": pos.price,
+            "up_price": pos.up_price,
+            "down_price": pos.down_price,
             "shares": pos.shares,
             "up_filled": pos.up_filled,
             "down_filled": pos.down_filled,
