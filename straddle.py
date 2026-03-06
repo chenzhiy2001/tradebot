@@ -66,19 +66,17 @@ CRYPTOS = ["btc", "eth", "sol", "xrp"]
 INTERVALS = [5]                # 5-min markets
 
 # ── Strategy params ──
-SHARES_PER_SIDE = 15           # Shares to order per side
-MAX_PAIRS = 2                  # Max simultaneous market pairs
-MAX_TOTAL_RISK = 25.0          # Max USDC locked across all open orders
+BET_AMOUNT = 40.0              # USDC per side
+MAX_PAIRS = 4                  # Max simultaneous market pairs
+MAX_TOTAL_RISK = 85.0          # Max USDC locked across all open orders
+TARGET_ROI = 0.01              # Target ≥1% profit per pair (actual ~2% due to rounding)
 
-# ── Volatility → spread mapping ──
-# Spread = how far below current token price to place limit buy orders
-# Higher vol → wider spread → cheaper orders → more profit per pair
-DEFAULT_SPREAD = 0.12          # Fallback spread if vol estimation fails
-MIN_SPREAD = 0.08              # Minimum spread below current price
-MAX_SPREAD = 0.35              # Maximum spread below current price
+# ── Pricing ──
+# Place limit buys 1¢ below each token's mid price
+# Both sides near 0.50 → buy at 0.49/0.49 → sum 0.98 → 2% ROI
 MIN_LIMIT_PRICE = 0.05        # Floor: never place orders below 5¢
-MAX_TOKEN_SKEW = 0.60         # Skip if either token > 60¢ (market already moved)
-MIN_EXPECTED_MOVE = 0.0008    # Skip if expected 5min move < 0.08% (too calm)
+MAX_TOKEN_SKEW = 0.55         # Skip if either token > 55¢ (want near 50/50)
+MIN_EXPECTED_MOVE = 0.0001    # Basically allow all vol levels
 
 # How far into the window to keep trying to fill
 CANCEL_UNFILLED_PCT = 0.80    # Cancel unfilled orders after 80% of window
@@ -91,7 +89,7 @@ MIN_VOL_SAMPLES = 30          # Need at least this many samples before trading
 
 # ── Trend detection ──
 TREND_LOOKBACK_MINUTES = 5    # Recent momentum window
-TREND_THRESHOLD = 2.0         # Skip if |momentum| > TREND_THRESHOLD × σ
+TREND_THRESHOLD = 10.0        # Effectively disabled — tight spreads work regardless
 
 # Data files
 LOG_FILE = "straddle_log.txt"
@@ -514,9 +512,8 @@ class StraddleBot:
     def run(self):
         log(f"\n{'='*60}")
         log(f"Straddle bot {'(DRY RUN) ' if DRY_RUN else ''}started")
-        log(f"Shares/side: {SHARES_PER_SIDE}, Max pairs: {MAX_PAIRS}")
-        log(f"Spread range: {MIN_SPREAD}-{MAX_SPREAD}, Default: {DEFAULT_SPREAD}")
-        log(f"Vol lookback: {VOL_LOOKBACK_MINUTES}min, Trend threshold: {TREND_THRESHOLD}σ")
+        log(f"Bet/side: ${BET_AMOUNT}, Max pairs: {MAX_PAIRS}, Target ROI: {TARGET_ROI*100:.0f}%")
+        log(f"Max risk: ${MAX_TOTAL_RISK}, Max skew: {MAX_TOKEN_SKEW}")
         log(f"{'='*60}\n")
 
         balance = get_usdc_balance()
@@ -614,32 +611,6 @@ class StraddleBot:
             if secs_to_start > 120:  # Too far in the future
                 continue
 
-            # Check volatility
-            vol, n_samples = self.binance.get_volatility(crypto)
-            if vol is None:
-                continue
-
-            expected_move = vol * math.sqrt(300)
-
-            # Skip if volatility too low — strategy needs price to swing both ways
-            if expected_move < MIN_EXPECTED_MOVE:
-                self._traded_epochs.add(key)
-                log(f"  ⊘ {crypto.upper()}: vol too low "
-                    f"({expected_move*100:.3f}% < {MIN_EXPECTED_MOVE*100:.3f}%), skipping")
-                continue
-
-            # Check trend
-            momentum, _ = self.binance.get_momentum(crypto)
-            if should_skip_trend(momentum, vol):
-                trend_σ = abs(momentum) / expected_move if expected_move > 0 else 0
-                log(f"  ⊘ {crypto.upper()}: trend too strong "
-                    f"({momentum*100:+.3f}% = {trend_σ:.1f}σ), skipping")
-                self._traded_epochs.add(key)
-                continue
-
-            # Compute order price from vol
-            spread = compute_spread(vol)
-
             # Get current token prices from CLOB
             up_mid = get_token_mid_price(market["up_token"])
             down_mid = get_token_mid_price(market["down_token"])
@@ -654,49 +625,57 @@ class StraddleBot:
                 log(f"  ⊘ {crypto.upper()}: can't get current token prices")
                 continue
 
-            # Skip if tokens already diverged — means market has moved, one side is expensive
+            # Skip if tokens already diverged — want near 50/50 for both to fill
             if up_mid > MAX_TOKEN_SKEW or down_mid > MAX_TOKEN_SKEW:
                 log(f"  ⊘ {crypto.upper()}: tokens skewed "
                     f"(Up={up_mid:.2f} Down={down_mid:.2f}, max={MAX_TOKEN_SKEW})")
                 self._traded_epochs.add(key)
                 continue
 
-            # Place limit buys BELOW current token prices
-            up_limit = round(max(MIN_LIMIT_PRICE, up_mid - spread), 2)
-            down_limit = round(max(MIN_LIMIT_PRICE, down_mid - spread), 2)
+            # Compute prices: place 1¢ below each mid for ~1-2% profit
+            mid_sum = up_mid + down_mid
+            target_sum = 1.0 / (1.0 + TARGET_ROI)
+            ratio = up_mid / mid_sum if mid_sum > 0 else 0.5
+            up_limit = math.floor(target_sum * ratio * 100) / 100
+            down_limit = math.floor(target_sum * (1 - ratio) * 100) / 100
+            up_limit = max(MIN_LIMIT_PRICE, up_limit)
+            down_limit = max(MIN_LIMIT_PRICE, down_limit)
 
-            # Safety: total cost must < $1 for profit to exist
-            if up_limit + down_limit >= 0.95:
-                log(f"  ⊘ {crypto.upper()}: spread too tight "
-                    f"(Up@{up_limit}+Dn@{down_limit}={up_limit+down_limit:.2f}≥0.95)")
+            actual_sum = up_limit + down_limit
+            if actual_sum >= 1.0:
+                log(f"  ⊘ {crypto.upper()}: no profit margin "
+                    f"(Up@{up_limit}+Dn@{down_limit}={actual_sum:.2f}≥1.00)")
                 self._traded_epochs.add(key)
                 continue
 
-            profit_if_both = (1.0 - up_limit - down_limit) * SHARES_PER_SIDE
+            actual_roi = (1.0 - actual_sum) / actual_sum
+            shares_per_side = round(BET_AMOUNT / max(up_limit, down_limit), 0)
+            profit_if_both = (1.0 - actual_sum) * shares_per_side
 
-            # Check risk: both sides' capital will be locked when orders are placed
-            pair_cost = SHARES_PER_SIDE * (up_limit + down_limit)
+            # Check risk: both sides' capital will be locked
+            pair_cost = shares_per_side * actual_sum
             locked_capital = sum(p.shares * (p.up_price + p.down_price) for p in self.positions)
             if locked_capital + pair_cost > MAX_TOTAL_RISK:
                 log(f"  ⊘ {crypto.upper()}: capital limit "
                     f"(${locked_capital + pair_cost:.0f} > ${MAX_TOTAL_RISK:.0f})")
                 continue
 
+            # Optional: log vol info if available
+            vol, n_samples = self.binance.get_volatility(crypto)
+            vol_str = f"{vol*math.sqrt(300)*100:.3f}%" if vol else "?"
+
             self._traded_epochs.add(key)
 
-            disp_mom = f"{momentum*100:+.3f}%" if momentum else "?"
             log(f"\n  📊 {crypto.upper()} window {window_start.strftime('%H:%M')}-{window_end.strftime('%H:%M')}")
-            log(f"     Vol: σ/√s={vol:.2e} ({expected_move*100:.3f}%/5min, {n_samples} samples)")
-            log(f"     Momentum: {disp_mom}")
-            log(f"     Token mid: Up={up_mid:.2f} Down={down_mid:.2f}")
-            log(f"     → Spread: {spread:.2f} → Buy Up@{up_limit:.2f} Down@{down_limit:.2f}")
-            log(f"     → Profit if both fill: ${profit_if_both:.2f}")
+            log(f"     Token mid: Up={up_mid:.2f} Down={down_mid:.2f} (vol={vol_str})")
+            log(f"     → Buy Up@{up_limit:.2f} Down@{down_limit:.2f} (sum={actual_sum:.2f}, ROI={actual_roi*100:.1f}%)")
+            log(f"     → {shares_per_side:.0f}sh/side, profit if both fill: ${profit_if_both:.2f}")
 
             # Place orders
-            pos = StraddlePosition(market, up_limit, down_limit, SHARES_PER_SIDE)
+            pos = StraddlePosition(market, up_limit, down_limit, shares_per_side)
 
             if DRY_RUN:
-                log(f"     [DRY RUN] Would place {SHARES_PER_SIDE}sh Up@{up_limit:.2f} Down@{down_limit:.2f}")
+                log(f"     [DRY RUN] Would place {shares_per_side:.0f}sh Up@{up_limit:.2f} Down@{down_limit:.2f}")
                 pos.up_order_id = "dry-up"
                 pos.down_order_id = "dry-down"
                 self.positions.append(pos)
@@ -707,7 +686,7 @@ class StraddleBot:
                 up_order = OrderArgs(
                     token_id=market["up_token"],
                     price=up_limit,
-                    size=SHARES_PER_SIDE,
+                    size=shares_per_side,
                     side=BUY,
                 )
                 signed = client.create_order(up_order)
@@ -723,7 +702,7 @@ class StraddleBot:
                 dn_order = OrderArgs(
                     token_id=market["down_token"],
                     price=down_limit,
-                    size=SHARES_PER_SIDE,
+                    size=shares_per_side,
                     side=BUY,
                 )
                 signed = client.create_order(dn_order)
