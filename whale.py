@@ -56,7 +56,7 @@ DRY_RUN = "--dry-run" in sys.argv
 # STRATEGY PARAMETERS
 # =========================================================================
 MIN_WHALE_SIZE = 1000         # Minimum accumulated $ to count as a whale trade
-BUY_AMOUNT = 15               # Our bet size per copy-trade ($)
+BUY_AMOUNT = 25               # Our bet size per copy-trade ($)
 MIN_BET = 3                   # Minimum viable bet
 ACCUM_WINDOW = 15             # Seconds to accumulate fragments from same wallet+token
 COOLDOWN_SECS = 30            # Don't re-enter same market within this window
@@ -173,56 +173,66 @@ class MarketCache:
         now = datetime.now(timezone.utc)
 
         for interval in INTERVALS:
+            # Current window
             aligned = (now.minute // interval) * interval
-            window_start = now.replace(minute=aligned, second=0, microsecond=0)
-            window_end = window_start + timedelta(minutes=interval)
-            epoch = int(window_start.timestamp())
+            current_start = now.replace(minute=aligned, second=0, microsecond=0)
 
-            for crypto in CRYPTOS:
-                slug = f"{crypto}-updown-{interval}m-{epoch}"
-                try:
-                    resp = requests.get(f"{GAMMA_API}/events/slug/{slug}", timeout=10)
-                    if resp.status_code != 200:
-                        continue
-                    event = resp.json()
-                    for m in event.get("markets", []):
-                        if m.get("closed"):
+            # Cache previous, current, and next windows to avoid misses at boundaries
+            offsets = [
+                current_start - timedelta(minutes=interval),  # previous
+                current_start,                                 # current
+                current_start + timedelta(minutes=interval),   # next
+            ]
+
+            for window_start in offsets:
+                window_end = window_start + timedelta(minutes=interval)
+                epoch = int(window_start.timestamp())
+
+                for crypto in CRYPTOS:
+                    slug = f"{crypto}-updown-{interval}m-{epoch}"
+                    try:
+                        resp = requests.get(f"{GAMMA_API}/events/slug/{slug}", timeout=10)
+                        if resp.status_code != 200:
                             continue
-                        condition_id = m.get("conditionId", "")
-                        tokens = json.loads(m.get("clobTokenIds", "[]"))
-                        outcomes = json.loads(m.get("outcomes", "[]"))
-                        if len(tokens) != 2 or len(outcomes) != 2:
-                            continue
+                        event = resp.json()
+                        for m in event.get("markets", []):
+                            if m.get("closed"):
+                                continue
+                            condition_id = m.get("conditionId", "")
+                            tokens = json.loads(m.get("clobTokenIds", "[]"))
+                            outcomes = json.loads(m.get("outcomes", "[]"))
+                            if len(tokens) != 2 or len(outcomes) != 2:
+                                continue
 
-                        up_idx = next((i for i, o in enumerate(outcomes) if "up" in o.lower()), 0)
-                        down_idx = 1 - up_idx
+                            up_idx = next((i for i, o in enumerate(outcomes) if "up" in o.lower()), 0)
+                            down_idx = 1 - up_idx
 
-                        market_info = {
-                            "condition_id": condition_id,
-                            "question": m.get("question", ""),
-                            "crypto": crypto.upper(),
-                            "interval": interval,
-                            "slug": slug,
-                            "epoch": epoch,
-                            "window_start": window_start,
-                            "window_end": window_end,
-                            "tokens": tokens,
-                            "up_token": tokens[up_idx],
-                            "down_token": tokens[down_idx],
-                            "up_idx": up_idx,
-                            "down_idx": down_idx,
-                        }
-                        markets[condition_id] = market_info
-
-                        for idx, tok in enumerate(tokens):
-                            side_name = "Up" if idx == up_idx else "Down"
-                            token_map[tok] = {
+                            market_info = {
                                 "condition_id": condition_id,
-                                "side": side_name,
-                                "token_id": tok,
+                                "question": m.get("question", ""),
+                                "crypto": crypto.upper(),
+                                "interval": interval,
+                                "slug": slug,
+                                "epoch": epoch,
+                                "window_start": window_start,
+                                "window_end": window_end,
+                                "tokens": tokens,
+                                "up_token": tokens[up_idx],
+                                "down_token": tokens[down_idx],
+                                "up_idx": up_idx,
+                                "down_idx": down_idx,
                             }
-                except Exception as e:
-                    log(f"  ⚠ Market fetch {slug}: {e}")
+                            markets[condition_id] = market_info
+
+                            for idx, tok in enumerate(tokens):
+                                side_name = "Up" if idx == up_idx else "Down"
+                                token_map[tok] = {
+                                    "condition_id": condition_id,
+                                    "side": side_name,
+                                    "token_id": tok,
+                                }
+                    except Exception as e:
+                        log(f"  ⚠ Market fetch {slug}: {e}")
 
         with self._lock:
             self._cache = markets
@@ -984,6 +994,7 @@ class WhaleBot:
                 pnl = -cost
                 log(f"\n  ❌ LOST: {pos['market_info']['question']}")
 
+            self._session_trades += 1
             self._session_pnl += pnl
             log(f"     {pos['side']} @ {entry_price:.2f} → P&L: ${pnl:+.2f} "
                 f"(whale: {pos.get('wallet_name', '?')})")
