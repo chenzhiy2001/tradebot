@@ -58,12 +58,12 @@ DRY_RUN = "--dry-run" in sys.argv
 MIN_WHALE_SIZE = 1000         # Minimum accumulated $ to count as a whale trade
 BUY_AMOUNT = 50               # Our bet size per copy-trade ($)
 MIN_BET = 3                   # Minimum viable bet
-MIN_ENTRY_PRICE = 0.50        # Skip entries below this price (avoid coinflip gambles)
+MIN_ENTRY_PRICE = 0.80        # Skip entries below this price (high-conviction bets only)
 ACCUM_WINDOW = 15             # Seconds to accumulate fragments from same wallet+token
 COOLDOWN_SECS = 30            # Don't re-enter same market within this window
 MAX_POSITIONS = 6             # Max concurrent positions
 MAX_PER_WINDOW = 2            # Max new entries per 5-min window
-MAX_RISK_PCT = 0.80           # Don't risk more than 80% of balance
+MAX_RISK_PCT = 0.95           # Don't risk more than 95% of balance
 
 # Anti market-maker: if wallet trades both sides within this window, ignore
 MM_DETECT_WINDOW = 60         # Seconds
