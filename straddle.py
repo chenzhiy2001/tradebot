@@ -74,9 +74,10 @@ MAX_TOTAL_RISK = 25.0          # Max USDC locked across all open orders
 # Spread = how far below current token price to place limit buy orders
 # Higher vol → wider spread → cheaper orders → more profit per pair
 DEFAULT_SPREAD = 0.12          # Fallback spread if vol estimation fails
-MIN_SPREAD = 0.04              # Minimum spread below current price
+MIN_SPREAD = 0.08              # Minimum spread below current price
 MAX_SPREAD = 0.35              # Maximum spread below current price
 MIN_LIMIT_PRICE = 0.05        # Floor: never place orders below 5¢
+MAX_TOKEN_SKEW = 0.60         # Skip if either token > 60¢ (market already moved)
 MIN_EXPECTED_MOVE = 0.0008    # Skip if expected 5min move < 0.08% (too calm)
 
 # How far into the window to keep trying to fill
@@ -301,7 +302,8 @@ class BinanceFeed:
 # MARKET DISCOVERY
 # =========================================================================
 def discover_next_window():
-    """Find the NEXT 5-min crypto market window (not yet started or just started).
+    """Find the NEXT 5-min crypto market window that hasn't started yet.
+    We ONLY target future windows so tokens are still near 50/50.
     Returns list of market dicts or empty list."""
     now = datetime.now(timezone.utc)
     markets = []
@@ -312,18 +314,10 @@ def discover_next_window():
         current_start = now.replace(minute=aligned, second=0, microsecond=0)
         current_end = current_start + timedelta(minutes=interval)
 
-        # How far into the current window?
-        elapsed = (now - current_start).total_seconds()
-        total = interval * 60
-
-        # If early enough in current window, use it
-        if elapsed < total * 0.15:  # First 15% of window
-            target_start = current_start
-            target_end = current_end
-        else:
-            # Next window
-            target_start = current_end
-            target_end = target_start + timedelta(minutes=interval)
+        # Always target the NEXT window (not the current one)
+        # Once a window opens, tokens diverge from 50/50 quickly
+        target_start = current_end
+        target_end = target_start + timedelta(minutes=interval)
 
         epoch = int(target_start.timestamp())
 
@@ -613,12 +607,11 @@ class StraddleBot:
             window_start = market["window_start"]
             window_end = market["window_end"]
             secs_to_start = (window_start - now).total_seconds()
-            secs_to_end = (window_end - now).total_seconds()
 
-            # Only enter if window is about to start or just started
-            if secs_to_end < MIN_WINDOW_SECS:
+            # Place orders up to 2 min before window opens, but not if it already opened
+            if secs_to_start < -5:  # Window already opened > 5s ago
                 continue
-            if secs_to_start > 60:  # Don't place orders more than 60s early
+            if secs_to_start > 120:  # Too far in the future
                 continue
 
             # Check volatility
@@ -659,6 +652,13 @@ class StraddleBot:
 
             if up_mid is None or down_mid is None:
                 log(f"  ⊘ {crypto.upper()}: can't get current token prices")
+                continue
+
+            # Skip if tokens already diverged — means market has moved, one side is expensive
+            if up_mid > MAX_TOKEN_SKEW or down_mid > MAX_TOKEN_SKEW:
+                log(f"  ⊘ {crypto.upper()}: tokens skewed "
+                    f"(Up={up_mid:.2f} Down={down_mid:.2f}, max={MAX_TOKEN_SKEW})")
+                self._traded_epochs.add(key)
                 continue
 
             # Place limit buys BELOW current token prices
