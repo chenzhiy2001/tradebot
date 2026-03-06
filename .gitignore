@@ -33,3 +33,6 @@ data.json
 strategy_perf.json
 straddle_log.txt
 straddle_trades.json
+whale_log.txt
+whale_trades.json
+whale_perf.json

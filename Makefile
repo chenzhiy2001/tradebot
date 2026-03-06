@@ -130,6 +130,11 @@ straddle_logs_backup:
 	zip -j -9 archives/straddle_logs_$$(date +%Y%m%d_%H%M%S).zip straddle_log.txt straddle_trades.json
 	rm -f straddle_log.txt straddle_trades.json
 
+whale_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/whale_logs_$$(date +%Y%m%d_%H%M%S).zip whale_log.txt whale_trades.json whale_perf.json
+	rm -f whale_log.txt whale_trades.json whale_perf.json
+
 git_logs_backup:
 	git add .
 	git commit -m "backup logs"
