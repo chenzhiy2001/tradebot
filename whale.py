@@ -641,9 +641,6 @@ class WhaleBot:
 
         now_utc = datetime.now(timezone.utc)
         secs_left = (market_info["window_end"] - now_utc).total_seconds()
-        if secs_left < 30:
-            log(f"     ⊘ Skip: only {secs_left:.0f}s left in window")
-            return
 
         if condition_id in self.cooldowns and time.time() < self.cooldowns[condition_id]:
             remaining = self.cooldowns[condition_id] - time.time()
@@ -804,87 +801,90 @@ class WhaleBot:
             self.cooldowns[condition_id] = time.time() + COOLDOWN_SECS
             return True
 
-        try:
-            mo = MarketOrderArgs(
-                token_id=token_id,
-                amount=amount,
-                side=BUY,
-                order_type=OrderType.FAK,
-            )
-            signed = client.create_market_order(mo)
-            resp = client.post_order(signed, OrderType.FAK)
+        for attempt in range(1, 4):
+            try:
+                mo = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=amount,
+                    side=BUY,
+                    order_type=OrderType.FAK,
+                )
+                signed = client.create_market_order(mo)
+                resp = client.post_order(signed, OrderType.FAK)
 
-            actual_shares = 0
-            actual_cost = amount
-            if isinstance(resp, dict):
-                taking = resp.get("takingAmount", "0")
-                making = resp.get("makingAmount", "0")
-                try:
-                    actual_shares = float(taking) if taking else 0
-                except (ValueError, TypeError):
-                    actual_shares = 0
-                try:
-                    filled_cost = float(making) if making else 0
-                    if filled_cost > 0:
-                        actual_cost = filled_cost
-                except (ValueError, TypeError):
-                    pass
-
-            if actual_shares <= 0:
-                actual_shares = amount / current_price if current_price > 0 else 0
+                actual_shares = 0
                 actual_cost = amount
+                if isinstance(resp, dict):
+                    taking = resp.get("takingAmount", "0")
+                    making = resp.get("makingAmount", "0")
+                    try:
+                        actual_shares = float(taking) if taking else 0
+                    except (ValueError, TypeError):
+                        actual_shares = 0
+                    try:
+                        filled_cost = float(making) if making else 0
+                        if filled_cost > 0:
+                            actual_cost = filled_cost
+                    except (ValueError, TypeError):
+                        pass
 
-            time.sleep(1)
-            on_chain = get_share_balance(token_id)
-            if on_chain and on_chain > 0.5:
-                actual_shares = on_chain
+                if actual_shares <= 0:
+                    actual_shares = amount / current_price if current_price > 0 else 0
+                    actual_cost = amount
 
-            self.positions[token_id] = {
-                "token_id": token_id,
-                "condition_id": condition_id,
-                "side": side,
-                "entry_price": current_price,
-                "shares": actual_shares,
-                "cost": actual_cost,
-                "entry_time": time.time(),
-                "wallet_addr": wallet_addr,
-                "wallet_name": wallet_name,
-                "market_info": {
-                    "question": market_info["question"],
+                time.sleep(1)
+                on_chain = get_share_balance(token_id)
+                if on_chain and on_chain > 0.5:
+                    actual_shares = on_chain
+
+                self.positions[token_id] = {
+                    "token_id": token_id,
+                    "condition_id": condition_id,
+                    "side": side,
+                    "entry_price": current_price,
+                    "shares": actual_shares,
+                    "cost": actual_cost,
+                    "entry_time": time.time(),
+                    "wallet_addr": wallet_addr,
+                    "wallet_name": wallet_name,
+                    "market_info": {
+                        "question": market_info["question"],
+                        "crypto": market_info["crypto"],
+                        "slug": market_info["slug"],
+                        "window_end": market_info["window_end"].isoformat(),
+                    },
+                    "dry_run": False,
+                }
+                self.cooldowns[condition_id] = time.time() + COOLDOWN_SECS
+
+                log(f"     ✓ Bought {actual_shares:.1f}sh @ {current_price:.2f} for ${actual_cost:.2f}")
+
+                record = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "action": "WHALE_BUY",
+                    "market": market_info["question"],
                     "crypto": market_info["crypto"],
-                    "slug": market_info["slug"],
-                    "window_end": market_info["window_end"].isoformat(),
-                },
-                "dry_run": False,
-            }
-            self.cooldowns[condition_id] = time.time() + COOLDOWN_SECS
+                    "side": side,
+                    "token": token_id,
+                    "price": current_price,
+                    "amount": amount,
+                    "actual_cost": actual_cost,
+                    "shares": actual_shares,
+                    "whale_addr": wallet_addr,
+                    "whale_name": wallet_name,
+                    "whale_size": whale_size,
+                    "response": str(resp),
+                }
+                with open(TRADE_LOG, "a") as f:
+                    f.write(json.dumps(record) + "\n")
 
-            log(f"     ✓ Bought {actual_shares:.1f}sh @ {current_price:.2f} for ${actual_cost:.2f}")
+                return True
 
-            record = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "action": "WHALE_BUY",
-                "market": market_info["question"],
-                "crypto": market_info["crypto"],
-                "side": side,
-                "token": token_id,
-                "price": current_price,
-                "amount": amount,
-                "actual_cost": actual_cost,
-                "shares": actual_shares,
-                "whale_addr": wallet_addr,
-                "whale_name": wallet_name,
-                "whale_size": whale_size,
-                "response": str(resp),
-            }
-            with open(TRADE_LOG, "a") as f:
-                f.write(json.dumps(record) + "\n")
-
-            return True
-
-        except Exception as e:
-            log(f"     ✗ Buy failed: {e}")
-            return False
+            except Exception as e:
+                log(f"     ✗ Buy attempt {attempt}/3 failed: {e}")
+                if attempt < 3:
+                    time.sleep(1)
+        return False
 
     # ─── RECORD CLOSE ────────────────────────────────────────────────
 
