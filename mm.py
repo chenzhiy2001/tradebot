@@ -60,7 +60,7 @@ TICK            = 0.01     # price tick
 
 # -- Timing --
 BUY_CUTOFF      = 150      # stop posting buys N sec before window end
-SELL_EXPIRY_BUF = 75       # GTD sell expires N sec before window end
+SELL_EXPIRY_BUF = 30       # GTD sell expires N sec before window end
 CLEANUP_BUF     = 75       # force-sell remaining N sec before window end
 CHECK_INTERVAL  = 4        # seconds between fill checks per market
 REQUOTE_INTERVAL = 20      # seconds between requoting if book moved
@@ -390,8 +390,8 @@ def record_trade(crypto, token_side, token_id, entry_price, exit_price, shares,
 # =========================================================================
 # FORCE SELL
 # =========================================================================
-def force_sell(token_id, max_retries=8):
-    """Cancel all orders then sell all shares at market. Returns total sold."""
+def force_sell(token_id, tracker=None, max_retries=8):
+    """Cancel all orders then sell all shares at best bid. Returns total sold."""
     if DRY_RUN:
         return 0
     total_sold = 0
@@ -404,12 +404,18 @@ def force_sell(token_id, max_retries=8):
         sell_size = math.floor(bal * 100) / 100
         if sell_size < MIN_SHARES:
             return total_sold
+        # Use best bid from book if available, otherwise fall back to 0.01
+        sell_price = 0.01
+        if tracker:
+            book = tracker.get_book(token_id)
+            if book and book["bb"] > 0.01:
+                sell_price = round(math.floor(book["bb"] / TICK) * TICK, 2)
         try:
             order_args = OrderArgs(
-                price=0.01, size=sell_size, side=SELL, token_id=token_id)
+                price=sell_price, size=sell_size, side=SELL, token_id=token_id)
             signed = client.create_order(order_args)
             client.post_order(signed, OrderType.GTC)
-            log(f"    force-sell {sell_size:.1f}sh (attempt {attempt + 1})")
+            log(f"    force-sell {sell_size:.1f}sh @ {sell_price} (attempt {attempt + 1})")
             total_sold += sell_size
         except Exception as e:
             log(f"    sell error (attempt {attempt + 1}): {e}")
@@ -459,6 +465,7 @@ class MMBot:
         log("=" * 60)
 
         self.balance = get_usdc_balance() or 0
+        self.start_balance = self.balance
         log(f"  Balance: ${self.balance:.2f}")
         log(f"  Config: quote=${QUOTE_SIZE}/side  spread={SPREAD_TARGET}  "
             f"buy_cutoff={BUY_CUTOFF}s  sell_exp={SELL_EXPIRY_BUF}s  cleanup={CLEANUP_BUF}s")
@@ -478,11 +485,11 @@ class MMBot:
             time.sleep(2)
             self._cleanup()
             end_balance = get_usdc_balance() or 0
-            actual_pnl = end_balance - self.balance
+            actual_pnl = end_balance - self.start_balance
             log(f"  Session: {self.trade_count} trades ({self.spread_captures} captures, "
                 f"{self.pairs_matched} pairs) | "
                 f"PnL: ${self.total_pnl:+.2f} (book) | "
-                f"${actual_pnl:+.2f} (USDC: ${self.balance:.2f} -> ${end_balance:.2f})")
+                f"${actual_pnl:+.2f} (USDC: ${self.start_balance:.2f} -> ${end_balance:.2f})")
 
     # -- Discovery --
 
@@ -738,7 +745,7 @@ class MMBot:
                     exit_price = book["bb"] if book else st["entry"]
 
                     if not DRY_RUN:
-                        force_sell(token_id)
+                        force_sell(token_id, tracker=self.tracker)
 
                     hold = time.time() - st["fill_time"] if st["fill_time"] else 0
                     pnl = (exit_price - st["entry"]) * st["shares"]
@@ -772,7 +779,7 @@ class MMBot:
                 try:
                     cancel_all_orders(token_id)
                     if not DRY_RUN:
-                        force_sell(token_id)
+                        force_sell(token_id, tracker=self.tracker)
                 except Exception:
                     pass
         finally:
@@ -908,7 +915,7 @@ class MMBot:
                 continue
             if bal >= MIN_SHARES:
                 log(f"  Selling {bal:.1f}sh on {token_id[:20]}...")
-                force_sell(token_id, max_retries=10)
+                force_sell(token_id, tracker=self.tracker, max_retries=10)
 
         time.sleep(3)
         for token_id in all_tokens:
@@ -916,7 +923,7 @@ class MMBot:
                 bal = get_share_balance(token_id) or 0
                 if bal >= MIN_SHARES:
                     log(f"  STILL {bal:.1f}sh -- retrying")
-                    force_sell(token_id, max_retries=5)
+                    force_sell(token_id, tracker=self.tracker, max_retries=5)
             except Exception:
                 continue
 
