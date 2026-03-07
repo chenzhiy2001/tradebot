@@ -55,6 +55,7 @@ MIN_SPREAD      = 0.01     # only quote if book spread >= this
 MIN_MID         = 0.15     # skip tokens near 0
 MAX_MID         = 0.85     # skip tokens near 1
 MIN_DEPTH       = 50       # min total depth ($) to trust book
+STOP_LOSS       = 0.04     # exit if bb drops this much below entry
 MIN_SHARES      = 5        # Polymarket minimum order
 TICK            = 0.01     # price tick
 
@@ -703,6 +704,24 @@ class MMBot:
                         self._check_buy_fill(token_id, st, sell_expiry, crypto)
                     elif st["status"] == "selling":
                         self._check_sell_fill(token_id, st, crypto)
+                        # Stop-loss: if bb dropped too far below entry, exit now
+                        if st["status"] == "selling":
+                            book = self.tracker.get_book(token_id)
+                            if book and book["bb"] < st["entry"] - STOP_LOSS:
+                                log(f"    [STOPLOSS] {st['label']}: bb={book['bb']:.2f} < entry={st['entry']:.2f}-{STOP_LOSS}")
+                                cancel_all_orders(token_id)
+                                if not DRY_RUN:
+                                    force_sell(token_id, tracker=self.tracker)
+                                exit_price = book["bb"]
+                                hold = time.time() - st["fill_time"] if st["fill_time"] else 0
+                                pnl = (exit_price - st["entry"]) * st["shares"]
+                                self.trade_count += 1
+                                self.total_pnl += pnl
+                                record_trade(crypto, st["token_side"], token_id,
+                                             st["entry"], exit_price, st["shares"],
+                                             st["entry"] * st["shares"], pnl, hold, "stop_loss")
+                                log(f"    [-] {st['label']} stop-loss: pnl=${pnl:+.2f} ({hold:.0f}s hold)")
+                                st["status"] = "done"
 
                 # Requote stale buys if book moved
                 now_t = time.time()
@@ -712,7 +731,7 @@ class MMBot:
                     if secs_left > BUY_CUTOFF:
                         for token_id, st in state.items():
                             if st["status"] == "buying":
-                                self._try_requote(token_id, st, buy_expiry)
+                                self._try_requote(token_id, st)
 
             # --- PHASE 3: Cleanup ---
             log(f"  {crypto} cleanup phase")
@@ -807,6 +826,15 @@ class MMBot:
                     client.cancel(st["buy_oid"])
                 except Exception:
                     pass
+                # Re-check balance after cancel to capture all filled shares
+                time.sleep(1)
+                bal2 = get_share_balance(token_id) or 0
+                filled2 = bal2 - st["pre_bal"]
+                if filled2 > actual_shares:
+                    actual_shares = filled2
+                    st["shares"] = actual_shares
+                    st["filled_shares"] = actual_shares
+                    log(f"    {st['label']}: updated fill to {actual_shares:.1f}sh")
 
             # Post SELL at entry + spread target
             sell_price = round(st["entry"] + SPREAD_TARGET, 2)
@@ -850,7 +878,7 @@ class MMBot:
                 f"pnl=${pnl:+.4f} ({hold:.1f}s hold)")
             st["status"] = "done"
 
-    def _try_requote(self, token_id, st, buy_expiry):
+    def _try_requote(self, token_id, st):
         """Cancel stale buy and repost if book moved significantly."""
         book = self.tracker.get_book(token_id)
         if not book:
@@ -889,7 +917,9 @@ class MMBot:
             st["shares"] = new_shares
             return
 
-        oid = post_limit(token_id, BUY, new_bb, new_shares, buy_expiry)
+        # Compute fresh expiry for requote (must be > now + 60s)
+        fresh_expiry = int(time.time()) + 90
+        oid = post_limit(token_id, BUY, new_bb, new_shares, fresh_expiry)
         if oid:
             st["buy_oid"] = oid
             st["entry"] = new_bb
