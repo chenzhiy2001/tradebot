@@ -74,7 +74,7 @@ SPIKE_COOLDOWN = 30           # Don't re-trigger same crypto for N seconds
 BET_AMOUNT = 15               # USDC per trade
 MAX_BET = 30                  # Cap
 MIN_BET = 5                   # Floor
-MAX_POSITIONS = 4             # Max concurrent positions
+MAX_POSITIONS = 2             # Max concurrent positions (reduce correlated risk)
 MIN_BALANCE = 10              # Stop trading below this
 ENTRY_PRICE_MAX = 0.85        # Don't buy tokens above 85¢ (too little upside)
 ENTRY_PRICE_MIN = 0.20        # Don't buy tokens below 20¢ (too speculative)
@@ -558,42 +558,22 @@ class LiqSniper:
         if existing_pos and existing_pos["direction"] == direction:
             return  # already positioned correctly
 
-        # If we have a position in the OPPOSITE direction → FLIP
-        is_flip = existing_pos is not None and existing_pos["direction"] != direction
+        # If we have a position in the OPPOSITE direction → skip (don't flip)
+        # Flipping has been net negative in every session due to race conditions
+        # and the cost of selling at a loss + buying into an already-moved market
+        if existing_pos is not None and existing_pos["direction"] != direction:
+            return
 
-        # Block flip if a sell is already in progress (prevents race condition spam)
-        if is_flip and existing_pos.get("sell_order_id"):
-            return  # sell already pending, don't spam flip attempts
-        if is_flip and existing_pos.get("_flip_pending"):
-            return  # flip already being attempted
-
-        if not is_flip:
-            # Normal cooldown for fresh entries
-            last_spike = self._spike_cooldowns.get(crypto, 0)
-            if now - last_spike < SPIKE_COOLDOWN:
-                return
+        # Normal cooldown for fresh entries
+        last_spike = self._spike_cooldowns.get(crypto, 0)
+        if now - last_spike < SPIKE_COOLDOWN:
+            return
 
         self._spike_cooldowns[crypto] = now
 
-        if is_flip:
-            log(f"\n  🔄 REVERSE SPIKE: {crypto.upper()} {direction} — "
-                f"${spike_usd:,.0f} vol ({spike_ratio:.1f}× baseline), "
-                f"{dir_ratio:.0%} directional")
-            log(f"     Closing {existing_pos['direction']} position to flip...")
-            existing_pos["_flip_pending"] = True
-            sold = self._sell_now(existing_pos, "FLIP")
-            if sold:
-                if existing_pos in self.positions:
-                    self.positions.remove(existing_pos)
-                self.completed.append(existing_pos)
-            else:
-                existing_pos["_flip_pending"] = False
-                log(f"     ⚠ Could not close old position, skipping flip")
-                return
-        else:
-            log(f"\n  🚨 SPIKE: {crypto.upper()} {direction} — "
-                f"${spike_usd:,.0f} vol ({spike_ratio:.1f}× baseline), "
-                f"{dir_ratio:.0%} directional")
+        log(f"\n  🚨 SPIKE: {crypto.upper()} {direction} — "
+            f"${spike_usd:,.0f} vol ({spike_ratio:.1f}× baseline), "
+            f"{dir_ratio:.0%} directional")
 
         # Check window timing
         utc_now = datetime.now(timezone.utc)
@@ -686,6 +666,9 @@ class LiqSniper:
             return
 
         try:
+            # Record pre-buy balance to detect actual fill amount
+            pre_balance = get_share_balance(token_id) or 0
+
             buy_order = OrderArgs(
                 token_id=token_id,
                 price=buy_price,
@@ -707,7 +690,8 @@ class LiqSniper:
             # Wait for fill
             time.sleep(FILL_WAIT)
 
-            actual = get_share_balance(token_id)
+            total_balance = get_share_balance(token_id)
+            actual = max(0, (total_balance or 0) - pre_balance)
 
             # Cancel remaining order
             try:
@@ -759,8 +743,9 @@ class LiqSniper:
                 log(f"     ⏳ Not filled after {FILL_WAIT}s")
                 # Double-check: wait a beat and re-check in case of cancel/fill race
                 time.sleep(1)
-                late_fill = get_share_balance(token_id)
-                if late_fill is not None and late_fill >= MIN_ORDER_SIZE:
+                late_total = get_share_balance(token_id)
+                late_fill = max(0, (late_total or 0) - pre_balance) if late_total is not None else 0
+                if late_fill >= MIN_ORDER_SIZE:
                     fee = compute_taker_fee(late_fill, buy_price)
                     cost = round(late_fill * buy_price + fee, 4)
                     log(f"     ⚠ Late fill detected! {late_fill:.1f}sh — adopting position")
@@ -845,7 +830,8 @@ class LiqSniper:
                     f"{pos['direction']} — no shares to sell")
                 return True
 
-            shares_to_sell = bal
+            # Sell only what we bought, not stale shares from other sessions
+            shares_to_sell = min(bal, pos["shares"])
 
             sell_order = OrderArgs(
                 token_id=pos["token_id"],
