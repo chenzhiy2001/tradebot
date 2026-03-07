@@ -510,15 +510,27 @@ class LiqSniper:
             self._shutdown()
 
     def _update_markets(self):
-        """Refresh available markets."""
+        """Refresh available markets. Prefer CURRENT (active) window over next."""
         try:
             found = discover_markets()
             now = datetime.now(timezone.utc)
             with self._lock:
                 self.markets = {}
                 for m in found:
-                    if now < m["window_end"]:
-                        self.markets[m["crypto"]] = m
+                    if now >= m["window_end"]:
+                        continue  # expired
+                    crypto = m["crypto"]
+                    existing = self.markets.get(crypto)
+                    if existing is None:
+                        self.markets[crypto] = m
+                    else:
+                        # Prefer the window that's already started
+                        m_active = m["window_start"] <= now
+                        ex_active = existing["window_start"] <= now
+                        if m_active and not ex_active:
+                            self.markets[crypto] = m
+                        elif m_active == ex_active and m["window_start"] < existing["window_start"]:
+                            self.markets[crypto] = m
         except Exception as e:
             log(f"  ⚠ Market update error: {e}")
 
