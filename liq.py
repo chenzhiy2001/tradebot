@@ -747,13 +747,27 @@ class LiqSniper:
             pos["pnl"] = 0
             return True
 
-        # Cancel any existing sell order first
+        # If a sell order already exists, DON'T place another one — tokens are locked
         if pos.get("sell_order_id"):
-            try:
-                client.cancel(pos["sell_order_id"])
-            except Exception:
-                pass
-            pos["sell_order_id"] = None
+            # Just check if it filled
+            bal = get_share_balance(pos["token_id"])
+            if bal is not None and bal < 1:
+                sell_price = pos.get("_pending_sell_price", pos["buy_price"])
+                payout = round(pos["shares"] * sell_price, 4)
+                pnl = round(payout - pos["cost"], 2)
+                pos["resolved"] = True
+                pos["pnl"] = pnl
+                pos["won"] = pnl > 0
+                if pnl > 0:
+                    self._win_count += 1
+                self._pnl += pnl
+                sym = "+" if pnl >= 0 else ""
+                log(f"  {'💰' if pnl > 0 else '❌'} {reason}: "
+                    f"{pos['market']['crypto'].upper()} {pos['direction']} — "
+                    f"{sym}${pnl:.2f}")
+                self._log_trade(pos, reason)
+                return True
+            return False  # sell still pending, don't spam new orders
 
         # Get current mid if no price given
         if sell_price is None:
@@ -765,8 +779,26 @@ class LiqSniper:
                 sell_price = max(round(pos["buy_price"] - EXIT_SPREAD, 2), 0.01)
 
         try:
+            # Ensure token allowance is set before selling
+            client.update_balance_allowance(
+                params=BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=pos["token_id"], signature_type=1,
+                )
+            )
+
             bal = get_share_balance(pos["token_id"])
-            shares_to_sell = bal if (bal and bal >= 1) else pos["shares"]
+            if bal is None or bal < 1:
+                # No shares to sell (already resolved?)
+                pos["resolved"] = True
+                pos["pnl"] = round(-pos["cost"], 2)
+                pos["won"] = False
+                self._pnl += pos["pnl"]
+                log(f"  ❌ {reason}: {pos['market']['crypto'].upper()} "
+                    f"{pos['direction']} — no shares to sell")
+                return True
+
+            shares_to_sell = bal
 
             sell_order = OrderArgs(
                 token_id=pos["token_id"],
@@ -777,6 +809,11 @@ class LiqSniper:
             signed = client.create_order(sell_order)
             resp = client.post_order(signed, OrderType.GTC)
             oid = resp.get("orderID", "") if isinstance(resp, dict) else ""
+            status = resp.get("status", "") if isinstance(resp, dict) else ""
+
+            if not oid or status == "error":
+                log(f"     ⚠ Sell rejected ({reason}): {resp}")
+                return False
 
             # Wait briefly for fill
             time.sleep(2)
@@ -806,10 +843,11 @@ class LiqSniper:
                     pass
                 return True
             else:
-                # Partial or no fill — leave GTC order live, will retry
+                # Sell order placed but not fully filled — leave it live
                 pos["sell_order_id"] = oid
-                log(f"     📤 {reason} sell pending @ {sell_price} "
-                    f"(remaining: {remaining:.0f}sh)")
+                pos["_pending_sell_price"] = sell_price
+                log(f"     📤 {reason} sell placed @ {sell_price} "
+                    f"({shares_to_sell:.0f}sh, waiting for fill)")
                 return False
 
         except Exception as e:
@@ -830,7 +868,7 @@ class LiqSniper:
                 to_remove.append(pos)
                 continue
 
-            # Check if an earlier sell order already filled
+            # If a sell order exists, just check if it filled — don't place more
             if not pos.get("dry_run") and pos.get("sell_order_id"):
                 bal = get_share_balance(pos["token_id"])
                 if bal is not None and bal < 1:
@@ -850,7 +888,8 @@ class LiqSniper:
                         f"{sym}${pnl:.2f}")
                     self._log_trade(pos, "SOLD")
                     to_remove.append(pos)
-                    continue
+                # Either way, don't try to place new sell orders
+                continue
 
             # Skip active monitoring for dry runs after window end
             if pos.get("dry_run") and now > window_end:
@@ -859,7 +898,7 @@ class LiqSniper:
                 to_remove.append(pos)
                 continue
 
-            # ── Active exit monitoring ──
+            # ── Active exit monitoring (only when NO sell order exists) ──
             hold_secs = now_ts - pos["buy_time"]
             last_check = pos.get("_last_exit_check", 0)
 
