@@ -68,7 +68,7 @@ INTERVALS = [5]                # 5-min markets
 # ── Strategy params ──
 BET_AMOUNT = 50.0              # USDC per side
 MAX_PAIRS = 4                  # Max simultaneous market pairs
-MAX_TOTAL_RISK = 85.0          # Max USDC locked across all open orders
+MAX_TOTAL_RISK = 100.0         # Max USDC locked across all open orders
 TARGET_ROI = 0.01              # Target ≥1% profit per pair (actual ~2% due to rounding)
 
 # ── Pricing ──
