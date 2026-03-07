@@ -40,3 +40,5 @@ liq_log.txt
 liq_trades.json
 mm_log.txt
 mm_trades.json
+strategy_rw_log.txt
+strategy_rw_trades.json
