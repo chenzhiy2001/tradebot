@@ -554,14 +554,8 @@ class LiqSniper:
                 existing_pos = pos
                 break
 
-        # If we have a position in the SAME direction, cooldown applies
-        if existing_pos and existing_pos["direction"] == direction:
-            return  # already positioned correctly
-
-        # If we have a position in the OPPOSITE direction → skip (don't flip)
-        # Flipping has been net negative in every session due to race conditions
-        # and the cost of selling at a loss + buying into an already-moved market
-        if existing_pos is not None and existing_pos["direction"] != direction:
+        # If we already have a position on this market, skip
+        if existing_pos is not None:
             return
 
         # Normal cooldown for fresh entries
@@ -574,6 +568,18 @@ class LiqSniper:
         log(f"\n  🚨 SPIKE: {crypto.upper()} {direction} — "
             f"${spike_usd:,.0f} vol ({spike_ratio:.1f}× baseline), "
             f"{dir_ratio:.0%} directional")
+
+        # ── MEAN REVERSION: invert the spike direction ──
+        # Data shows spikes (especially DOWN) are V-shaped and revert.
+        # 134 trades: DOWN spikes → original 25% WR (vs 40% random) = strong inverse signal.
+        # Only trade against DOWN spikes (strongest edge); skip UP spikes (38% WR ≈ noise).
+        if direction == "UP":
+            log(f"     ⊘ Skipping UP spike (no inverse edge)")
+            return
+
+        # DOWN spike detected → buy UP (mean reversion bet)
+        trade_direction = "UP"
+        log(f"     ↩ REVERSION: buying {trade_direction} (against {direction} spike)")
 
         # Check window timing
         utc_now = datetime.now(timezone.utc)
@@ -605,8 +611,8 @@ class LiqSniper:
             log(f"     ⊘ Low balance: ${balance}")
             return
 
-        # Determine token to buy
-        if direction == "UP":
+        # Determine token to buy (using trade_direction, not spike direction)
+        if trade_direction == "UP":
             token_id = market["up_token"]
             token_price = market["up_mid"]
         else:
@@ -636,10 +642,10 @@ class LiqSniper:
         est_shares = max(MIN_ORDER_SIZE, math.floor(bet / buy_price))
         fee_est = compute_taker_fee(est_shares, buy_price)
 
-        log(f"     → BUY {direction} {crypto.upper()}: ~{est_shares}sh @ {buy_price:.2f} "
+        log(f"     → BUY {trade_direction} {crypto.upper()}: ~{est_shares}sh @ {buy_price:.2f} "
             f"(${bet:.0f}, fee ~${fee_est:.2f})")
 
-        self._execute_buy(market, market_key, direction, token_id, buy_price,
+        self._execute_buy(market, market_key, trade_direction, token_id, buy_price,
                           est_shares, spike_usd, spike_ratio, dir_ratio)
 
     def _execute_buy(self, market, market_key, direction, token_id,
