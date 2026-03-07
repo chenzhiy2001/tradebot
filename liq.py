@@ -81,9 +81,15 @@ ENTRY_PRICE_MIN = 0.50        # Don't buy tokens below 50¢ (uncertain)
 MIN_TIME_REMAINING = 60       # Don't enter with < 60s left
 MAX_ELAPSED_PCT = 0.75        # Don't enter after 75% of window elapsed
 FILL_WAIT = 4                 # Seconds to wait for limit buy fill
-EXIT_PRICE = 0.99             # GTC sell at 99¢ — fills when winning token → $1
-SELL_RETRY_INTERVAL = 10      # Retry sell placement every N seconds
 MIN_ORDER_SIZE = 5            # Polymarket minimum
+
+# ── Exit params (sell during the spike, don't hold to resolution) ──
+PROFIT_TARGET = 0.06          # Take profit when token moves +6¢ above entry
+STOP_LOSS = 0.04              # Cut loss when token drops -4¢ below entry
+MAX_HOLD_SECS = 45            # Force exit after 45 seconds regardless
+EXIT_CHECK_INTERVAL = 2       # Check midpoint every 2 seconds
+EXIT_SPREAD = 0.02            # Sell 2¢ below mid to cross spread and fill fast
+FALLBACK_PRICE = 0.99         # Last-resort GTC sell if active exit fails
 
 # ── Fee model (5m crypto markets) ──
 CRYPTO_FEE_RATE = 0.25
@@ -455,6 +461,7 @@ class LiqSniper:
         log(f"  Bet: ${BET_AMOUNT}, Max positions: {MAX_POSITIONS}")
         log(f"  Spike threshold: {SPIKE_THRESHOLD}×, Min spike: ${MIN_SPIKE_USD:,}")
         log(f"  Direction ratio: {MIN_DIRECTION_RATIO:.0%}, Cooldown: {SPIKE_COOLDOWN}s")
+        log(f"  Exit: TP +{PROFIT_TARGET:.0%} / SL -{STOP_LOSS:.0%} / timeout {MAX_HOLD_SECS}s")
         log("=" * 60)
 
         self._start_balance = get_usdc_balance()
@@ -689,9 +696,6 @@ class LiqSniper:
                 self.positions.append(pos)
                 self._trade_count += 1
 
-                # Place exit sell at $0.99
-                self._place_exit_sell(pos)
-
                 # Log trade
                 self._log_trade(pos, "OPEN")
             else:
@@ -700,27 +704,85 @@ class LiqSniper:
         except Exception as e:
             log(f"     ⚠ Buy error: {e}")
 
-    def _place_exit_sell(self, pos):
-        """Place GTC sell at EXIT_PRICE to capture profit if correct."""
+    def _sell_now(self, pos, reason, sell_price=None):
+        """Execute an immediate sell at the given price (crossing spread)."""
         if pos.get("dry_run"):
-            return
+            pos["resolved"] = True
+            pos["pnl"] = 0
+            return True
+
+        # Cancel any existing sell order first
+        if pos.get("sell_order_id"):
+            try:
+                client.cancel(pos["sell_order_id"])
+            except Exception:
+                pass
+            pos["sell_order_id"] = None
+
+        # Get current mid if no price given
+        if sell_price is None:
+            try:
+                mid_data = client.get_midpoint(pos["token_id"])
+                mid = float(mid_data.get("mid", 0))
+                sell_price = max(round(mid - EXIT_SPREAD, 2), 0.01)
+            except Exception:
+                sell_price = max(round(pos["buy_price"] - EXIT_SPREAD, 2), 0.01)
+
         try:
+            bal = get_share_balance(pos["token_id"])
+            shares_to_sell = bal if (bal and bal >= 1) else pos["shares"]
+
             sell_order = OrderArgs(
                 token_id=pos["token_id"],
-                price=EXIT_PRICE,
-                size=pos["shares"],
+                price=sell_price,
+                size=shares_to_sell,
                 side=SELL,
             )
             signed = client.create_order(sell_order)
             resp = client.post_order(signed, OrderType.GTC)
             oid = resp.get("orderID", "") if isinstance(resp, dict) else ""
-            pos["sell_order_id"] = oid
-            log(f"     📤 Exit sell placed @ {EXIT_PRICE} (id: {oid[:10]})")
+
+            # Wait briefly for fill
+            time.sleep(2)
+            remaining = get_share_balance(pos["token_id"])
+
+            if remaining is not None and remaining < 1:
+                # Fully sold
+                payout = round(shares_to_sell * sell_price, 4)
+                pnl = round(payout - pos["cost"], 2)
+                pos["resolved"] = True
+                pos["pnl"] = pnl
+                pos["exit_price"] = sell_price
+                pos["won"] = pnl > 0
+                if pnl > 0:
+                    self._win_count += 1
+                self._pnl += pnl
+                sym = "+" if pnl >= 0 else ""
+                log(f"  {'💰' if pnl > 0 else '❌'} {reason}: "
+                    f"{pos['market']['crypto'].upper()} {pos['direction']} — "
+                    f"{sym}${pnl:.2f} (sold {shares_to_sell:.0f}sh @ {sell_price:.2f})")
+                self._log_trade(pos, reason)
+                # Cancel order just in case
+                try:
+                    if oid:
+                        client.cancel(oid)
+                except Exception:
+                    pass
+                return True
+            else:
+                # Partial or no fill — leave GTC order live, will retry
+                pos["sell_order_id"] = oid
+                log(f"     📤 {reason} sell pending @ {sell_price} "
+                    f"(remaining: {remaining:.0f}sh)")
+                return False
+
         except Exception as e:
-            log(f"     ⚠ Sell placement error: {e}")
+            log(f"     ⚠ Sell error ({reason}): {e}")
+            return False
 
     def _monitor_positions(self):
-        """Check position status: sell filled? market resolved?"""
+        """Active exit management: take profit, stop loss, time exit."""
+        now_ts = time.time()
         now = datetime.now(timezone.utc)
         to_remove = []
 
@@ -732,63 +794,116 @@ class LiqSniper:
                 to_remove.append(pos)
                 continue
 
-            # Check if sell filled (share balance = 0 means sold)
+            # Check if an earlier sell order already filled
             if not pos.get("dry_run") and pos.get("sell_order_id"):
                 bal = get_share_balance(pos["token_id"])
                 if bal is not None and bal < 1:
-                    # Sell filled — we won
-                    payout = pos["shares"] * EXIT_PRICE
+                    # Sell filled
+                    sell_price = pos.get("_pending_sell_price", pos["buy_price"])
+                    payout = round(pos["shares"] * sell_price, 4)
                     pnl = round(payout - pos["cost"], 2)
                     pos["resolved"] = True
                     pos["pnl"] = pnl
-                    pos["won"] = True
-                    self._win_count += 1
+                    pos["won"] = pnl > 0
+                    if pnl > 0:
+                        self._win_count += 1
                     self._pnl += pnl
-                    log(f"  💰 WIN: {market['crypto'].upper()} {pos['direction']} — "
-                        f"+${pnl:.2f} ({pos['shares']:.0f}sh @ {pos['buy_price']:.2f})")
-                    self._log_trade(pos, "WIN")
+                    sym = "+" if pnl >= 0 else ""
+                    log(f"  {'💰' if pnl > 0 else '❌'} SOLD: "
+                        f"{market['crypto'].upper()} {pos['direction']} — "
+                        f"{sym}${pnl:.2f}")
+                    self._log_trade(pos, "SOLD")
                     to_remove.append(pos)
                     continue
 
-            # After window end + buffer: check resolution
-            if now > window_end + timedelta(seconds=30):
-                if pos.get("dry_run"):
-                    # Simulate resolution: check Binance price
-                    pos["resolved"] = True
-                    pos["pnl"] = 0
-                    to_remove.append(pos)
-                    continue
+            # Skip active monitoring for dry runs after window end
+            if pos.get("dry_run") and now > window_end:
+                pos["resolved"] = True
+                pos["pnl"] = 0
+                to_remove.append(pos)
+                continue
 
-                bal = get_share_balance(pos["token_id"])
+            # ── Active exit monitoring ──
+            hold_secs = now_ts - pos["buy_time"]
+            last_check = pos.get("_last_exit_check", 0)
+
+            if now_ts - last_check < EXIT_CHECK_INTERVAL:
+                continue
+            pos["_last_exit_check"] = now_ts
+
+            # Get current token midpoint
+            try:
+                mid_data = client.get_midpoint(pos["token_id"])
+                current_mid = float(mid_data.get("mid", 0))
+            except Exception:
+                current_mid = 0
+
+            if current_mid <= 0:
+                continue
+
+            entry = pos["buy_price"]
+            move = current_mid - entry
+
+            # Log price movement
+            if not pos.get("_logged_first_check"):
+                pos["_logged_first_check"] = True
+                log(f"     📊 Monitoring {market['crypto'].upper()} {pos['direction']}: "
+                    f"entry={entry:.2f}, current={current_mid:.2f}, "
+                    f"TP@{entry + PROFIT_TARGET:.2f}, SL@{entry - STOP_LOSS:.2f}")
+
+            # 1. TAKE PROFIT — token moved up enough
+            if move >= PROFIT_TARGET:
+                sell_at = max(round(current_mid - EXIT_SPREAD, 2), 0.01)
+                log(f"     🎯 TAKE PROFIT: mid={current_mid:.2f} (+{move:.2f}¢), "
+                    f"selling @ {sell_at}")
+                pos["_pending_sell_price"] = sell_at
+                if self._sell_now(pos, "TP", sell_at):
+                    to_remove.append(pos)
+                continue
+
+            # 2. STOP LOSS — token dropped
+            if move <= -STOP_LOSS:
+                sell_at = max(round(current_mid - EXIT_SPREAD, 2), 0.01)
+                log(f"     🛑 STOP LOSS: mid={current_mid:.2f} ({move:.2f}¢), "
+                    f"selling @ {sell_at}")
+                pos["_pending_sell_price"] = sell_at
+                if self._sell_now(pos, "SL", sell_at):
+                    to_remove.append(pos)
+                continue
+
+            # 3. TIME EXIT — held too long, spike momentum is gone
+            if hold_secs >= MAX_HOLD_SECS:
+                sell_at = max(round(current_mid - EXIT_SPREAD, 2), 0.01)
+                log(f"     ⏱ TIME EXIT: {hold_secs:.0f}s held, mid={current_mid:.2f} "
+                    f"({move:+.2f}¢), selling @ {sell_at}")
+                pos["_pending_sell_price"] = sell_at
+                if self._sell_now(pos, "TIMEOUT", sell_at):
+                    to_remove.append(pos)
+                continue
+
+            # 4. WINDOW ENDING — must exit before resolution
+            remaining_secs = (window_end - now).total_seconds()
+            if remaining_secs < 20:
+                sell_at = max(round(current_mid - EXIT_SPREAD, 2), 0.01)
+                log(f"     ⏳ WINDOW EXIT: {remaining_secs:.0f}s left, "
+                    f"mid={current_mid:.2f}, selling @ {sell_at}")
+                pos["_pending_sell_price"] = sell_at
+                if self._sell_now(pos, "WINDOW", sell_at):
+                    to_remove.append(pos)
+                continue
+
+            # 5. Post-resolution cleanup (fallback)
+            if now > window_end + timedelta(minutes=10):
+                bal = get_share_balance(pos["token_id"]) if not pos.get("dry_run") else 0
                 if bal is not None and bal < 1:
-                    # Shares gone — either sold or resolved to $1
-                    payout = pos["shares"] * EXIT_PRICE
-                    pnl = round(payout - pos["cost"], 2)
                     pos["resolved"] = True
-                    pos["pnl"] = pnl
-                    pos["won"] = True
-                    self._win_count += 1
-                    self._pnl += pnl
-                    log(f"  💰 WIN: {market['crypto'].upper()} {pos['direction']} — "
-                        f"+${pnl:.2f}")
-                    self._log_trade(pos, "WIN")
-                    to_remove.append(pos)
-                elif now > window_end + timedelta(minutes=10):
-                    # Timeout — assume loss (shares resolved to $0)
-                    pnl = round(-pos["cost"], 2)
-                    pos["resolved"] = True
-                    pos["pnl"] = pnl
+                    pos["pnl"] = round(-pos["cost"], 2)
                     pos["won"] = False
-                    self._pnl += pnl
-                    log(f"  ❌ LOSS: {market['crypto'].upper()} {pos['direction']} — "
-                        f"${pnl:.2f}")
-                    self._log_trade(pos, "LOSS")
+                    self._pnl += pos["pnl"]
+                    log(f"  ❌ EXPIRED: {market['crypto'].upper()} {pos['direction']} — "
+                        f"${pos['pnl']:.2f}")
+                    self._log_trade(pos, "EXPIRED")
                     to_remove.append(pos)
-
-            # Retry sell if needed
-            elif not pos.get("sell_order_id") and not pos.get("dry_run"):
-                if time.time() - pos["buy_time"] > SELL_RETRY_INTERVAL:
-                    self._place_exit_sell(pos)
 
         for pos in to_remove:
             if pos in self.positions:
