@@ -60,9 +60,9 @@ BUY_AMOUNT = 25               # Our bet size per copy-trade ($)
 MIN_BET = 3                   # Minimum viable bet
 MIN_ENTRY_PRICE = 0.50        # Skip entries below this price (avoid coinflip gambles)
 ACCUM_WINDOW = 15             # Seconds to accumulate fragments from same wallet+token
-COOLDOWN_SECS = 30            # Don't re-enter same market within this window
+COOLDOWN_SECS = 15            # Don't re-enter same market within this window
 MAX_POSITIONS = 6             # Max concurrent positions
-MAX_PER_WINDOW = 2            # Max new entries per 5-min window
+MAX_PER_WINDOW = 3            # Max new entries per 5-min window
 MAX_RISK_PCT = 0.95           # Don't risk more than 95% of balance
 
 # Anti market-maker: if wallet trades both sides within this window, ignore
