@@ -51,7 +51,7 @@ CHAIN_ID        = 137
 # -- Quoting --
 QUOTE_SIZE      = 10       # $ per side per token (so $20 per market, $80 for 4)
 SPREAD_TARGET   = 0.02     # post SELL at entry + 2c
-MIN_SPREAD      = 0.02     # only quote if book spread >= this
+MIN_SPREAD      = 0.01     # only quote if book spread >= this
 MIN_MID         = 0.15     # skip tokens near 0
 MAX_MID         = 0.85     # skip tokens near 1
 MIN_DEPTH       = 50       # min total depth ($) to trust book
