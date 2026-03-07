@@ -886,6 +886,9 @@ class MMBot:
         new_bb = round(math.floor(book["bb"] / TICK) * TICK, 2)
         if new_bb == st["entry"]:
             return
+        # Only requote upward -- don't chase a falling bid into a crash
+        if new_bb < st["entry"]:
+            return
         if new_bb <= 0.01 or new_bb >= 0.99:
             return
         if book["mid"] < MIN_MID or book["mid"] > MAX_MID:
