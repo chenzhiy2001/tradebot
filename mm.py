@@ -443,6 +443,9 @@ class MMBot:
         self._active_markets = {}
         self._active_lock = threading.Lock()
 
+        # Track condition_ids that failed to post orders (avoid re-launch spam)
+        self._failed_cids = set()
+
         # Aggregated stats
         self.trade_count = 0
         self.total_pnl = 0.0
@@ -496,10 +499,15 @@ class MMBot:
 
         all_tokens = set()
         self.token_to_market = {}
+        current_cids = set()
         for m in self.markets:
+            current_cids.add(m["condition_id"])
             for tok in [m["up_token"], m["down_token"]]:
                 all_tokens.add(tok)
                 self.token_to_market[tok] = m
+
+        # Clear failed cids from previous windows
+        self._failed_cids -= self._failed_cids - current_cids
 
         self.ws.subscribe(all_tokens)
 
@@ -535,6 +543,8 @@ class MMBot:
             with self._active_lock:
                 if cid in self._active_markets:
                     continue
+                if cid in self._failed_cids:
+                    continue
                 if len(self._active_markets) >= MAX_MARKETS:
                     continue
 
@@ -567,8 +577,13 @@ class MMBot:
         cid = market["condition_id"]
 
         # GTD expiry timestamps
-        buy_expiry = int(window_end.timestamp()) - BUY_CUTOFF
-        sell_expiry = int(window_end.timestamp()) - SELL_EXPIRY_BUF
+        # Polymarket requires expiration > now + 60s security buffer
+        # So set buy_expiry = now + (secs_to_window_end - BUY_CUTOFF)
+        # and sell_expiry = now + (secs_to_window_end - SELL_EXPIRY_BUF)
+        now_ts = int(time.time())
+        secs_to_end = int(window_end.timestamp()) - now_ts
+        buy_expiry = now_ts + max(secs_to_end - BUY_CUTOFF, 90)
+        sell_expiry = now_ts + max(secs_to_end - SELL_EXPIRY_BUF, 90)
         cleanup_time = window_end - timedelta(seconds=CLEANUP_BUF)
 
         # Per-token state
@@ -612,7 +627,7 @@ class MMBot:
                 if not book:
                     log(f"    {st['label']}: no book data, skipping")
                     continue
-                if book["spread"] < MIN_SPREAD:
+                if book["spread"] < MIN_SPREAD - 0.001:
                     log(f"    {st['label']}: spread {book['spread']:.2f} < {MIN_SPREAD}, skip")
                     continue
                 if book["mid"] < MIN_MID or book["mid"] > MAX_MID:
@@ -657,6 +672,8 @@ class MMBot:
             active = [t for t, s in state.items() if s["status"] == "buying"]
             if not active:
                 log(f"    {crypto}: no orders posted, exiting")
+                with self._active_lock:
+                    self._failed_cids.add(cid)
                 return
 
             # --- PHASE 2: Monitor fills and manage positions ---
@@ -831,7 +848,7 @@ class MMBot:
             return
         if book["mid"] < MIN_MID or book["mid"] > MAX_MID:
             return
-        if book["spread"] < MIN_SPREAD:
+        if book["spread"] < MIN_SPREAD - 0.001:
             return
 
         # Cancel old order
