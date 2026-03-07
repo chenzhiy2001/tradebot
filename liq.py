@@ -76,8 +76,8 @@ MAX_BET = 30                  # Cap
 MIN_BET = 5                   # Floor
 MAX_POSITIONS = 4             # Max concurrent positions
 MIN_BALANCE = 10              # Stop trading below this
-ENTRY_PRICE_MAX = 0.70        # Don't buy tokens above 70¢ (need upside)
-ENTRY_PRICE_MIN = 0.50        # Don't buy tokens below 50¢ (uncertain)
+ENTRY_PRICE_MAX = 0.85        # Don't buy tokens above 85¢ (too little upside)
+ENTRY_PRICE_MIN = 0.20        # Don't buy tokens below 20¢ (too speculative)
 MIN_TIME_REMAINING = 60       # Don't enter with < 60s left
 MAX_ELAPSED_PCT = 0.75        # Don't enter after 75% of window elapsed
 FILL_WAIT = 4                 # Seconds to wait for limit buy fill
@@ -642,8 +642,8 @@ class LiqSniper:
             log(f"     ⊘ Token too cheap: {token_price:.2f} < {ENTRY_PRICE_MIN}")
             return
 
-        # Calculate buy price (cross spread: buy at ask = mid + 1¢)
-        buy_price = min(round(token_price + 0.01, 2), 0.95)
+        # Calculate buy price (cross spread aggressively: mid + 2¢)
+        buy_price = min(round(token_price + 0.02, 2), 0.95)
         bet = min(BET_AMOUNT, MAX_BET, balance * 0.25)  # Never more than 25% of balance
         est_shares = max(MIN_ORDER_SIZE, math.floor(bet / buy_price))
         fee_est = compute_taker_fee(est_shares, buy_price)
