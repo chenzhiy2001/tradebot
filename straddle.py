@@ -486,8 +486,14 @@ class StraddlePosition:
         return 1.0 - self.up_price - self.down_price
 
     def status_str(self):
-        up = f"Up={'✓' if self.up_filled else '○'}@{self.up_price:.2f}"
-        dn = f"Dn={'✓' if self.down_filled else '○'}@{self.down_price:.2f}"
+        def _icon(filled, shares, target):
+            if filled:
+                return '✓'
+            if shares > 0:
+                return f'{shares:.0f}/{target:.0f}'
+            return '○'
+        up = f"Up={_icon(self.up_filled, self.up_shares, self.shares)}@{self.up_price:.2f}"
+        dn = f"Dn={_icon(self.down_filled, self.down_shares, self.shares)}@{self.down_price:.2f}"
         return f"{self.market['crypto']} {up} {dn} ({self.market['question'][:40]})"
 
 
@@ -754,31 +760,39 @@ class StraddleBot:
             return
 
         # Check fill status by querying share balance
-        # Keep updating share counts even after initial fill detection,
-        # because partial fills may accumulate over time.
+        # Only mark as "filled" when the full ordered amount is reached.
         up_bal = get_share_balance(market["up_token"])
         if up_bal is not None and up_bal >= 1.0:
+            prev_up = pos.up_shares
+            pos.up_shares = up_bal
             if not pos.up_filled:
-                pos.up_filled = True
-                log(f"     ✓ Up FILLED: {up_bal:.1f}sh @ {pos.up_price} "
-                    f"({market['crypto']} {market['question'][:35]})")
-            pos.up_shares = up_bal  # always update to latest balance
+                if up_bal >= pos.shares - 0.1:
+                    pos.up_filled = True
+                    log(f"     ✓ Up FILLED: {up_bal:.1f}sh @ {pos.up_price} "
+                        f"({market['crypto']} {market['question'][:35]})")
+                elif up_bal - prev_up >= 1.0:
+                    log(f"     ◐ Up partial: {up_bal:.1f}/{pos.shares:.0f}sh @ {pos.up_price} "
+                        f"({market['crypto']})")
 
         dn_bal = get_share_balance(market["down_token"])
         if dn_bal is not None and dn_bal >= 1.0:
-            if not pos.down_filled:
-                pos.down_filled = True
-                log(f"     ✓ Down FILLED: {dn_bal:.1f}sh @ {pos.down_price} "
-                    f"({market['crypto']} {market['question'][:35]})")
+            prev_dn = pos.down_shares
             pos.down_shares = dn_bal
+            if not pos.down_filled:
+                if dn_bal >= pos.shares - 0.1:
+                    pos.down_filled = True
+                    log(f"     ✓ Down FILLED: {dn_bal:.1f}sh @ {pos.down_price} "
+                        f"({market['crypto']} {market['question'][:35]})")
+                elif dn_bal - prev_dn >= 1.0:
+                    log(f"     ◐ Down partial: {dn_bal:.1f}/{pos.shares:.0f}sh @ {pos.down_price} "
+                        f"({market['crypto']})")
 
         if pos.both_filled and not pos._both_logged:
             pos._both_logged = True
-            profit = pos.up_shares + pos.down_shares - pos.cost
+            matched = min(pos.up_shares, pos.down_shares)
+            profit = matched * (1.0 - pos.up_price - pos.down_price)
             log(f"  🎯 BOTH FILLED! {market['crypto']} guaranteed profit: "
-                f"${profit:.2f} (cost ${pos.cost:.2f})")
-            # Cancel any remaining limit order fragments
-            self._cancel_orders(pos)
+                f"${profit:.2f} ({matched:.0f}sh matched, cost ${pos.cost:.2f})")
 
         # Near expiry: cancel unfilled orders
         if pct_elapsed >= CANCEL_UNFILLED_PCT and not pos.both_filled:
