@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-mm.py — Spread-Capture Market Maker for Polymarket 5-min crypto markets.
+mm.py -- Two-Sided Market Maker for Polymarket 5-min crypto markets.
 
 Strategy:
-  1. Monitor order books for BTC, ETH, SOL, XRP 5-min markets via WS
-  2. When spread >= MIN_SPREAD: post limit BUY at best_bid (maker, 0% fee)
-  3. On fill: post limit SELL at entry + SPREAD_TARGET (maker, 0% fee)
-  4. Exits:
-     - Sell limit fills → "spread_captured" (pure profit, 0% fee both sides)
-     - Hold > MAX_HOLD → cancel sell, market-sell ("timeout")
-     - Window ending → cancel sell, market-sell ("window_end")
+  For each 5-min window, for each crypto (BTC, ETH, SOL, XRP):
+    1. Post BUY Up at best_bid_up with GTD expiry (maker, 0% fee)
+    2. Post BUY Down at best_bid_down with GTD expiry (maker, 0% fee)
+       Together = TWO-SIDED liquidity:
+         BUY Up = bid on Up; BUY Down = bid on Down = ask on Up
+    3. When either BUY fills -> post SELL at entry + SPREAD_TARGET (maker)
+    4. If sell fills -> spread captured (both legs maker = 0% total fee)
+    5. GTD auto-cancels all orders before window end -> no resolution risk
+    6. Force-sell remaining tokens in cleanup window
 
-What's different from old maker.py (142 trades, -$34.74):
-  - NO stop-loss (old 8¢ SL caused -$40 of losses)
-  - NO adverse-fill panic-selling (old logic caused -$15 of losses)
-  - NO directional signal needed (old imbalance/OFI added complexity, not edge)
-  - Longer fill timeout (30s vs 8s → fewer wasted entries)
-  - Longer hold time (120s vs 25s → more time for spread capture)
-  - Position thread manages full lifecycle (cleaner than scattered checks)
+  Paired position bonus:
+    If BOTH Up and Down fill for the same market:
+      cost = up_entry + down_entry (< $1.00 if spread > 0)
+      At resolution one side = $1.00 -> guaranteed profit = $1.00 - cost
 
-Key edge:
-  Maker orders = 0% fee. Buy at bid, sell at ask = earn the full spread.
-  Old bot's timeout exits (no SL, just hold & sell) were 75% WR, +$1.74 avg.
+Revenue streams:
+  1. Spread capture: buy at bid, sell at ask (2c+ per leg)
+  2. Pair profit: buy both sides < $1.00, one resolves to $1.00
+  3. Liquidity rewards: daily USDC for two-sided quoting (Q_min formula)
+  4. Maker rebates: 20% of crypto taker fees redistributed daily
 
 Usage:
   python mm.py              # live trading
@@ -29,12 +30,10 @@ Usage:
 """
 
 import os, sys, time, json, math, threading, asyncio, requests
-from collections import deque
 from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
-    OrderArgs, OrderType, OpenOrderParams,
-    BalanceAllowanceParams, AssetType,
+    OrderArgs, OrderType, BalanceAllowanceParams, AssetType,
 )
 from py_clob_client.order_builder.constants import BUY, SELL
 from dotenv import load_dotenv
@@ -49,37 +48,34 @@ GAMMA_API       = "https://gamma-api.polymarket.com"
 WS_MARKET_URL   = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CHAIN_ID        = 137
 
-# ── Spread capture ──
-SPREAD_TARGET   = 0.02     # post SELL at entry + this (2¢)
-MIN_SPREAD      = 0.02     # only enter if book spread >= this
-MIN_MID         = 0.20     # skip dead/resolved tokens
-MAX_MID         = 0.80     # skip tokens near 1 (thin spread)
-MIN_DEPTH       = 100      # minimum total depth ($) near BBA
-
-# ── Sizing ──
-BET_SIZE        = 25       # $ per trade
-MAX_BET         = 40       # cap
+# -- Quoting --
+QUOTE_SIZE      = 10       # $ per side per token (so $20 per market, $80 for 4)
+SPREAD_TARGET   = 0.02     # post SELL at entry + 2c
+MIN_SPREAD      = 0.02     # only quote if book spread >= this
+MIN_MID         = 0.15     # skip tokens near 0
+MAX_MID         = 0.85     # skip tokens near 1
+MIN_DEPTH       = 50       # min total depth ($) to trust book
 MIN_SHARES      = 5        # Polymarket minimum order
 TICK            = 0.01     # price tick
 
-# ── Timing ──
-FILL_WAIT       = 30       # seconds to wait for buy fill
-MAX_HOLD        = 120      # seconds after fill before force-exit
-EXIT_BUFFER     = 60       # force-exit this many seconds before window end
-MIN_ENTRY_TIME  = 150      # only enter if >= this many seconds remain
-WS_WARMUP       = 8        # WS warm-up period
-COOLDOWN        = 15       # don't re-enter same token for N seconds
+# -- Timing --
+BUY_CUTOFF      = 150      # stop posting buys N sec before window end
+SELL_EXPIRY_BUF = 75       # GTD sell expires N sec before window end
+CLEANUP_BUF     = 75       # force-sell remaining N sec before window end
+CHECK_INTERVAL  = 4        # seconds between fill checks per market
+REQUOTE_INTERVAL = 20      # seconds between requoting if book moved
+WS_WARMUP       = 8        # WS warm-up delay
 
-# ── Risk ──
-MAX_POSITIONS   = 4        # max simultaneous positions
+# -- Risk --
+MAX_MARKETS     = 4        # max simultaneous market threads
 MIN_BALANCE     = 5        # stop trading below this USDC
 
-# ── Markets ──
+# -- Markets --
 CRYPTOS         = ["btc", "eth", "sol", "xrp"]
 INTERVALS       = [5]
 
-DRY_RUN   = "--dry-run" in sys.argv
-LOG_FILE  = "mm_dry_log.txt" if DRY_RUN else "mm_log.txt"
+DRY_RUN    = "--dry-run" in sys.argv
+LOG_FILE   = "mm_dry_log.txt" if DRY_RUN else "mm_log.txt"
 TRADE_FILE = "mm_dry_trades.json" if DRY_RUN else "mm_trades.json"
 
 
@@ -111,7 +107,7 @@ def get_usdc_balance():
                 asset_type=AssetType.COLLATERAL, token_id="", signature_type=1))
         return float(ba.get("balance", 0)) / 1e6
     except Exception as e:
-        log(f"  ⚠ Balance error: {e}")
+        log(f"  balance error: {e}")
         return None
 
 
@@ -136,8 +132,25 @@ def cancel_all_orders(token_id=None):
             client.cancel_all()
         return True
     except Exception as e:
-        log(f"  ⚠ cancel error: {e}")
+        log(f"  cancel error: {e}")
         return False
+
+
+def post_limit(token_id, side, price, size, expiry_ts=None):
+    """Post a limit order (GTD with expiry or GTC). Returns order_id or None."""
+    try:
+        kwargs = dict(price=price, size=size, side=side, token_id=token_id)
+        if expiry_ts:
+            kwargs["expiration"] = str(int(expiry_ts))
+        order_args = OrderArgs(**kwargs)
+        signed = client.create_order(order_args)
+        order_type = OrderType.GTD if expiry_ts else OrderType.GTC
+        resp = client.post_order(signed, order_type)
+        oid = resp.get("orderID", "") if isinstance(resp, dict) else ""
+        return oid if oid else None
+    except Exception as e:
+        log(f"    order error ({side} {size}@{price}): {e}")
+        return None
 
 
 # =========================================================================
@@ -269,8 +282,6 @@ class BookTracker:
 # MARKET WEBSOCKET
 # =========================================================================
 class MarketWS:
-    """Connect to Polymarket WS for order book data."""
-
     def __init__(self, tracker: BookTracker):
         self.tracker = tracker
         self._tokens = set()
@@ -311,7 +322,7 @@ class MarketWS:
                     self.tracker.ws_start_time = time.time()
                     sub = {"type": "market", "assets_ids": list(self._tokens)}
                     await ws.send(json.dumps(sub))
-                    log(f"  📡 WS: subscribed to {len(self._tokens)} tokens")
+                    log(f"  WS: subscribed to {len(self._tokens)} tokens")
 
                     while not self._force_reconnect:
                         try:
@@ -338,113 +349,73 @@ class MarketWS:
                                         ch["asset_id"], ch["side"],
                                         ch["price"], ch["size"],
                                         ch.get("best_bid", 0), ch.get("best_ask", 0))
-                    log("  🔄 WS: reconnecting (token change)")
+                    log("  WS: reconnecting (token change)")
             except Exception as e:
-                log(f"  ⚠ WS error: {e}")
+                log(f"  WS error: {e}")
                 await asyncio.sleep(2)
 
 
 # =========================================================================
-# POSITION MANAGER
+# TRADE RECORDER
 # =========================================================================
-class PositionManager:
-    """Track open positions with simple lifecycle: pending → filled → closed."""
+def record_trade(crypto, token_side, token_id, entry_price, exit_price, shares,
+                 cost, pnl, hold_secs, reason):
+    record = {
+        "time": datetime.now(timezone.utc).isoformat(),
+        "crypto": crypto,
+        "token_side": token_side,
+        "token_id": token_id[:20] + "...",
+        "entry_price": entry_price,
+        "exit_price": round(exit_price, 4),
+        "shares": round(shares, 2),
+        "cost": round(cost, 4),
+        "pnl": round(pnl, 4),
+        "hold_secs": round(hold_secs, 1),
+        "reason": reason,
+        "dry_run": DRY_RUN,
+    }
+    try:
+        existing = []
+        if os.path.exists(TRADE_FILE):
+            with open(TRADE_FILE) as f:
+                existing = json.load(f)
+        existing.append(record)
+        with open(TRADE_FILE, "w") as f:
+            json.dump(existing, f, indent=2)
+    except Exception:
+        pass
+    return record
 
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._positions = {}     # token_id -> pos dict
-        self._cooldowns = {}     # token_id -> last_close_time
-        self.trade_count = 0
-        self.total_pnl = 0.0
-        self.session_start = time.time()
 
-    @property
-    def n_open(self):
-        with self._lock:
-            return len(self._positions)
-
-    def can_enter(self, token_id):
-        now = time.time()
-        with self._lock:
-            if len(self._positions) >= MAX_POSITIONS:
-                return False
-            if token_id in self._positions:
-                return False
-            if now - self._cooldowns.get(token_id, 0) < COOLDOWN:
-                return False
-        return True
-
-    def open(self, token_id, entry_price, shares, cost, order_id, window_end, crypto):
-        with self._lock:
-            self._positions[token_id] = {
-                "token_id": token_id,
-                "entry_price": entry_price,
-                "shares": shares,
-                "cost": cost,
-                "order_id": order_id,
-                "window_end": window_end,
-                "crypto": crypto,
-                "entry_time": time.time(),
-                "fill_time": None,
-                "status": "pending",
-            }
-
-    def mark_filled(self, token_id, actual_shares):
-        with self._lock:
-            pos = self._positions.get(token_id)
-            if pos:
-                pos["shares"] = actual_shares
-                pos["fill_time"] = time.time()
-                pos["status"] = "filled"
-
-    def close(self, token_id, exit_price, reason):
-        with self._lock:
-            pos = self._positions.pop(token_id, None)
-            if not pos:
-                return None
-            self._cooldowns[token_id] = time.time()
-
-        entry = pos["entry_price"]
-        shares = pos["shares"]
-        pnl = (exit_price - entry) * shares
-        hold = time.time() - pos["entry_time"]
-
-        self.trade_count += 1
-        self.total_pnl += pnl
-
-        record = {
-            "time": datetime.now(timezone.utc).isoformat(),
-            "crypto": pos["crypto"],
-            "token_id": token_id[:20] + "...",
-            "entry_price": entry,
-            "exit_price": round(exit_price, 4),
-            "shares": round(shares, 2),
-            "cost": round(pos["cost"], 4),
-            "pnl": round(pnl, 4),
-            "hold_secs": round(hold, 1),
-            "reason": reason,
-            "dry_run": DRY_RUN,
-        }
+# =========================================================================
+# FORCE SELL
+# =========================================================================
+def force_sell(token_id, max_retries=8):
+    """Cancel all orders then sell all shares at market. Returns total sold."""
+    if DRY_RUN:
+        return 0
+    total_sold = 0
+    for attempt in range(max_retries):
+        cancel_all_orders(token_id)
+        time.sleep(2 if attempt == 0 else 3)
+        bal = get_share_balance(token_id) or 0
+        if bal < MIN_SHARES:
+            return total_sold
+        sell_size = math.floor(bal * 100) / 100
+        if sell_size < MIN_SHARES:
+            return total_sold
         try:
-            existing = []
-            if os.path.exists(TRADE_FILE):
-                with open(TRADE_FILE) as f:
-                    existing = json.load(f)
-            existing.append(record)
-            with open(TRADE_FILE, "w") as f:
-                json.dump(existing, f, indent=2)
-        except Exception:
-            pass
-
-        return record
-
-    def get_all(self):
-        with self._lock:
-            return list(self._positions.items())
-
-    def has_position(self, token_id):
-        with self._lock:
-            return token_id in self._positions
+            order_args = OrderArgs(
+                price=0.01, size=sell_size, side=SELL, token_id=token_id)
+            signed = client.create_order(order_args)
+            client.post_order(signed, OrderType.GTC)
+            log(f"    force-sell {sell_size:.1f}sh (attempt {attempt + 1})")
+            total_sold += sell_size
+        except Exception as e:
+            log(f"    sell error (attempt {attempt + 1}): {e}")
+            continue
+        time.sleep(3)
+    return total_sold
 
 
 # =========================================================================
@@ -452,33 +423,42 @@ class PositionManager:
 # =========================================================================
 class MMBot:
     """
-    Main market-maker loop.
-    - Discovers markets, subscribes to book data.
-    - Scans for spread opportunities and enters via limit buy.
-    - Each position runs in its own thread for fill + exit management.
+    Two-sided market maker.
+    Per market: one thread manages both Up and Down tokens.
+    Main thread handles discovery and status.
     """
 
     def __init__(self):
         self.tracker = BookTracker()
         self.ws = MarketWS(self.tracker)
-        self.pm = PositionManager()
         self.markets = []
         self.token_to_market = {}
         self.last_discovery = 0
         self.last_status = 0
         self.balance = 0
-        self._known_tokens = set()
         self._shutting_down = False
+        self._known_tokens = set()
+
+        # Track active market threads by condition_id
+        self._active_markets = {}
+        self._active_lock = threading.Lock()
+
+        # Aggregated stats
+        self.trade_count = 0
+        self.total_pnl = 0.0
+        self.session_start = time.time()
+        self.spread_captures = 0
+        self.pairs_matched = 0
 
     def run(self):
-        log(f"{'=' * 60}")
-        log(f"  MM BOT {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
-        log(f"{'=' * 60}")
+        log("=" * 60)
+        log(f"  MM BOT v2 -- TWO-SIDED {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
+        log("=" * 60)
 
         self.balance = get_usdc_balance() or 0
         log(f"  Balance: ${self.balance:.2f}")
-        log(f"  Config: bet=${BET_SIZE}, spread_target={SPREAD_TARGET}, "
-            f"fill_wait={FILL_WAIT}s, max_hold={MAX_HOLD}s")
+        log(f"  Config: quote=${QUOTE_SIZE}/side  spread={SPREAD_TARGET}  "
+            f"buy_cutoff={BUY_CUTOFF}s  sell_exp={SELL_EXPIRY_BUF}s  cleanup={CLEANUP_BUF}s")
         log(f"  Markets: {', '.join(CRYPTOS)}")
 
         self.ws.start()
@@ -487,28 +467,30 @@ class MMBot:
         try:
             while True:
                 self._tick()
-                time.sleep(0.5)
+                time.sleep(1)
         except KeyboardInterrupt:
-            log("\n  🛑 Shutting down...")
+            log("")
+            log("  Shutting down...")
             self._shutting_down = True
-            time.sleep(1)
+            time.sleep(2)
             self._cleanup()
             end_balance = get_usdc_balance() or 0
             actual_pnl = end_balance - self.balance
-            log(f"  Session: {self.pm.trade_count} trades, "
-                f"PnL: ${self.pm.total_pnl:+.2f} (book) | "
-                f"${actual_pnl:+.2f} (USDC: ${self.balance:.2f} → ${end_balance:.2f})")
+            log(f"  Session: {self.trade_count} trades ({self.spread_captures} captures, "
+                f"{self.pairs_matched} pairs) | "
+                f"PnL: ${self.total_pnl:+.2f} (book) | "
+                f"${actual_pnl:+.2f} (USDC: ${self.balance:.2f} -> ${end_balance:.2f})")
 
-    # ── Discovery ──
+    # -- Discovery --
 
     def _discover(self):
         now = time.time()
-        if now - self.last_discovery < 30:
+        if now - self.last_discovery < 15:
             return
         self.last_discovery = now
 
         markets = discover_markets()
-        self.markets = [m for m in markets if m["secs_left"] > EXIT_BUFFER]
+        self.markets = [m for m in markets if m["secs_left"] > CLEANUP_BUF + 30]
         if not self.markets:
             return
 
@@ -521,316 +503,376 @@ class MMBot:
 
         self.ws.subscribe(all_tokens)
 
+        cryptos = sorted(set(m["crypto"] for m in self.markets))
         if len(self.markets) != getattr(self, "_prev_count", 0):
-            cryptos = sorted(set(m["crypto"] for m in self.markets))
-            log(f"  🔍 Tracking {len(self.markets)} markets: {', '.join(cryptos)}")
+            secs = self.markets[0]["secs_left"] if self.markets else 0
+            log(f"  Tracking {len(self.markets)} markets: "
+                f"{', '.join(cryptos)} ({secs:.0f}s left)")
             self._prev_count = len(self.markets)
 
-    # ── Main tick ──
+    # -- Main tick --
 
     def _tick(self):
         self._discover()
 
-        # Status every 30s
         now = time.time()
         if now - self.last_status > 30:
             self.last_status = now
-            mins = (now - self.pm.session_start) / 60
-            tph = self.pm.trade_count / max((now - self.pm.session_start) / 3600, 0.001)
-            log(f"  📊 {mins:.0f}m | trades={self.pm.trade_count} ({tph:.0f}/hr) | "
-                f"pnl=${self.pm.total_pnl:+.2f} | open={self.pm.n_open}/{MAX_POSITIONS} | "
-                f"markets={len(self.markets)}")
+            mins = (now - self.session_start) / 60
+            with self._active_lock:
+                n_active = len(self._active_markets)
+            log(f"  [{mins:.0f}m] trades={self.trade_count} "
+                f"(cap={self.spread_captures} pair={self.pairs_matched}) | "
+                f"pnl=${self.total_pnl:+.2f} | active={n_active}/{MAX_MARKETS}")
 
-        # Scan entries
-        if self.pm.n_open < MAX_POSITIONS:
-            self._scan_entries()
-
-    # ── Entry scanning ──
-
-    def _scan_entries(self):
-        for token_id, market in self.token_to_market.items():
-            secs_left = (market["window_end"] - datetime.now(timezone.utc)).total_seconds()
-            if secs_left < MIN_ENTRY_TIME:
-                continue
-            if not self.pm.can_enter(token_id):
+        # Launch market threads for new markets
+        for m in self.markets:
+            cid = m["condition_id"]
+            secs_left = (m["window_end"] - datetime.now(timezone.utc)).total_seconds()
+            if secs_left < BUY_CUTOFF:
                 continue
 
-            book = self.tracker.get_book(token_id)
-            if not book:
+            with self._active_lock:
+                if cid in self._active_markets:
+                    continue
+                if len(self._active_markets) >= MAX_MARKETS:
+                    continue
+
+            # Check balance
+            bal = get_usdc_balance()
+            if bal is not None:
+                self.balance = bal
+            if self.balance < MIN_BALANCE + QUOTE_SIZE * 2:
                 continue
-            if book["spread"] < MIN_SPREAD:
-                continue
-            if book["mid"] < MIN_MID or book["mid"] > MAX_MID:
-                continue
-            if book["bid_depth"] + book["ask_depth"] < MIN_DEPTH:
-                continue
 
-            self._enter(token_id, market, book)
-            return  # one entry per tick
+            t = threading.Thread(
+                target=self._market_lifecycle, args=(m,), daemon=True)
+            with self._active_lock:
+                self._active_markets[cid] = t
+            t.start()
 
-    def _enter(self, token_id, market, book):
-        entry_price = round(math.floor(book["bb"] / TICK) * TICK, 2)
-        if entry_price <= 0.01 or entry_price >= 0.99:
-            return
+    # -- Per-market lifecycle (one thread per crypto per window) --
 
-        self.balance = get_usdc_balance() or self.balance
-        if self.balance < MIN_BALANCE:
-            return
-
-        bet = min(BET_SIZE, MAX_BET)
-        shares = round(bet / entry_price, 2)
-        if shares < MIN_SHARES:
-            return
-
+    def _market_lifecycle(self, market):
+        """
+        Full lifecycle for one market (both Up and Down tokens).
+        Phase 1: Post BUY Up + BUY Down (GTD)
+        Phase 2: Monitor fills, post SELLs on fill
+        Phase 3: Cleanup - force sell remaining
+        """
         crypto = market["crypto"]
-        secs = (market["window_end"] - datetime.now(timezone.utc)).total_seconds()
-        log(f"  ⚡ {crypto} BUY @ {entry_price} | "
-            f"shares={shares:.1f} bet=${bet:.2f} | "
-            f"spread={book['spread']:.3f} mid={book['mid']:.3f} secs_left={secs:.0f}")
+        up_token = market["up_token"]
+        down_token = market["down_token"]
+        window_end = market["window_end"]
+        cid = market["condition_id"]
 
-        if DRY_RUN:
-            self.pm.open(token_id, entry_price, shares, bet, "dry",
-                         market["window_end"], crypto)
-            self.pm.mark_filled(token_id, shares)
-            # Simulate: close at mid after a few seconds
-            threading.Thread(
-                target=self._dry_run_lifecycle,
-                args=(token_id, entry_price, shares, market),
-                daemon=True).start()
-            return
+        # GTD expiry timestamps
+        buy_expiry = int(window_end.timestamp()) - BUY_CUTOFF
+        sell_expiry = int(window_end.timestamp()) - SELL_EXPIRY_BUF
+        cleanup_time = window_end - timedelta(seconds=CLEANUP_BUF)
+
+        # Per-token state
+        state = {
+            up_token: {
+                "status": "idle",
+                "buy_oid": None,
+                "sell_oid": None,
+                "entry": 0,
+                "shares": 0,
+                "label": f"{crypto} Up",
+                "token_side": "Up",
+                "fill_time": 0,
+                "pre_bal": 0,
+                "filled_shares": 0,
+            },
+            down_token: {
+                "status": "idle",
+                "buy_oid": None,
+                "sell_oid": None,
+                "entry": 0,
+                "shares": 0,
+                "label": f"{crypto} Dn",
+                "token_side": "Down",
+                "fill_time": 0,
+                "pre_bal": 0,
+                "filled_shares": 0,
+            },
+        }
+
+        self._known_tokens.add(up_token)
+        self._known_tokens.add(down_token)
 
         try:
-            order_args = OrderArgs(
-                price=entry_price, size=shares,
-                side=BUY, token_id=token_id,
-            )
-            signed = client.create_order(order_args)
-            resp = client.post_order(signed, OrderType.GTC)
-            order_id = resp.get("orderID", "") if isinstance(resp, dict) else ""
-            if not order_id:
-                log(f"    ⚠ Order rejected: {resp}")
+            secs_left = (window_end - datetime.now(timezone.utc)).total_seconds()
+            log(f"  {crypto} starting two-sided quotes ({secs_left:.0f}s left)")
+
+            # --- PHASE 1: Post BUY orders for both tokens ---
+            for token_id, st in state.items():
+                book = self.tracker.get_book(token_id)
+                if not book:
+                    log(f"    {st['label']}: no book data, skipping")
+                    continue
+                if book["spread"] < MIN_SPREAD:
+                    log(f"    {st['label']}: spread {book['spread']:.2f} < {MIN_SPREAD}, skip")
+                    continue
+                if book["mid"] < MIN_MID or book["mid"] > MAX_MID:
+                    log(f"    {st['label']}: mid {book['mid']:.2f} out of range, skip")
+                    continue
+                if book["bid_depth"] + book["ask_depth"] < MIN_DEPTH:
+                    continue
+
+                entry_price = round(math.floor(book["bb"] / TICK) * TICK, 2)
+                if entry_price <= 0.01 or entry_price >= 0.99:
+                    continue
+
+                shares = round(QUOTE_SIZE / entry_price, 2)
+                if shares < MIN_SHARES:
+                    continue
+
+                # Record pre-fill share balance
+                if not DRY_RUN:
+                    st["pre_bal"] = get_share_balance(token_id) or 0
+
+                exp_str = datetime.fromtimestamp(
+                    buy_expiry, tz=timezone.utc).strftime("%H:%M:%S")
+                log(f"    {st['label']} BUY @ {entry_price} "
+                    f"({shares:.1f}sh, ${QUOTE_SIZE:.0f}) exp={exp_str}")
+
+                if DRY_RUN:
+                    st["status"] = "buying"
+                    st["entry"] = entry_price
+                    st["shares"] = shares
+                    continue
+
+                oid = post_limit(token_id, BUY, entry_price, shares, buy_expiry)
+                if oid:
+                    st["buy_oid"] = oid
+                    st["entry"] = entry_price
+                    st["shares"] = shares
+                    st["status"] = "buying"
+                else:
+                    log(f"    {st['label']}: buy order failed")
+
+            # Check we posted at least one order
+            active = [t for t, s in state.items() if s["status"] == "buying"]
+            if not active:
+                log(f"    {crypto}: no orders posted, exiting")
                 return
 
-            log(f"    📝 Limit BUY posted: {order_id[:16]}...")
-            self._known_tokens.add(token_id)
-            self.pm.open(token_id, entry_price, shares, bet, order_id,
-                         market["window_end"], crypto)
+            # --- PHASE 2: Monitor fills and manage positions ---
+            last_requote = time.time()
 
-            threading.Thread(
-                target=self._position_lifecycle,
-                args=(token_id, order_id, entry_price, shares, market),
-                daemon=True).start()
+            while datetime.now(timezone.utc) < cleanup_time:
+                if self._shutting_down:
+                    break
+                time.sleep(CHECK_INTERVAL)
+
+                for token_id, st in state.items():
+                    if st["status"] == "buying":
+                        self._check_buy_fill(token_id, st, sell_expiry, crypto)
+                    elif st["status"] == "selling":
+                        self._check_sell_fill(token_id, st, crypto)
+
+                # Requote stale buys if book moved
+                now_t = time.time()
+                if now_t - last_requote > REQUOTE_INTERVAL:
+                    last_requote = now_t
+                    secs_left = (window_end - datetime.now(timezone.utc)).total_seconds()
+                    if secs_left > BUY_CUTOFF:
+                        for token_id, st in state.items():
+                            if st["status"] == "buying":
+                                self._try_requote(token_id, st, buy_expiry)
+
+            # --- PHASE 3: Cleanup ---
+            log(f"  {crypto} cleanup phase")
+
+            for token_id, st in state.items():
+                # Cancel all pending orders for this token
+                if st["status"] in ("buying", "selling"):
+                    cancel_all_orders(token_id)
+
+                if st["status"] == "buying":
+                    # Check for late fill after cancel
+                    if not DRY_RUN:
+                        time.sleep(1)
+                        bal = get_share_balance(token_id) or 0
+                        filled = bal - st["pre_bal"]
+                        if filled >= MIN_SHARES:
+                            st["shares"] = min(filled, st["shares"])
+                            st["status"] = "filled"
+                            st["fill_time"] = time.time()
+                            st["filled_shares"] = st["shares"]
+                            log(f"    {st['label']}: late fill {filled:.1f}sh")
+                        else:
+                            st["status"] = "done"
+                    else:
+                        st["status"] = "done"
+
+                # Force sell any tokens we still hold
+                if st["status"] in ("filled", "selling"):
+                    book = self.tracker.get_book(token_id)
+                    exit_price = book["bb"] if book else st["entry"]
+
+                    if not DRY_RUN:
+                        force_sell(token_id)
+
+                    hold = time.time() - st["fill_time"] if st["fill_time"] else 0
+                    pnl = (exit_price - st["entry"]) * st["shares"]
+                    self.trade_count += 1
+                    self.total_pnl += pnl
+                    record_trade(crypto, st["token_side"], token_id,
+                                 st["entry"], exit_price, st["shares"],
+                                 st["entry"] * st["shares"], pnl, hold, "cleanup")
+                    icon = "+" if pnl >= 0 else "-"
+                    log(f"    [{icon}] {st['label']} cleanup: "
+                        f"pnl=${pnl:+.2f} ({hold:.0f}s hold)")
+                    st["status"] = "done"
+
+            # Check for matched pair
+            up_st = state[up_token]
+            down_st = state[down_token]
+            up_filled = up_st.get("filled_shares", 0)
+            down_filled = down_st.get("filled_shares", 0)
+            if up_filled > 0 and down_filled > 0:
+                pair_cost = up_st["entry"] + down_st["entry"]
+                matched = min(up_filled, down_filled)
+                if matched > 0 and pair_cost < 1.0:
+                    pair_profit = (1.0 - pair_cost) * matched
+                    log(f"  {crypto} PAIR: {matched:.0f}sh x "
+                        f"${1.0 - pair_cost:.2f} = ${pair_profit:+.2f} implicit")
+                    self.pairs_matched += 1
 
         except Exception as e:
-            log(f"    ⚠ Order error: {e}")
-            self._known_tokens.add(token_id)
-
-    # ── Position lifecycle (one thread per position) ──
-
-    def _position_lifecycle(self, token_id, order_id, entry_price, ordered_shares, market):
-        """
-        Full lifecycle for one position:
-          Phase 1: Wait for buy fill
-          Phase 2: Post sell limit, wait for sell fill or force-exit
-        """
-        crypto = market["crypto"]
-        pre_bal = get_share_balance(token_id) or 0
-        start = time.time()
-
-        # ─── PHASE 1: Wait for buy limit to fill ───
-        actual_shares = 0
-        while time.time() - start < FILL_WAIT:
-            if self._shutting_down:
-                cancel_all_orders(token_id)
-                self.pm.close(token_id, entry_price, "shutdown")
-                return
-            time.sleep(1)
-
-            # Abort if not enough time for a full round trip
-            secs_left = (market["window_end"] - datetime.now(timezone.utc)).total_seconds()
-            if secs_left < EXIT_BUFFER + 30:
-                cancel_all_orders(token_id)
-                self.pm.close(token_id, entry_price, "no_fill")
-                log(f"    ❌ {crypto} cancelled (window ending)")
-                return
-
-            bal = get_share_balance(token_id) or 0
-            filled = bal - pre_bal
-            if filled >= MIN_SHARES:
-                # Cancel remaining buy order
+            log(f"  {crypto} lifecycle error: {e}")
+            for token_id in [up_token, down_token]:
                 try:
-                    client.cancel(order_id)
+                    cancel_all_orders(token_id)
+                    if not DRY_RUN:
+                        force_sell(token_id)
                 except Exception:
                     pass
-                cancel_all_orders(token_id)
-                time.sleep(1.5)
+        finally:
+            with self._active_lock:
+                self._active_markets.pop(cid, None)
 
-                # Re-check for late chunks
-                final_bal = get_share_balance(token_id) or 0
-                actual_shares = min(max(final_bal - pre_bal, filled), ordered_shares)
-                break
-
-        if actual_shares < MIN_SHARES:
-            # No fill
-            cancel_all_orders(token_id)
-            time.sleep(1)
-            # Check one last time
-            bal = get_share_balance(token_id) or 0
-            filled = bal - pre_bal
-            if filled >= MIN_SHARES:
-                actual_shares = min(filled, ordered_shares)
-            else:
-                self.pm.close(token_id, entry_price, "no_fill")
-                log(f"    ❌ {crypto} no fill after {FILL_WAIT}s")
-                return
-
-        self.pm.mark_filled(token_id, actual_shares)
-        fill_time = time.time()
-        log(f"    ✅ {crypto} filled: {actual_shares:.1f}sh @ {entry_price}")
-
-        # ─── PHASE 2: Post sell limit, monitor until exit ───
-        sell_price = round(entry_price + SPREAD_TARGET, 2)
-        if sell_price > 0.99:
-            sell_price = 0.99
-
-        sell_shares = math.floor(actual_shares * 100) / 100
-        sell_posted = False
-        if sell_shares >= MIN_SHARES and not self._shutting_down:
-            try:
-                order_args = OrderArgs(
-                    price=sell_price, size=sell_shares,
-                    side=SELL, token_id=token_id,
-                )
-                signed = client.create_order(order_args)
-                resp = client.post_order(signed, OrderType.GTC)
-                sell_oid = resp.get("orderID", "") if isinstance(resp, dict) else ""
-                if sell_oid:
-                    log(f"    🎯 {crypto} SELL limit @ {sell_price} ({sell_shares:.1f}sh)")
-                    sell_posted = True
-                else:
-                    log(f"    ⚠ Sell order failed: {resp}")
-            except Exception as e:
-                log(f"    ⚠ Sell order error: {e}")
-
-        # Monitor: check every 3s if sell filled or if we need to force-exit
-        check_interval = 3
-        while True:
-            if self._shutting_down:
-                log(f"    🛑 {crypto} shutdown — force selling")
-                self._force_sell(token_id)
-                book = self.tracker.get_book(token_id)
-                exit_price = book["bb"] if book else entry_price
-                trade = self.pm.close(token_id, exit_price, "shutdown")
-                if trade:
-                    log(f"    {'💰' if trade['pnl'] > 0 else '🔻'} {crypto}: "
-                        f"pnl=${trade['pnl']:+.4f} ({trade['hold_secs']:.1f}s)")
-                return
-
-            time.sleep(check_interval)
-
-            # Check if sell limit filled (no more shares)
-            bal = get_share_balance(token_id) or 0
-            if bal < MIN_SHARES:
-                trade = self.pm.close(token_id, sell_price, "spread_captured")
-                if trade:
-                    log(f"    💰 {crypto} SPREAD CAPTURED: "
-                        f"pnl=${trade['pnl']:+.4f} ({trade['hold_secs']:.1f}s)")
-                return
-
-            hold = time.time() - fill_time
-            secs_left = (market["window_end"] - datetime.now(timezone.utc)).total_seconds()
-
-            # Force exit: window ending
-            if secs_left < EXIT_BUFFER:
-                log(f"    ⏰ {crypto} window ending ({secs_left:.0f}s left)")
-                self._force_sell(token_id)
-                book = self.tracker.get_book(token_id)
-                exit_price = book["bb"] if book else entry_price
-                trade = self.pm.close(token_id, exit_price, "window_end")
-                if trade:
-                    log(f"    {'💰' if trade['pnl'] > 0 else '🔻'} {crypto}: "
-                        f"pnl=${trade['pnl']:+.4f} ({trade['hold_secs']:.1f}s)")
-                return
-
-            # Force exit: max hold time
-            if hold > MAX_HOLD:
-                log(f"    ⏰ {crypto} max hold ({hold:.0f}s)")
-                self._force_sell(token_id)
-                book = self.tracker.get_book(token_id)
-                exit_price = book["bb"] if book else entry_price
-                trade = self.pm.close(token_id, exit_price, "timeout")
-                if trade:
-                    log(f"    {'💰' if trade['pnl'] > 0 else '🔻'} {crypto}: "
-                        f"pnl=${trade['pnl']:+.4f} ({trade['hold_secs']:.1f}s)")
-                return
-
-    def _dry_run_lifecycle(self, token_id, entry_price, shares, market):
-        """Simulate position lifecycle in dry run mode."""
-        time.sleep(5)
-        book = self.tracker.get_book(token_id)
-        if book:
-            mid = book["mid"]
-            if mid >= entry_price + SPREAD_TARGET:
-                exit_price = entry_price + SPREAD_TARGET
-                reason = "spread_captured"
-            else:
-                exit_price = mid
-                reason = "timeout"
-        else:
-            exit_price = entry_price
-            reason = "timeout_no_data"
-        trade = self.pm.close(token_id, exit_price, reason)
-        if trade:
-            log(f"    🧪 DRY {trade['crypto']}: pnl=${trade['pnl']:+.4f} ({reason})")
-
-    # ── Sell helpers ──
-
-    def _force_sell(self, token_id, max_retries=8):
-        """Cancel all orders then sell all shares. Retries until clean."""
+    def _check_buy_fill(self, token_id, st, sell_expiry, crypto):
+        """Check if a BUY order filled. If so, post SELL."""
         if DRY_RUN:
             return
 
-        for attempt in range(max_retries):
-            cancel_all_orders(token_id)
-            time.sleep(2 if attempt == 0 else 3)
+        bal = get_share_balance(token_id) or 0
+        filled = bal - st["pre_bal"]
+        if filled >= MIN_SHARES:
+            actual_shares = min(filled, st["shares"])
+            st["shares"] = actual_shares
+            st["status"] = "filled"
+            st["fill_time"] = time.time()
+            st["filled_shares"] = actual_shares
+            log(f"    [FILL] {st['label']}: {actual_shares:.1f}sh @ {st['entry']}")
 
-            bal = get_share_balance(token_id) or 0
-            if bal < MIN_SHARES:
-                if attempt > 0:
-                    log(f"    ✅ All shares sold ({attempt + 1} attempts)")
+            # Cancel remaining buy if any
+            if st["buy_oid"]:
+                try:
+                    client.cancel(st["buy_oid"])
+                except Exception:
+                    pass
+
+            # Post SELL at entry + spread target
+            sell_price = round(st["entry"] + SPREAD_TARGET, 2)
+            if sell_price > 0.99:
+                sell_price = 0.99
+            sell_shares = math.floor(actual_shares * 100) / 100
+            if sell_shares < MIN_SHARES:
+                log(f"    {st['label']}: {actual_shares:.1f}sh too small to sell")
                 return
 
-            sell_size = math.floor(bal * 100) / 100
-            if sell_size < MIN_SHARES:
-                log(f"    ⚠ {bal:.2f}sh dust (< min {MIN_SHARES})")
-                return
+            oid = post_limit(token_id, SELL, sell_price, sell_shares, sell_expiry)
+            if oid:
+                st["sell_oid"] = oid
+                st["status"] = "selling"
+                exp_str = datetime.fromtimestamp(
+                    sell_expiry, tz=timezone.utc).strftime("%H:%M:%S")
+                log(f"    [SELL] {st['label']} limit @ {sell_price} "
+                    f"({sell_shares:.1f}sh) exp={exp_str}")
+            else:
+                log(f"    {st['label']}: sell order failed")
 
-            try:
-                order_args = OrderArgs(
-                    price=0.01, size=sell_size,
-                    side=SELL, token_id=token_id,
-                )
-                signed = client.create_order(order_args)
-                client.post_order(signed, OrderType.GTC)
-                log(f"    📤 Sell {sell_size:.1f}sh @ market (attempt {attempt + 1})")
-            except Exception as e:
-                log(f"    ⚠ Sell error (attempt {attempt + 1}): {e}")
-                continue
-
-            time.sleep(3)
+    def _check_sell_fill(self, token_id, st, crypto):
+        """Check if SELL order filled (shares gone = sold)."""
+        if DRY_RUN:
+            return
 
         bal = get_share_balance(token_id) or 0
-        if bal >= MIN_SHARES:
-            log(f"    ❌ FAILED to sell {bal:.1f}sh after {max_retries} attempts!")
+        remaining = bal - st["pre_bal"]
+        if remaining < MIN_SHARES:
+            # Sell filled!
+            exit_price = st["entry"] + SPREAD_TARGET
+            hold = time.time() - st["fill_time"]
+            pnl = SPREAD_TARGET * st["shares"]
+            self.trade_count += 1
+            self.total_pnl += pnl
+            self.spread_captures += 1
+            record_trade(crypto, st["token_side"], token_id,
+                         st["entry"], exit_price, st["shares"],
+                         st["entry"] * st["shares"], pnl, hold, "spread_captured")
+            log(f"    [CAPTURED] {st['label']}: "
+                f"pnl=${pnl:+.4f} ({hold:.1f}s hold)")
+            st["status"] = "done"
 
-    # ── Cleanup ──
+    def _try_requote(self, token_id, st, buy_expiry):
+        """Cancel stale buy and repost if book moved significantly."""
+        book = self.tracker.get_book(token_id)
+        if not book:
+            return
+        new_bb = round(math.floor(book["bb"] / TICK) * TICK, 2)
+        if new_bb == st["entry"]:
+            return
+        if new_bb <= 0.01 or new_bb >= 0.99:
+            return
+        if book["mid"] < MIN_MID or book["mid"] > MAX_MID:
+            return
+        if book["spread"] < MIN_SPREAD:
+            return
+
+        # Cancel old order
+        if st["buy_oid"]:
+            try:
+                client.cancel(st["buy_oid"])
+            except Exception:
+                pass
+
+        # Check for partial fill before reposting
+        if not DRY_RUN:
+            time.sleep(1)
+            bal = get_share_balance(token_id) or 0
+            filled = bal - st["pre_bal"]
+            if filled >= MIN_SHARES:
+                return  # Got filled, will handle in next check cycle
+
+        new_shares = round(QUOTE_SIZE / new_bb, 2)
+        if new_shares < MIN_SHARES:
+            return
+
+        if DRY_RUN:
+            st["entry"] = new_bb
+            st["shares"] = new_shares
+            return
+
+        oid = post_limit(token_id, BUY, new_bb, new_shares, buy_expiry)
+        if oid:
+            st["buy_oid"] = oid
+            st["entry"] = new_bb
+            st["shares"] = new_shares
+            log(f"    [REQUOTE] {st['label']} BUY @ {new_bb} ({new_shares:.1f}sh)")
+
+    # -- Global Cleanup --
 
     def _cleanup(self):
         """Cancel everything and sell all held shares."""
         if DRY_RUN:
             return
 
-        log("  🧹 Cleanup: cancelling all orders...")
+        log("  Global cleanup: cancelling all orders...")
         cancel_all_orders()
         time.sleep(3)
 
@@ -841,23 +883,20 @@ class MMBot:
             except Exception:
                 continue
             if bal >= MIN_SHARES:
-                log(f"  🧹 Selling {bal:.1f}sh on {token_id[:20]}...")
-                self._force_sell(token_id, max_retries=10)
-            elif bal > 0.5:
-                log(f"  ⚠ Dust: {bal:.1f}sh on {token_id[:20]}... (< min)")
+                log(f"  Selling {bal:.1f}sh on {token_id[:20]}...")
+                force_sell(token_id, max_retries=10)
 
-        # Final verification
         time.sleep(3)
         for token_id in all_tokens:
             try:
                 bal = get_share_balance(token_id) or 0
                 if bal >= MIN_SHARES:
-                    log(f"  ⚠ STILL {bal:.1f}sh on {token_id[:20]} — retrying")
-                    self._force_sell(token_id, max_retries=5)
+                    log(f"  STILL {bal:.1f}sh -- retrying")
+                    force_sell(token_id, max_retries=5)
             except Exception:
                 continue
 
-        log("  ✅ Cleanup complete")
+        log("  Cleanup complete")
 
 
 # =========================================================================
