@@ -227,7 +227,7 @@ class BookTracker:
         self._lock = threading.Lock()
         self._books = {}
         self._last_update = {}
-        self.ws_start_time = 0
+        self.ws_start_time = time.time()
 
     def on_snapshot(self, token_id, bids, asks):
         with self._lock:
@@ -620,6 +620,13 @@ class MMBot:
         try:
             secs_left = (window_end - datetime.now(timezone.utc)).total_seconds()
             log(f"  {crypto} starting two-sided quotes ({secs_left:.0f}s left)")
+
+            # Wait for WS book data before proceeding
+            deadline = time.time() + WS_WARMUP + 2
+            while time.time() < deadline:
+                if all(self.tracker.get_book(t) for t in [up_token, down_token]):
+                    break
+                time.sleep(0.5)
 
             # --- PHASE 1: Post BUY orders for both tokens ---
             for token_id, st in state.items():
