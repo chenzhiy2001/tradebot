@@ -538,23 +538,54 @@ class LiqSniper:
         """Called by BinanceSpikeFeed when a volume spike is detected."""
         now = time.time()
 
-        # Cooldown check
-        last_spike = self._spike_cooldowns.get(crypto, 0)
-        if now - last_spike < SPIKE_COOLDOWN:
-            return
-        self._spike_cooldowns[crypto] = now
-
-        log(f"\n  🚨 SPIKE: {crypto.upper()} {direction} — "
-            f"${spike_usd:,.0f} vol ({spike_ratio:.1f}× baseline), "
-            f"{dir_ratio:.0%} directional")
-
         # Check if we have a live market for this crypto
         with self._lock:
             market = self.markets.get(crypto)
 
         if not market:
-            log(f"     ⊘ No live market for {crypto.upper()}")
-            return
+            return  # silent — no market, no log spam
+
+        market_key = f"{crypto}_{market['epoch']}"
+
+        # Check for existing position on this market
+        existing_pos = None
+        for pos in self.positions:
+            if pos.get("market_key") == market_key:
+                existing_pos = pos
+                break
+
+        # If we have a position in the SAME direction, cooldown applies
+        if existing_pos and existing_pos["direction"] == direction:
+            return  # already positioned correctly
+
+        # If we have a position in the OPPOSITE direction → FLIP
+        is_flip = existing_pos is not None and existing_pos["direction"] != direction
+
+        if not is_flip:
+            # Normal cooldown for fresh entries
+            last_spike = self._spike_cooldowns.get(crypto, 0)
+            if now - last_spike < SPIKE_COOLDOWN:
+                return
+
+        self._spike_cooldowns[crypto] = now
+
+        if is_flip:
+            log(f"\n  🔄 REVERSE SPIKE: {crypto.upper()} {direction} — "
+                f"${spike_usd:,.0f} vol ({spike_ratio:.1f}× baseline), "
+                f"{dir_ratio:.0%} directional")
+            log(f"     Closing {existing_pos['direction']} position to flip...")
+            sold = self._sell_now(existing_pos, "FLIP")
+            if sold:
+                if existing_pos in self.positions:
+                    self.positions.remove(existing_pos)
+                self.completed.append(existing_pos)
+            else:
+                log(f"     ⚠ Could not close old position, skipping flip")
+                return
+        else:
+            log(f"\n  🚨 SPIKE: {crypto.upper()} {direction} — "
+                f"${spike_usd:,.0f} vol ({spike_ratio:.1f}× baseline), "
+                f"{dir_ratio:.0%} directional")
 
         # Check window timing
         utc_now = datetime.now(timezone.utc)
@@ -585,13 +616,6 @@ class LiqSniper:
         if balance is None or balance < MIN_BALANCE:
             log(f"     ⊘ Low balance: ${balance}")
             return
-
-        # Check if already have a position on this market
-        market_key = f"{crypto}_{market['epoch']}"
-        for pos in self.positions:
-            if pos.get("market_key") == market_key:
-                log(f"     ⊘ Already have position on {market_key}")
-                return
 
         # Determine token to buy
         if direction == "UP":
