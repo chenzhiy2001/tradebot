@@ -62,9 +62,9 @@ TICK            = 0.01     # price tick
 BUY_CUTOFF      = 150      # stop posting buys N sec before window end
 SELL_EXPIRY_BUF = 30       # GTD sell expires N sec before window end
 CLEANUP_BUF     = 75       # force-sell remaining N sec before window end
-CHECK_INTERVAL  = 4        # seconds between fill checks per market
-REQUOTE_INTERVAL = 20      # seconds between requoting if book moved
-WS_WARMUP       = 8        # WS warm-up delay
+CHECK_INTERVAL  = 2        # seconds between fill checks per market
+REQUOTE_INTERVAL = 10      # seconds between requoting if book moved
+WS_WARMUP       = 5        # WS warm-up delay
 
 # -- Risk --
 MAX_MARKETS     = 4        # max simultaneous market threads
@@ -495,7 +495,7 @@ class MMBot:
 
     def _discover(self):
         now = time.time()
-        if now - self.last_discovery < 15:
+        if now - self.last_discovery < 5:
             return
         self.last_discovery = now
 
