@@ -58,7 +58,6 @@ DRY_RUN = "--dry-run" in sys.argv
 MIN_WHALE_SIZE = 1000         # Minimum accumulated $ to count as a whale trade
 BUY_AMOUNT = 25               # Our bet size per copy-trade ($)
 MIN_BET = 3                   # Minimum viable bet
-MIN_ENTRY_PRICE = 0.50        # Skip entries below this price (avoid coinflip gambles)
 ACCUM_WINDOW = 15             # Seconds to accumulate fragments from same wallet+token
 COOLDOWN_SECS = 15            # Don't re-enter same market within this window
 MAX_POSITIONS = 6             # Max concurrent positions
@@ -676,11 +675,6 @@ class WhaleBot:
             if pos.get("condition_id") == condition_id:
                 log(f"     ⊘ Skip: already in this market")
                 return
-
-        # Price floor — sub-50c entries are coinflips
-        if avg_price < MIN_ENTRY_PRICE:
-            log(f"     ⊘ Skip: entry price {avg_price:.2f} < {MIN_ENTRY_PRICE}")
-            return
 
         success = self._execute_buy(
             token_id=token_id,
