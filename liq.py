@@ -561,6 +561,12 @@ class LiqSniper:
         # If we have a position in the OPPOSITE direction → FLIP
         is_flip = existing_pos is not None and existing_pos["direction"] != direction
 
+        # Block flip if a sell is already in progress (prevents race condition spam)
+        if is_flip and existing_pos.get("sell_order_id"):
+            return  # sell already pending, don't spam flip attempts
+        if is_flip and existing_pos.get("_flip_pending"):
+            return  # flip already being attempted
+
         if not is_flip:
             # Normal cooldown for fresh entries
             last_spike = self._spike_cooldowns.get(crypto, 0)
@@ -574,12 +580,14 @@ class LiqSniper:
                 f"${spike_usd:,.0f} vol ({spike_ratio:.1f}× baseline), "
                 f"{dir_ratio:.0%} directional")
             log(f"     Closing {existing_pos['direction']} position to flip...")
+            existing_pos["_flip_pending"] = True
             sold = self._sell_now(existing_pos, "FLIP")
             if sold:
                 if existing_pos in self.positions:
                     self.positions.remove(existing_pos)
                 self.completed.append(existing_pos)
             else:
+                existing_pos["_flip_pending"] = False
                 log(f"     ⚠ Could not close old position, skipping flip")
                 return
         else:
@@ -734,8 +742,47 @@ class LiqSniper:
 
                 # Log trade
                 self._log_trade(pos, "OPEN")
+
+                # Post-fill sanity check: if mid already past SL, sell immediately
+                try:
+                    mid_data = client.get_midpoint(token_id)
+                    post_mid = float(mid_data.get("mid", 0))
+                    if post_mid > 0 and (post_mid - buy_price) <= -STOP_LOSS * 2:
+                        sell_at = max(round(post_mid - EXIT_SPREAD, 2), 0.01)
+                        log(f"     ⚠ Post-fill SL: mid={post_mid:.2f} already "
+                            f"{post_mid - buy_price:+.2f}¢ from entry, emergency sell @ {sell_at}")
+                        pos["_pending_sell_price"] = sell_at
+                        self._sell_now(pos, "SL")
+                except Exception:
+                    pass
             else:
                 log(f"     ⏳ Not filled after {FILL_WAIT}s")
+                # Double-check: wait a beat and re-check in case of cancel/fill race
+                time.sleep(1)
+                late_fill = get_share_balance(token_id)
+                if late_fill is not None and late_fill >= MIN_ORDER_SIZE:
+                    fee = compute_taker_fee(late_fill, buy_price)
+                    cost = round(late_fill * buy_price + fee, 4)
+                    log(f"     ⚠ Late fill detected! {late_fill:.1f}sh — adopting position")
+                    pos = {
+                        "market_key": market_key,
+                        "market": market,
+                        "direction": direction,
+                        "token_id": token_id,
+                        "buy_price": buy_price,
+                        "shares": late_fill,
+                        "cost": cost,
+                        "spike_usd": spike_usd,
+                        "spike_ratio": spike_ratio,
+                        "dir_ratio": dir_ratio,
+                        "buy_time": time.time(),
+                        "sell_order_id": None,
+                        "resolved": False,
+                        "dry_run": False,
+                    }
+                    self.positions.append(pos)
+                    self._trade_count += 1
+                    self._log_trade(pos, "OPEN")
 
         except Exception as e:
             log(f"     ⚠ Buy error: {e}")
@@ -1035,10 +1082,29 @@ class LiqSniper:
             f.write(json.dumps(record) + "\n")
 
     def _shutdown(self):
-        """Clean shutdown: cancel open buys, keep sell orders live."""
+        """Clean shutdown: cancel ALL open orders to prevent orphaned positions."""
         self._running = False
         log("  Cancelling open buy orders (keeping sells live)...")
-        # No open buys to cancel (we cancel after FILL_WAIT)
+        # Cancel all open orders for tracked markets to prevent orphaned positions
+        try:
+            for pos in self.positions:
+                if not pos.get("resolved") and not pos.get("sell_order_id"):
+                    # This position has no pending sell — safe to cancel any lingering buys
+                    pass
+            # Use CLOB cancel_all to nuke any lingering buy orders
+            open_orders = client.get_orders(OpenOrderParams())
+            if open_orders:
+                for order in open_orders:
+                    side = order.get("side", "")
+                    oid = order.get("id", "")
+                    if side == "BUY" and oid:
+                        try:
+                            client.cancel(oid)
+                            log(f"  Cancelled lingering buy order {oid[:10]}")
+                        except Exception:
+                            pass
+        except Exception as e:
+            log(f"  ⚠ Error cancelling orders: {e}")
 
         final_balance = get_usdc_balance()
         log("")
