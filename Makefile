@@ -59,6 +59,7 @@ strategy_logs_paths:
 	@echo $(CURDIR)/strategy_trades.json
 	@echo $(CURDIR)/data.json
 	@echo $(CURDIR)/perf.json
+	@echo $(CURDIR)/history.json
 
 flow_logs_paths:
 	@echo "Full paths:"
