@@ -552,16 +552,16 @@ class WhaleBot:
         self._record_mm_activity(proxy_wallet, condition_id, side_name)
 
         # ── IMMEDIATE EXIT CHECK ──
-        # If anyone sells our held token or buys the opposite side, exit now
-        if self.positions:
+        # Only react to whale-size ($100+) contrary activity, not random small trades
+        if self.positions and trade_value >= MIN_WHALE_SIZE:
             if side == "SELL" and token_id in self.positions:
-                log(f"\n  🚨 EXIT: {name} selling our {outcome} position")
+                log(f"\n  🚨 EXIT: {name} selling ${trade_value:.0f} of our {outcome} position")
                 self._exit_position_retry(token_id)
                 return
             if side == "BUY":
                 for held_token, held_pos in list(self.positions.items()):
                     if held_pos.get("condition_id") == condition_id and held_token != token_id:
-                        log(f"\n  🚨 EXIT: {name} buying opposite side ({outcome})")
+                        log(f"\n  🚨 EXIT: {name} buying ${trade_value:.0f} opposite side ({outcome})")
                         self._exit_position_retry(held_token)
                         break
 
@@ -794,16 +794,21 @@ class WhaleBot:
             self._record_close(token_id, pos, cp, "SIGNAL_SELL")
             return
 
-        actual_bal = get_share_balance(token_id)
-        if not actual_bal or actual_bal < 0.5:
-            log(f"     ⚠ No shares to sell (balance={actual_bal})")
-            self._record_close(token_id, pos, pos["entry_price"], "SIGNAL_SELL_EMPTY")
-            return
-
-        sell_amt = math.floor(actual_bal * 100) / 100
         attempt = 0
+        max_settle_retries = 5
         while True:
             attempt += 1
+            actual_bal = get_share_balance(token_id)
+            if not actual_bal or actual_bal < 0.5:
+                if attempt <= max_settle_retries:
+                    log(f"     ⏳ Shares not settled yet (balance={actual_bal}), waiting... [{attempt}/{max_settle_retries}]")
+                    time.sleep(2)
+                    continue
+                else:
+                    log(f"     ⚠ Shares still empty after {max_settle_retries} retries — keeping position for resolution")
+                    return
+
+            sell_amt = math.floor(actual_bal * 100) / 100
             try:
                 mo = MarketOrderArgs(
                     token_id=token_id,
