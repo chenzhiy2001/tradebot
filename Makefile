@@ -161,6 +161,16 @@ arb_dry_logs_backup:
 	zip -j -9 archives/arb_dry_logs_$$(date +%Y%m%d_%H%M%S).zip arb_dry_log.txt arb_dry_trades.json
 	rm -f arb_dry_log.txt arb_dry_trades.json
 
+xarb_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/xarb_logs_$$(date +%Y%m%d_%H%M%S).zip xarb_log.txt xarb_trades.json
+	rm -f xarb_log.txt xarb_trades.json
+
+xarb_dry_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/xarb_dry_logs_$$(date +%Y%m%d_%H%M%S).zip xarb_dry_log.txt xarb_dry_trades.json
+	rm -f xarb_dry_log.txt xarb_dry_trades.json
+
 git_logs_backup:
 	git add .
 	git commit -m "backup logs"
