@@ -779,16 +779,21 @@ class WhaleBot:
             self._record_close(our_token, our_pos, cp, "WHALE_SELL")
             return
 
-        actual_bal = get_share_balance(our_token)
-        if not actual_bal or actual_bal < 0.5:
-            log(f"     ⚠ No shares to sell (balance={actual_bal})")
-            self._record_close(our_token, our_pos, our_pos["entry_price"], "WHALE_SELL_EMPTY")
-            return
-
-        sell_amt = math.floor(actual_bal * 100) / 100
         attempt = 0
+        max_settle_retries = 5
         while True:
             attempt += 1
+            actual_bal = get_share_balance(our_token)
+            if not actual_bal or actual_bal < 0.5:
+                if attempt <= max_settle_retries:
+                    log(f"     ⏳ Shares not settled yet (balance={actual_bal}), waiting... [{attempt}/{max_settle_retries}]")
+                    time.sleep(2)
+                    continue
+                else:
+                    log(f"     ⚠ Shares still empty after {max_settle_retries} retries — keeping position for resolution")
+                    return
+
+            sell_amt = math.floor(actual_bal * 100) / 100
             try:
                 mo = MarketOrderArgs(
                     token_id=our_token,
