@@ -810,7 +810,7 @@ class WhaleBot:
                 pnl = (cp * sell_amt) - our_pos["cost"]
                 log(f"     ✓ Sold {sell_amt:.1f}sh @ ~{cp:.2f} (P&L: ${pnl:+.2f}) [attempt {attempt}]")
                 self._apply_profit_reserve(pnl)
-                self._record_close(our_token, our_pos, cp, "WHALE_SELL")
+                self._record_close(our_token, our_pos, cp, "WHALE_SELL", actual_shares=sell_amt)
                 return
 
             except Exception as e:
@@ -866,7 +866,7 @@ class WhaleBot:
                 pnl = (cp * sell_amt) - pos["cost"]
                 log(f"     ✓ Sold {sell_amt:.1f}sh @ ~{cp:.2f} (P&L: ${pnl:+.2f}) [attempt {attempt}]")
                 self._apply_profit_reserve(pnl)
-                self._record_close(token_id, pos, cp, "SIGNAL_SELL")
+                self._record_close(token_id, pos, cp, "SIGNAL_SELL", actual_shares=sell_amt)
                 return
 
             except Exception as e:
@@ -962,6 +962,14 @@ class WhaleBot:
                 if on_chain and on_chain > 0.5:
                     actual_shares = on_chain
 
+                # If we already hold this token (e.g. kept for resolution), accumulate
+                existing = self.positions.get(token_id)
+                if existing:
+                    actual_cost += existing["cost"]
+                    actual_shares = on_chain if (on_chain and on_chain > 0.5) else (actual_shares + existing["shares"])
+                    current_price = actual_cost / actual_shares if actual_shares > 0 else current_price
+                    log(f"     ℹ Merged with existing position (total {actual_shares:.1f}sh, ${actual_cost:.2f})")
+
                 self.positions[token_id] = {
                     "token_id": token_id,
                     "condition_id": condition_id,
@@ -1013,8 +1021,8 @@ class WhaleBot:
 
     # ─── RECORD CLOSE ────────────────────────────────────────────────
 
-    def _record_close(self, token_id, pos, exit_price, action):
-        shares = pos["shares"]
+    def _record_close(self, token_id, pos, exit_price, action, actual_shares=None):
+        shares = actual_shares if actual_shares is not None else pos["shares"]
         cost = pos["cost"]
         pnl = (exit_price * shares) - cost
 
