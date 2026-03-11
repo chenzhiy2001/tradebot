@@ -151,6 +151,11 @@ strategy_rw_logs_backup:
 	zip -j -9 archives/strategy_rw_logs_$$(date +%Y%m%d_%H%M%S).zip strategy_rw_log.txt strategy_rw_trades.json
 	rm -f strategy_rw_log.txt strategy_rw_trades.json
 
+arb_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/arb_logs_$$(date +%Y%m%d_%H%M%S).zip arb_log.txt arb_trades.json
+	rm -f arb_log.txt arb_trades.json
+
 git_logs_backup:
 	git add .
 	git commit -m "backup logs"

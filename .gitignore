@@ -42,3 +42,5 @@ mm_log.txt
 mm_trades.json
 strategy_rw_log.txt
 strategy_rw_trades.json
+arb_log.txt
+arb_trades.json
