@@ -12,6 +12,9 @@ install: venv
 	.venv/bin/pip install websockets
 	.venv/bin/pip install polymarket-apis
 	.venv/bin/pip install python-dotenv
+	.venv/bin/pip install scipy
+	.venv/bin/pip install numpy
+	.venv/bin/pip install pandas
 
 run:
 	$(PY) utility.py
