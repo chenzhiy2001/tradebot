@@ -60,11 +60,11 @@ CHAIN_ID        = 137
 
 # -- Arb parameters --
 MIN_EDGE        = 0.02      # Minimum pair_edge (1.00 - bid_up - bid_dn) to quote
-BASE_SIZE       = 10         # $ per side when edge = MIN_EDGE
-MAX_SIZE        = 200        # $ per side cap
+BASE_SIZE       = 3          # $ per side when edge = MIN_EDGE (min viable with 5-share min)
+MAX_SIZE        = 5          # $ per side cap
 EDGE_SCALE      = True       # Scale size proportionally with edge
 MAX_PAIR_COST   = 0.98       # Absolute max we'll pay for a pair (cost_up + cost_dn)
-MAX_UNPAIRED_COST = 100      # Max $ of unpaired directional exposure per market
+MAX_UNPAIRED_COST = 5        # Max $ of unpaired directional exposure per market
 TICK            = 0.01       # Price tick
 MIN_SHARES      = 5          # Polymarket minimum order
 MIN_MID         = 0.15       # Skip tokens near 0
@@ -79,8 +79,8 @@ REQUOTE_INTERVAL = 5         # Seconds between requoting on book changes
 WS_WARMUP       = 3          # WS warm-up delay
 
 # -- Risk --
-MAX_MARKETS     = 4          # Max simultaneous market threads
-MIN_BALANCE     = 5          # Stop trading below this USDC
+MAX_MARKETS     = 1          # Max simultaneous market threads ($11 budget)
+MIN_BALANCE     = 2          # Stop trading below this USDC
 
 # -- Markets --
 CRYPTOS         = ["btc", "eth", "sol", "xrp"]
