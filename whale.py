@@ -632,11 +632,6 @@ class WhaleBot:
             f"{total_shares:.0f}sh @ {avg_price:.2f} (${total_dollar:.0f}) "
             f"[{acc['fragments']} frags] — {outcome}")
 
-        # Anti-MM check
-        if self._is_market_maker(wallet_addr, condition_id):
-            log(f"     ⊘ Skip: market maker (traded both sides)")
-            return
-
         # Muted wallet check
         if is_wallet_muted(wallet_addr, self.live_perf):
             stats = self.live_perf.get(wallet_addr, {})
