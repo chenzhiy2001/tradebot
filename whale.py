@@ -781,6 +781,7 @@ class WhaleBot:
 
         attempt = 0
         max_settle_retries = 5
+        max_sell_retries = 5
         while True:
             attempt += 1
             actual_bal = get_share_balance(our_token)
@@ -814,13 +815,17 @@ class WhaleBot:
                 return
 
             except Exception as e:
+                sell_attempt = attempt - max_settle_retries if attempt > max_settle_retries else attempt
+                if sell_attempt >= max_sell_retries:
+                    log(f"     ⚠ Sell failed {max_sell_retries}× (no match) — keeping position for resolution")
+                    return
                 log(f"     ✗ Sell attempt {attempt} failed: {e} — retrying...")
                 time.sleep(min(attempt, 5))
 
     # ─── EXIT WITH RETRY ─────────────────────────────────────────────
 
     def _exit_position_retry(self, token_id):
-        """Sell position with unlimited retries until sold."""
+        """Sell position with retries; keep for resolution if no match."""
         pos = self.positions.get(token_id)
         if not pos:
             return
@@ -837,6 +842,7 @@ class WhaleBot:
 
         attempt = 0
         max_settle_retries = 5
+        max_sell_retries = 5
         while True:
             attempt += 1
             actual_bal = get_share_balance(token_id)
@@ -870,6 +876,10 @@ class WhaleBot:
                 return
 
             except Exception as e:
+                sell_attempt = attempt - max_settle_retries if attempt > max_settle_retries else attempt
+                if sell_attempt >= max_sell_retries:
+                    log(f"     ⚠ Sell failed {max_sell_retries}× (no match) — keeping position for resolution")
+                    return
                 log(f"     ✗ Sell attempt {attempt} failed: {e} — retrying...")
                 time.sleep(min(attempt, 5))
 
@@ -928,15 +938,19 @@ class WhaleBot:
 
         for attempt in range(1, 4):
             try:
-                # Use GTC limit order at current price (maker fee savings)
-                size = round(amount / current_price, 2) if current_price > 0 else 0
+                # Use GTC limit order 1 tick below ask for maker fee (0%)
+                tick = 0.01
+                gtc_price = round(current_price - tick, 2)
+                if gtc_price <= 0:
+                    gtc_price = tick
+                size = round(amount / gtc_price, 2) if gtc_price > 0 else 0
                 if size <= 0:
                     log(f"     ✗ Buy attempt {attempt}/3 failed: invalid size")
                     continue
 
                 order_args = OrderArgs(
                     token_id=token_id,
-                    price=round(current_price, 2),
+                    price=gtc_price,
                     size=size,
                     side=BUY,
                 )
@@ -959,7 +973,7 @@ class WhaleBot:
                                 size_matched = float(status.get("size_matched", 0))
                                 if size_matched > 0:
                                     actual_shares = size_matched
-                                    actual_cost = size_matched * current_price
+                                    actual_cost = size_matched * gtc_price
                                     break
                         except Exception:
                             pass
