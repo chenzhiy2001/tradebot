@@ -87,6 +87,7 @@ CRYPTOS         = ["btc", "eth", "sol", "xrp"]
 INTERVALS       = [5]
 
 DRY_RUN    = "--dry-run" in sys.argv
+DRY_BALANCE = 1000.0         # Simulated balance for dry-run mode
 LOG_FILE   = "arb_dry_log.txt" if DRY_RUN else "arb_log.txt"
 TRADE_FILE = "arb_dry_trades.json" if DRY_RUN else "arb_trades.json"
 
@@ -456,9 +457,9 @@ class ArbBot:
         log(f"  ARB BOT — Conditional Token Arbitrage {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
         log("=" * 60)
 
-        self.balance = get_usdc_balance() or 0
+        self.balance = DRY_BALANCE if DRY_RUN else (get_usdc_balance() or 0)
         self.start_balance = self.balance
-        log(f"  Balance: ${self.balance:.2f}")
+        log(f"  Balance: ${self.balance:.2f}{' (simulated)' if DRY_RUN else ''}")
         log(f"  Config: min_edge={MIN_EDGE} base_size=${BASE_SIZE} max_size=${MAX_SIZE}")
         log(f"  Cancel buffer: {CANCEL_BUFFER}s before window end")
         log(f"  Markets: {', '.join(CRYPTOS)} × {INTERVALS}min")
@@ -476,7 +477,7 @@ class ArbBot:
             self._shutting_down = True
             time.sleep(2)
             self._cleanup()
-            end_balance = get_usdc_balance() or 0
+            end_balance = self.balance if DRY_RUN else (get_usdc_balance() or 0)
             actual_pnl = end_balance - self.start_balance
             log(f"  Session: pairs={self.pairs_completed} singles={self.single_legs} "
                 f"trades={self.total_trades}")
@@ -550,9 +551,10 @@ class ArbBot:
                 if len(self._active_markets) >= MAX_MARKETS:
                     continue
 
-            bal = get_usdc_balance()
-            if bal is not None:
-                self.balance = bal
+            if not DRY_RUN:
+                bal = get_usdc_balance()
+                if bal is not None:
+                    self.balance = bal
             if self.balance < MIN_BALANCE + BASE_SIZE * 2:
                 continue
 
@@ -625,6 +627,7 @@ class ArbBot:
                     state[tok]["pre_bal"] = get_share_balance(tok) or 0
 
             last_requote = 0
+            last_book_log = 0
 
             # ── MAIN LOOP: quote + monitor fills ──
             while datetime.now(timezone.utc) < cancel_time:
@@ -640,6 +643,20 @@ class ArbBot:
                 # Get books for both sides
                 up_book = self.tracker.get_book(up_token)
                 dn_book = self.tracker.get_book(down_token)
+
+                # Diagnostic book logging every 15s
+                if now_t - last_book_log >= 15:
+                    last_book_log = now_t
+                    if up_book and dn_book:
+                        pe = 1.0 - up_book["bb"] - dn_book["bb"]
+                        log(f"    {crypto} book: Up bb={up_book['bb']:.2f} ba={up_book['ba']:.2f} "
+                            f"Dn bb={dn_book['bb']:.2f} ba={dn_book['ba']:.2f} "
+                            f"| pair_edge={pe:.3f} {'OK' if pe >= MIN_EDGE else 'thin'}")
+                    elif not up_book and not dn_book:
+                        log(f"    {crypto} book: NO DATA for either token")
+                    else:
+                        log(f"    {crypto} book: partial (Up={'ok' if up_book else 'NONE'}, "
+                            f"Dn={'ok' if dn_book else 'NONE'})")
 
                 if up_book and dn_book:
                     pair_cost = up_book["bb"] + dn_book["bb"]
@@ -828,14 +845,21 @@ class ArbBot:
     def _check_fill(self, token_id, st):
         """Check if limit buy got (partially) filled by comparing share balance."""
         if DRY_RUN:
-            # Simulate: assume 50% fill rate per check cycle
+            # Simulate: assume fill happens after order is posted
             if st["buy_oid"] == "dry" and st["buy_price"] > 0:
-                sim_shares = st["buy_size"] * 0.3
+                # Use book depth to estimate realistic fill fraction
+                book = self.tracker.get_book(token_id)
+                fill_frac = 0.5  # default
+                if book:
+                    # More depth at bid → higher fill probability
+                    fill_frac = min(0.9, max(0.2, book["bid_depth"] / 200))
+                sim_shares = st["buy_size"] * fill_frac
                 sim_cost = sim_shares * st["buy_price"]
                 st["filled_shares"] += sim_shares
                 st["filled_cost"] += sim_cost
                 st["buy_oid"] = None
-                log(f"    [SIM FILL] {st['label']}: {sim_shares:.1f}sh @ {st['buy_price']}")
+                log(f"    [SIM FILL] {st['label']}: {sim_shares:.1f}sh @ {st['buy_price']} "
+                    f"({fill_frac*100:.0f}% fill)")
             return
 
         bal = get_share_balance(token_id) or 0
