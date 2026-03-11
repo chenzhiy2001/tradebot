@@ -200,6 +200,15 @@ def post_fak_buy(token_id, amount):
 def post_fak_sell(token_id, amount):
     """Place a FAK market sell. amount = shares to sell. Returns (shares_sold, proceeds)."""
     try:
+        # Must grant exchange allowance to transfer our conditional tokens
+        client.update_balance_allowance(
+            params=BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=1,
+            )
+        )
+
         mo = MarketOrderArgs(
             token_id=token_id,
             amount=amount,
@@ -770,6 +779,12 @@ class CrossArbBot:
         now = time.time()
         now_utc = datetime.now(timezone.utc)
 
+        # Close any expired windows (even if no longer in self.markets)
+        with self._windows_lock:
+            for cid, w in list(self._windows.items()):
+                if not w["done"] and now_utc >= w["window_end"]:
+                    self._close_window(cid, w)
+
         # Status every 30s
         if now - self.last_status > 30:
             self.last_status = now
@@ -936,8 +951,12 @@ class CrossArbBot:
                 if ask > 0 and amt / ask < MIN_BET_SHARES:
                     amt = MIN_BET_SHARES * ask
 
-                # Global cost cap (include this pending trade)
-                remaining_budget = MAX_TOTAL_COST - (self.total_cost - self.total_proceeds)
+                # Global cost cap — only count ACTIVE (open) window costs
+                active_cost = sum(
+                    ww["up_cost"] + ww["dn_cost"]
+                    for ww in self._windows.values() if not ww["done"]
+                )
+                remaining_budget = MAX_TOTAL_COST - active_cost
                 if remaining_budget <= 0.5:
                     continue
                 amt = min(amt, remaining_budget)
@@ -1044,6 +1063,7 @@ class CrossArbBot:
                     log(f"    [SIM] sold {sell_shares:.1f}sh @ {bid:.3f} (${proceeds:.2f})")
                 else:
                     sold, proceeds = post_fak_sell(token, sell_shares)
+                    w[last_key] = now  # cooldown even on failure to avoid spam
                     if sold > 0:
                         remaining = shares_held - sold
                         if remaining < 0.5:
@@ -1052,7 +1072,6 @@ class CrossArbBot:
                         else:
                             w[shares_key] = remaining
                             w[cost_key] = avg_entry * remaining
-                        w[last_key] = now
                         self.total_sells += 1
                         self.total_proceeds += proceeds
                         self.balance += proceeds
