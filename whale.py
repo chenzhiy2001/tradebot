@@ -928,30 +928,72 @@ class WhaleBot:
 
         for attempt in range(1, 4):
             try:
-                mo = MarketOrderArgs(
-                    token_id=token_id,
-                    amount=amount,
-                    side=BUY,
-                    order_type=OrderType.FAK,
-                )
-                signed = client.create_market_order(mo)
-                resp = client.post_order(signed, OrderType.FAK)
+                # Use GTC limit order at current price (maker fee savings)
+                size = round(amount / current_price, 2) if current_price > 0 else 0
+                if size <= 0:
+                    log(f"     ✗ Buy attempt {attempt}/3 failed: invalid size")
+                    continue
 
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=round(current_price, 2),
+                    size=size,
+                    side=BUY,
+                )
+                signed = client.create_order(order_args)
+                resp = client.post_order(signed, OrderType.GTC)
+
+                order_id = ""
+                if isinstance(resp, dict):
+                    order_id = resp.get("orderID", "")
+
+                # Wait for fill (up to 3s)
                 actual_shares = 0
                 actual_cost = amount
-                if isinstance(resp, dict):
-                    taking = resp.get("takingAmount", "0")
-                    making = resp.get("makingAmount", "0")
+                if order_id:
+                    for _ in range(3):
+                        time.sleep(1)
+                        try:
+                            status = client.get_order(order_id)
+                            if isinstance(status, dict):
+                                size_matched = float(status.get("size_matched", 0))
+                                if size_matched > 0:
+                                    actual_shares = size_matched
+                                    actual_cost = size_matched * current_price
+                                    break
+                        except Exception:
+                            pass
+                    # Cancel any unfilled remainder
                     try:
-                        actual_shares = float(taking) if taking else 0
-                    except (ValueError, TypeError):
-                        actual_shares = 0
-                    try:
-                        filled_cost = float(making) if making else 0
-                        if filled_cost > 0:
-                            actual_cost = filled_cost
-                    except (ValueError, TypeError):
+                        client.cancel(order_id)
+                    except Exception:
                         pass
+
+                # Fallback: if GTC didn't fill, try FAK
+                gtc_filled = actual_shares > 0
+                if not gtc_filled:
+                    mo = MarketOrderArgs(
+                        token_id=token_id,
+                        amount=amount,
+                        side=BUY,
+                        order_type=OrderType.FAK,
+                    )
+                    signed = client.create_market_order(mo)
+                    resp = client.post_order(signed, OrderType.FAK)
+
+                    if isinstance(resp, dict):
+                        taking = resp.get("takingAmount", "0")
+                        making = resp.get("makingAmount", "0")
+                        try:
+                            actual_shares = float(taking) if taking else 0
+                        except (ValueError, TypeError):
+                            actual_shares = 0
+                        try:
+                            filled_cost = float(making) if making else 0
+                            if filled_cost > 0:
+                                actual_cost = filled_cost
+                        except (ValueError, TypeError):
+                            pass
 
                 if actual_shares <= 0:
                     actual_shares = amount / current_price if current_price > 0 else 0
@@ -990,7 +1032,8 @@ class WhaleBot:
                 }
                 self.cooldowns[condition_id] = time.time() + COOLDOWN_SECS
 
-                log(f"     ✓ Bought {actual_shares:.1f}sh @ {current_price:.2f} for ${actual_cost:.2f}")
+                fill_type = "GTC" if gtc_filled else "FAK"
+                log(f"     ✓ Bought {actual_shares:.1f}sh @ {current_price:.2f} for ${actual_cost:.2f} ({fill_type})")
 
                 record = {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1003,6 +1046,7 @@ class WhaleBot:
                     "amount": amount,
                     "actual_cost": actual_cost,
                     "shares": actual_shares,
+                    "fill_type": fill_type,
                     "whale_addr": wallet_addr,
                     "whale_name": wallet_name,
                     "whale_size": whale_size,
