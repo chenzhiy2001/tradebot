@@ -59,7 +59,7 @@ WS_MARKET_URL   = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CHAIN_ID        = 137
 
 # -- Arb parameters --
-MIN_EDGE        = 0.02      # Minimum pair_edge (1.00 - bid_up - bid_dn) to quote
+MIN_EDGE        = 0.005     # Minimum pair_edge (1.00 - bid_up - bid_dn) to quote
 BASE_SIZE       = 3          # $ per side when edge = MIN_EDGE (min viable with 5-share min)
 MAX_SIZE        = 5          # $ per side cap
 EDGE_SCALE      = True       # Scale size proportionally with edge
@@ -666,7 +666,15 @@ class ArbBot:
                     if now_t - last_requote >= REQUOTE_INTERVAL:
                         last_requote = now_t
 
-                        if pair_edge >= MIN_EDGE and pair_cost <= MAX_PAIR_COST:
+                        # Determine if one side already filled (need to hedge)
+                        up_filled = state[up_token]["filled_shares"] > 0
+                        dn_filled = state[down_token]["filled_shares"] > 0
+                        one_side_filled = (up_filled != dn_filled)  # XOR
+
+                        # Relax edge requirement when hedging an existing fill
+                        effective_edge = MIN_EDGE / 2 if one_side_filled else MIN_EDGE
+
+                        if pair_edge >= effective_edge and pair_cost <= MAX_PAIR_COST:
                             # Dynamic sizing: scale with edge
                             if EDGE_SCALE:
                                 scale = pair_edge / MIN_EDGE
@@ -674,8 +682,15 @@ class ArbBot:
                             else:
                                 size_per_side = BASE_SIZE
 
+                            # When hedging, prioritize the unfilled side
+                            side_order = [up_token, down_token]
+                            if up_filled and not dn_filled:
+                                side_order = [down_token, up_token]
+                            elif dn_filled and not up_filled:
+                                side_order = [up_token, down_token]
+
                             # Cap based on unpaired exposure
-                            for tok in [up_token, down_token]:
+                            for tok in side_order:
                                 st = state[tok]
                                 other_tok = down_token if tok == up_token else up_token
                                 other_st = state[other_tok]
@@ -738,13 +753,15 @@ class ArbBot:
                                     f"[edge={pair_edge:.3f}]")
 
                                 if not DRY_RUN:
+                                    # Record price BEFORE API call so fill detection
+                                    # tracks cost even if API errors but order goes through
+                                    st["buy_price"] = entry_price
+                                    st["buy_size"] = shares
                                     oid = post_limit(tok, BUY, entry_price, shares)
                                     if oid:
                                         st["buy_oid"] = oid
-                                        st["buy_price"] = entry_price
-                                        st["buy_size"] = shares
                                     else:
-                                        log(f"    {st['label']}: order failed")
+                                        log(f"    {st['label']}: order failed (price still tracked)")
                                 else:
                                     st["buy_oid"] = "dry"
                                     st["buy_price"] = entry_price
@@ -752,16 +769,19 @@ class ArbBot:
 
                         else:
                             # Edge too thin — cancel existing quotes
-                            for tok in [up_token, down_token]:
-                                st = state[tok]
-                                if st["buy_oid"] and st["buy_oid"] != "dry":
-                                    try:
-                                        client.cancel(st["buy_oid"])
-                                    except Exception:
-                                        cancel_all_orders(tok)
-                                    st["buy_oid"] = None
-                                    # Check for fill before clearing
-                                    self._check_fill(tok, st)
+                            # But don't cancel if we're hedging (one side filled)
+                            # and edge is still above relaxed threshold
+                            if not one_side_filled:
+                                for tok in [up_token, down_token]:
+                                    st = state[tok]
+                                    if st["buy_oid"] and st["buy_oid"] != "dry":
+                                        try:
+                                            client.cancel(st["buy_oid"])
+                                        except Exception:
+                                            cancel_all_orders(tok)
+                                        st["buy_oid"] = None
+                                        # Check for fill before clearing
+                                        self._check_fill(tok, st)
 
                 time.sleep(CHECK_INTERVAL)
 
