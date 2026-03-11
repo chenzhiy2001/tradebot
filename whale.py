@@ -22,6 +22,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -61,7 +62,7 @@ MIN_BET = 3                   # Minimum viable bet
 ACCUM_WINDOW = 15             # Seconds to accumulate fragments from same wallet+token
 COOLDOWN_SECS = 15            # Don't re-enter same market within this window
 MAX_POSITIONS = 6             # Max concurrent positions
-MAX_PER_WINDOW = 3            # Max new entries per 5-min window
+MAX_PER_WINDOW = 5            # Max new entries per 5-min window
 MAX_RISK_PCT = 0.95           # Don't risk more than 95% of balance
 
 # Anti market-maker: if wallet trades both sides within this window, ignore
@@ -408,6 +409,10 @@ class WhaleBot:
         # Buy signal consensus: condition_id → deque of recent buy directions
         self._buy_signals = defaultdict(lambda: deque(maxlen=CONSENSUS_COUNT))
 
+        # Live token map built from incoming trades (fallback when cache misses)
+        # condition_id → {"Up": token_id, "Down": token_id, "slug": str, "crypto": str, "interval": int, "epoch": int}
+        self._live_tokens = {}
+
         # Compounding: reserved profit (not available for betting)
         self._reserved = 0.0
 
@@ -546,6 +551,19 @@ class WhaleBot:
         if not is_crypto:
             return
 
+        # Build live token map from trade stream
+        if condition_id and token_id and outcome:
+            entry = self._live_tokens.setdefault(condition_id, {})
+            entry[outcome] = token_id
+            if event_slug and "slug" not in entry:
+                # parse crypto and epoch from slug like "btc-updown-5m-1741665600"
+                m = re.search(r"([a-z]+)-updown-(\d+)m-(\d+)", event_slug.lower())
+                if m:
+                    entry["slug"] = event_slug
+                    entry["crypto"] = m.group(1).upper()
+                    entry["interval"] = int(m.group(2))
+                    entry["epoch"] = int(m.group(3))
+
         # Track for MM detection
         token_info = self.market_cache.get_by_token(token_id)
         side_name = token_info["side"] if token_info else outcome
@@ -650,8 +668,26 @@ class WhaleBot:
             self.market_cache.refresh()
             market_info = self.market_cache.get_by_condition(condition_id)
         if not market_info:
-            log(f"     ⊘ Skip: market not found in cache")
-            return
+            # Fallback: build minimal market_info from live trade stream data
+            lt = self._live_tokens.get(condition_id, {})
+            if "Up" in lt and "Down" in lt and "epoch" in lt:
+                epoch = lt["epoch"]
+                interval = lt["interval"]
+                window_start = datetime.fromtimestamp(epoch, tz=timezone.utc)
+                market_info = {
+                    "condition_id": condition_id,
+                    "question": f"{lt['crypto']} Up or Down (live)",
+                    "crypto": lt["crypto"],
+                    "slug": lt.get("slug", ""),
+                    "up_token": lt["Up"],
+                    "down_token": lt["Down"],
+                    "window_start": window_start,
+                    "window_end": window_start + timedelta(minutes=interval),
+                }
+                log(f"     ℹ Using live token map (cache miss)")
+            else:
+                log(f"     ⊘ Skip: market not found in cache or live map")
+                return
 
         # Record direction and check unanimous consensus
         signals = self._buy_signals[condition_id]
