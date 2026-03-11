@@ -33,7 +33,7 @@ import asyncio
 import threading
 import requests
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 from scipy.stats import norm
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
@@ -53,7 +53,17 @@ HOST            = "https://clob.polymarket.com"
 GAMMA_API       = "https://gamma-api.polymarket.com"
 WS_MARKET_URL   = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 BINANCE_WS_URL  = "wss://stream.binance.com:9443/stream"
+RTDS_WS_URL     = "wss://ws-live-data.polymarket.com"
 CHAIN_ID        = 137
+
+# Chainlink symbols (Polymarket resolution source)
+CHAINLINK_SYMBOLS = {
+    "btc": "btc/usd",
+    "eth": "eth/usd",
+    "sol": "sol/usd",
+    "xrp": "xrp/usd",
+}
+PRICE_BUFFER_SECONDS = 900  # Keep 15 min of price history
 
 # -- Strategy --
 MIN_EDGE        = 0.06       # Minimum edge (fair_prob - market_price) to trade
@@ -76,6 +86,8 @@ MAX_WINDOWS     = 2          # Max simultaneous windows ($11 budget)
 BOOK_STALE_S    = 10         # Ignore book data older than 10s
 PRICE_STALE_S   = 5          # Ignore Binance price older than 5s
 MAX_TOTAL_COST  = 8          # Max total $ across all windows
+MIN_ASK_PRICE   = 0.05       # Don't buy below 5c (extreme longshots lose almost always)
+MAX_EDGE        = 0.30       # If model says edge > 30%, model is probably wrong — skip
 
 # -- Markets --
 CRYPTOS = {
@@ -383,6 +395,127 @@ class BinanceFeed:
 
 
 # =========================================================================
+# CHAINLINK PRICE FEED  (Polymarket resolution source)
+# =========================================================================
+class ChainlinkFeed:
+    """Real-time Chainlink prices from Polymarket RTDS WebSocket.
+    This is the SAME data source Polymarket uses to resolve crypto markets.
+    Keeps a rolling buffer so we can look up the EXACT price at any timestamp."""
+
+    def __init__(self):
+        self._prices = {}     # symbol -> {price, ts}
+        self._buffers = {}    # symbol -> deque of (unix_ts_secs, price)
+        self._lock = threading.Lock()
+        self._connected = False
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._ws_loop())
+
+    async def _ws_loop(self):
+        import websockets
+
+        while True:
+            try:
+                async with websockets.connect(RTDS_WS_URL, close_timeout=5, open_timeout=10) as ws:
+                    sub_msg = json.dumps({
+                        "action": "subscribe",
+                        "subscriptions": [{
+                            "topic": "crypto_prices_chainlink",
+                            "type": "*",
+                            "filters": "",
+                        }]
+                    })
+                    await ws.send(sub_msg)
+                    self._connected = True
+                    log("  Chainlink RTDS connected (resolution source)")
+
+                    last_ping = time.time()
+                    while True:
+                        if time.time() - last_ping > 4:
+                            try:
+                                await ws.send("PING")
+                                last_ping = time.time()
+                            except Exception:
+                                break
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=1)
+                        except asyncio.TimeoutError:
+                            continue
+                        try:
+                            data = json.loads(msg)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+                        if data.get("topic") == "crypto_prices_chainlink":
+                            payload = data.get("payload", {})
+                            symbol = payload.get("symbol", "").lower()
+                            value = payload.get("value")
+                            ts = payload.get("timestamp")
+                            if symbol and value is not None:
+                                price_val = float(value)
+                                ts_secs = (ts / 1000.0) if ts else time.time()
+                                with self._lock:
+                                    self._prices[symbol] = {"price": price_val, "ts": ts_secs}
+                                    if symbol not in self._buffers:
+                                        self._buffers[symbol] = deque()
+                                    buf = self._buffers[symbol]
+                                    buf.append((ts_secs, price_val))
+                                    cutoff = time.time() - PRICE_BUFFER_SECONDS
+                                    while buf and buf[0][0] < cutoff:
+                                        buf.popleft()
+
+            except Exception as e:
+                self._connected = False
+                log(f"  Chainlink RTDS error: {e}, reconnecting in 2s...")
+                await asyncio.sleep(2)
+
+    def get_price(self, crypto):
+        """Get latest Chainlink price. Returns (price, age_secs) or (None, None)."""
+        symbol = CHAINLINK_SYMBOLS.get(crypto.lower())
+        if not symbol:
+            return None, None
+        with self._lock:
+            data = self._prices.get(symbol)
+        if not data:
+            return None, None
+        return data["price"], time.time() - data["ts"]
+
+    def get_price_at(self, crypto, target_ts):
+        """Get Chainlink price at a specific timestamp (for open price lookup).
+        Returns (price, delta_secs) or (None, None)."""
+        symbol = CHAINLINK_SYMBOLS.get(crypto.lower())
+        if not symbol:
+            return None, None
+        with self._lock:
+            buf = self._buffers.get(symbol)
+            if not buf or len(buf) == 0:
+                return None, None
+            lo, hi = 0, len(buf) - 1
+            best_idx = None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if buf[mid][0] <= target_ts:
+                    best_idx = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best_idx is not None:
+                ts, price = buf[best_idx]
+                return price, abs(target_ts - ts)
+            ts, price = buf[0]
+            return price, abs(target_ts - ts)
+
+    @property
+    def connected(self):
+        return self._connected
+
+
+# =========================================================================
 # BOOK TRACKER (Polymarket order book via WebSocket)
 # =========================================================================
 class BookTracker:
@@ -542,6 +675,7 @@ class CrossArbBot:
         self.tracker = BookTracker()
         self.ws = MarketWS(self.tracker)
         self.binance = BinanceFeed()
+        self.chainlink = ChainlinkFeed()
         self.markets = []
         self.last_discovery = 0
         self.last_status = 0
@@ -571,17 +705,21 @@ class CrossArbBot:
         self.start_balance = self.balance
         log(f"  Balance: ${self.balance:.2f}{' (simulated)' if DRY_RUN else ''}")
         log(f"  Config: min_edge={MIN_EDGE} bet=${BET_AMOUNT} max_exposure=${MAX_EXPOSURE}")
-        log(f"  Vol: {DEFAULT_VOL:.1e}  cooldown={TRADE_COOLDOWN}s")
+        log(f"  Vol: {DEFAULT_VOL:.1e}  cooldown={TRADE_COOLDOWN}s  ask_floor={MIN_ASK_PRICE}")
+        log(f"  Price source: Chainlink RTDS (resolution-accurate)")
         log(f"  Markets: {', '.join(CRYPTOS)} x {INTERVALS}min")
 
         self.binance.start()
+        self.chainlink.start()
         self.ws.start()
 
-        # Wait for Binance
+        # Wait for Chainlink (primary) and Binance (fallback)
         for _ in range(30):
-            if self.binance._connected:
+            if self.chainlink.connected and self.binance._connected:
                 break
             time.sleep(0.5)
+        if not self.chainlink.connected:
+            log("  WARNING: Chainlink RTDS not connected after 15s")
         if not self.binance._connected:
             log("  WARNING: Binance not connected after 15s")
 
@@ -681,16 +819,31 @@ class CrossArbBot:
                 self._close_window(cid, w)
                 continue
 
-            # Get Binance spot price
-            spot, spot_age = self.binance.get_price(crypto)
+            # Get current price: prefer Chainlink (resolution source), fallback Binance
+            spot, spot_age = self.chainlink.get_price(crypto)
+            if spot is None or spot_age > PRICE_STALE_S:
+                spot, spot_age = self.binance.get_price(crypto)
             if spot is None or spot_age > PRICE_STALE_S:
                 continue
 
-            # Set open price (first price we see after MIN_ELAPSED_S)
+            # Set open price from Chainlink buffer at EXACT window start timestamp
+            # (this is the "price to beat" that Polymarket resolves against)
             if w["open_price"] is None:
-                if secs_into >= 2:  # Wait 2s for stable price
+                start_ts = m["window_start"].timestamp()
+                cl_open, delta = self.chainlink.get_price_at(crypto, start_ts)
+                if cl_open is not None and delta <= 10.0:
+                    w["open_price"] = cl_open
+                    log(f"  {crypto} open price: ${cl_open:,.2f} (Chainlink, delta={delta:.1f}s)")
+                elif secs_into <= 5 and spot is not None:
+                    # Only use live price as fallback in the first 5s of window
                     w["open_price"] = spot
-                    log(f"  {crypto} open price: ${spot:,.2f}")
+                    log(f"  {crypto} open price: ${spot:,.2f} (live fallback, {secs_into:.0f}s in)")
+                else:
+                    # Don't have the open price and too late to estimate — skip this window
+                    if not w.get("_open_warned"):
+                        w["_open_warned"] = True
+                        log(f"  {crypto} no Chainlink open price (buffer too short, {secs_into:.0f}s in) — skipping window")
+                    continue
                 continue
 
             # Too early or too late
@@ -735,10 +888,6 @@ class CrossArbBot:
             # Edge = our fair probability - Polymarket ask price
             # If edge > MIN_EDGE, Polymarket is underpricing this side
 
-            # Global cost cap
-            if self.total_cost - self.total_proceeds >= MAX_TOTAL_COST:
-                continue
-
             for side, token, book, fair_p, last_key, shares_key, cost_key in [
                 ("Up", w["up_token"], up_book, p_up, "last_buy_up", "up_shares", "up_cost"),
                 ("Dn", w["down_token"], dn_book, p_dn, "last_buy_dn", "dn_shares", "dn_cost"),
@@ -747,6 +896,14 @@ class CrossArbBot:
                 edge = fair_p - ask
 
                 if edge < MIN_EDGE:
+                    continue
+
+                # Skip extreme longshots (market prices < 5c almost always lose)
+                if ask < MIN_ASK_PRICE:
+                    continue
+
+                # Skip if edge is absurdly large (model probably wrong)
+                if edge > MAX_EDGE:
                     continue
 
                 # Cooldown
@@ -778,6 +935,12 @@ class CrossArbBot:
                 # Ensure we get MIN_BET_SHARES
                 if ask > 0 and amt / ask < MIN_BET_SHARES:
                     amt = MIN_BET_SHARES * ask
+
+                # Global cost cap (include this pending trade)
+                remaining_budget = MAX_TOTAL_COST - (self.total_cost - self.total_proceeds)
+                if remaining_budget <= 0.5:
+                    continue
+                amt = min(amt, remaining_budget)
 
                 if amt > self.balance - MIN_BALANCE and not DRY_RUN:
                     amt = self.balance - MIN_BALANCE
