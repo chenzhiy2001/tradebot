@@ -988,9 +988,10 @@ class CrossArbBot:
                 # Recalculate after trade
                 total_exposure = w["up_cost"] + w["dn_cost"]
 
-            # ── SELL LOGIC: sell overpriced side we hold ──
-            # If fair_p for a side drops significantly below our avg entry,
-            # AND the bid is still above our entry → sell for profit
+            # ── SELL LOGIC ──
+            # Two modes:
+            #   1. Profit take: bid > entry AND model says overpriced → lock in gain
+            #   2. Stop loss: model flipped against us → cut loss before resolution
             for side, token, book, fair_p, last_key, shares_key, cost_key in [
                 ("Up", w["up_token"], up_book, p_up, "last_sell_up", "up_shares", "up_cost"),
                 ("Dn", w["down_token"], dn_book, p_dn, "last_sell_dn", "dn_shares", "dn_cost"),
@@ -1003,54 +1004,70 @@ class CrossArbBot:
                 avg_entry = cost_held / shares_held
                 bid = book["bb"]
 
-                # Sell if: bid > avg_entry AND fair_p < bid (we think it's overpriced)
-                # This locks in profit from price movement
+                should_sell = False
+                reason = ""
+
+                # Profit take: bid above entry and model says overpriced
                 if bid > avg_entry + 0.02 and fair_p < bid - MIN_EDGE:
-                    # Cooldown
-                    if now - w[last_key] < TRADE_COOLDOWN:
-                        continue
+                    should_sell = True
+                    reason = "PROFIT"
 
-                    sell_shares = math.floor(shares_held * 100) / 100
-                    if sell_shares < MIN_BET_SHARES:
-                        continue
+                # Stop loss: model flipped hard against us — fair value dropped
+                # well below our entry, meaning we're likely holding a loser.
+                # Sell if we can recover anything (bid > 0.02) and model says
+                # fair prob is at least 10c below our entry price.
+                elif fair_p < avg_entry - 0.10 and bid >= 0.03:
+                    should_sell = True
+                    reason = "STOPLOSS"
 
-                    log(f"    {crypto} SELL {side} {sell_shares:.1f}sh @ ~{bid:.2f} "
-                        f"[entry={avg_entry:.3f} fair={fair_p:.3f}]")
+                if not should_sell:
+                    continue
 
-                    if DRY_RUN:
-                        proceeds = sell_shares * bid
-                        w[shares_key] = 0
-                        w[cost_key] = 0
+                # Cooldown
+                if now - w[last_key] < TRADE_COOLDOWN:
+                    continue
+
+                sell_shares = math.floor(shares_held * 100) / 100
+                if sell_shares < MIN_BET_SHARES:
+                    continue
+
+                log(f"    {crypto} {reason} SELL {side} {sell_shares:.1f}sh @ ~{bid:.2f} "
+                    f"[entry={avg_entry:.3f} fair={fair_p:.3f}]")
+
+                if DRY_RUN:
+                    proceeds = sell_shares * bid
+                    w[shares_key] = 0
+                    w[cost_key] = 0
+                    w[last_key] = now
+                    self.total_sells += 1
+                    self.total_proceeds += proceeds
+                    log(f"    [SIM] sold {sell_shares:.1f}sh @ {bid:.3f} (${proceeds:.2f})")
+                else:
+                    sold, proceeds = post_fak_sell(token, sell_shares)
+                    if sold > 0:
+                        remaining = shares_held - sold
+                        if remaining < 0.5:
+                            w[shares_key] = 0
+                            w[cost_key] = 0
+                        else:
+                            w[shares_key] = remaining
+                            w[cost_key] = avg_entry * remaining
                         w[last_key] = now
                         self.total_sells += 1
                         self.total_proceeds += proceeds
-                        log(f"    [SIM] sold {sell_shares:.1f}sh @ {bid:.3f} (${proceeds:.2f})")
-                    else:
-                        sold, proceeds = post_fak_sell(token, sell_shares)
-                        if sold > 0:
-                            # Update position
-                            remaining = shares_held - sold
-                            if remaining < 0.5:
-                                w[shares_key] = 0
-                                w[cost_key] = 0
-                            else:
-                                w[shares_key] = remaining
-                                w[cost_key] = avg_entry * remaining
-                            w[last_key] = now
-                            self.total_sells += 1
-                            self.total_proceeds += proceeds
-                            self.balance += proceeds
-                            log(f"    SOLD {sold:.1f}sh (${proceeds:.2f})")
+                        self.balance += proceeds
+                        log(f"    {reason} SOLD {sold:.1f}sh (${proceeds:.2f})")
 
-                            w["trades"].append({
-                                "time": datetime.now(timezone.utc).isoformat(),
-                                "action": "SELL",
-                                "side": side,
-                                "shares": round(sold, 2),
-                                "proceeds": round(proceeds, 4),
-                                "edge": round(fair_p - bid, 4),
-                                "spot": round(spot, 2),
-                            })
+                        w["trades"].append({
+                            "time": datetime.now(timezone.utc).isoformat(),
+                            "action": "SELL",
+                            "reason": reason,
+                            "side": side,
+                            "shares": round(sold, 2),
+                            "proceeds": round(proceeds, 4),
+                            "edge": round(fair_p - bid, 4),
+                            "spot": round(spot, 2),
+                        })
 
     def _close_window(self, cid, w):
         """Window ended — report positions (hold to resolution)."""
