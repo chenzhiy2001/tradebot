@@ -44,3 +44,5 @@ strategy_rw_log.txt
 strategy_rw_trades.json
 arb_log.txt
 arb_trades.json
+arb_dry_log.txt
+arb_dry_trades.json

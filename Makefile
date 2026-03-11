@@ -156,6 +156,11 @@ arb_logs_backup:
 	zip -j -9 archives/arb_logs_$$(date +%Y%m%d_%H%M%S).zip arb_log.txt arb_trades.json
 	rm -f arb_log.txt arb_trades.json
 
+arb_dry_logs_backup:
+	mkdir -p archives
+	zip -j -9 archives/arb_dry_logs_$$(date +%Y%m%d_%H%M%S).zip arb_dry_log.txt arb_dry_trades.json
+	rm -f arb_dry_log.txt arb_dry_trades.json
+
 git_logs_backup:
 	git add .
 	git commit -m "backup logs"
