@@ -29,7 +29,7 @@ import math
 import asyncio
 import threading
 import requests
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams, AssetType
@@ -55,8 +55,8 @@ DRY_RUN = "--dry-run" in sys.argv
 # =========================================================================
 # STRATEGY PARAMETERS
 # =========================================================================
-MIN_WHALE_SIZE = 1000         # Minimum accumulated $ to count as a whale trade
-BUY_AMOUNT = 25               # Our bet size per copy-trade ($)
+MIN_WHALE_SIZE = 100          # Minimum accumulated $ to count as a whale trade
+CONSENSUS_COUNT = 10          # Need N consecutive same-direction whale buys to enter
 MIN_BET = 3                   # Minimum viable bet
 ACCUM_WINDOW = 15             # Seconds to accumulate fragments from same wallet+token
 COOLDOWN_SECS = 15            # Don't re-enter same market within this window
@@ -405,6 +405,12 @@ class WhaleBot:
         # Anti-MM tracker: wallet → {condition_id → {sides: set(), last_seen: float}}
         self._mm_tracker = {}
 
+        # Buy signal consensus: condition_id → deque of recent buy directions
+        self._buy_signals = defaultdict(lambda: deque(maxlen=CONSENSUS_COUNT))
+
+        # Compounding: reserved profit (not available for betting)
+        self._reserved = 0.0
+
         self._window_entries = {}     # epoch_key → count
 
     # ─── MAIN LOOP ───────────────────────────────────────────────────
@@ -413,7 +419,7 @@ class WhaleBot:
         log(f"\n{'='*60}")
         log(f"Whale bot {'(DRY RUN) ' if DRY_RUN else ''}started")
         log(f"Whale threshold: ${MIN_WHALE_SIZE}")
-        log(f"Buy amount: ${BUY_AMOUNT}, max positions: {MAX_POSITIONS}")
+        log(f"Consensus: {CONSENSUS_COUNT} buys, max positions: {MAX_POSITIONS}")
         log(f"Markets: {', '.join(sorted(CRYPTOS))} × {INTERVALS}min")
         log(f"{'='*60}\n")
 
@@ -545,6 +551,20 @@ class WhaleBot:
         side_name = token_info["side"] if token_info else outcome
         self._record_mm_activity(proxy_wallet, condition_id, side_name)
 
+        # ── IMMEDIATE EXIT CHECK ──
+        # If anyone sells our held token or buys the opposite side, exit now
+        if self.positions:
+            if side == "SELL" and token_id in self.positions:
+                log(f"\n  🚨 EXIT: {name} selling our {outcome} position")
+                self._exit_position_retry(token_id)
+                return
+            if side == "BUY":
+                for held_token, held_pos in list(self.positions.items()):
+                    if held_pos.get("condition_id") == condition_id and held_token != token_id:
+                        log(f"\n  🚨 EXIT: {name} buying opposite side ({outcome})")
+                        self._exit_position_retry(held_token)
+                        break
+
         # Accumulate into (wallet, token_id) bucket
         key = (proxy_wallet, token_id)
         now = time.time()
@@ -629,7 +649,7 @@ class WhaleBot:
                                     total_shares, avg_price)
             return
 
-        # ── BUY path ──
+        # ── BUY path — record signal and check consensus ──
         market_info = self.market_cache.get_by_condition(condition_id)
         if not market_info:
             self.market_cache.refresh()
@@ -638,8 +658,20 @@ class WhaleBot:
             log(f"     ⊘ Skip: market not found in cache")
             return
 
-        now_utc = datetime.now(timezone.utc)
-        secs_left = (market_info["window_end"] - now_utc).total_seconds()
+        # Record direction and check unanimous consensus
+        signals = self._buy_signals[condition_id]
+        signals.append(outcome)
+        n_same = sum(1 for s in signals if s == outcome)
+        log(f"     📊 Signal {len(signals)}/{CONSENSUS_COUNT}: {outcome} "
+            f"({n_same} agree, {len(signals) - n_same} disagree)")
+
+        if len(signals) < CONSENSUS_COUNT or len(set(signals)) != 1:
+            return
+
+        consensus_side = signals[0]
+        buy_token = market_info["up_token"] if consensus_side.lower() == "up" else market_info["down_token"]
+        log(f"     ✅ CONSENSUS: {CONSENSUS_COUNT}× {consensus_side} — entering!")
+        self._buy_signals[condition_id].clear()
 
         if condition_id in self.cooldowns and time.time() < self.cooldowns[condition_id]:
             remaining = self.cooldowns[condition_id] - time.time()
@@ -653,11 +685,9 @@ class WhaleBot:
         # Budget check
         balance = get_usdc_balance()
         if balance is not None:
-            total_at_risk = sum(p["cost"] for p in self.positions.values())
-            total_capital = balance + total_at_risk
-            if total_at_risk + BUY_AMOUNT > total_capital * MAX_RISK_PCT:
-                log(f"     ⊘ Skip: risk cap (${total_at_risk + BUY_AMOUNT:.0f} > "
-                    f"{MAX_RISK_PCT*100:.0f}% of ${total_capital:.0f})")
+            available = balance - self._reserved
+            if available < MIN_BET:
+                log(f"     ⊘ Skip: available ${available:.2f} < ${MIN_BET}")
                 return
 
         # Per-window limit
@@ -668,7 +698,7 @@ class WhaleBot:
             return
 
         # Don't double-enter
-        if token_id in self.positions:
+        if buy_token in self.positions:
             log(f"     ⊘ Skip: already holding this token")
             return
         for tok, pos in self.positions.items():
@@ -677,9 +707,9 @@ class WhaleBot:
                 return
 
         success = self._execute_buy(
-            token_id=token_id,
+            token_id=buy_token,
             condition_id=condition_id,
-            side=outcome,
+            side=consensus_side,
             price=avg_price,
             wallet_addr=wallet_addr,
             wallet_name=name,
@@ -725,7 +755,9 @@ class WhaleBot:
             return
 
         sell_amt = math.floor(actual_bal * 100) / 100
-        for attempt in range(1, 4):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 mo = MarketOrderArgs(
                     token_id=our_token,
@@ -740,29 +772,87 @@ class WhaleBot:
                 if cp <= 0:
                     cp = sell_price
                 pnl = (cp * sell_amt) - our_pos["cost"]
-                log(f"     ✓ Sold {sell_amt:.1f}sh @ ~{cp:.2f} (P&L: ${pnl:+.2f})")
+                log(f"     ✓ Sold {sell_amt:.1f}sh @ ~{cp:.2f} (P&L: ${pnl:+.2f}) [attempt {attempt}]")
+                self._apply_profit_reserve(pnl)
                 self._record_close(our_token, our_pos, cp, "WHALE_SELL")
                 return
 
             except Exception as e:
-                log(f"     ✗ Sell attempt {attempt}/3 failed: {e}")
-                if attempt < 3:
-                    time.sleep(1)
+                log(f"     ✗ Sell attempt {attempt} failed: {e} — retrying...")
+                time.sleep(min(attempt, 5))
+
+    # ─── EXIT WITH RETRY ─────────────────────────────────────────────
+
+    def _exit_position_retry(self, token_id):
+        """Sell position with unlimited retries until sold."""
+        pos = self.positions.get(token_id)
+        if not pos:
+            return
+
+        log(f"     🏃 Exiting {pos['market_info']['crypto']} {pos['side']}...")
+
+        if DRY_RUN:
+            cp = get_price(token_id, side=SELL)
+            pnl = (cp - pos["entry_price"]) * pos["shares"] if cp > 0 else 0
+            log(f"     🧪 DRY RUN — would sell @ ~{cp:.2f} (P&L: ${pnl:+.2f})")
+            self._apply_profit_reserve(pnl)
+            self._record_close(token_id, pos, cp, "SIGNAL_SELL")
+            return
+
+        actual_bal = get_share_balance(token_id)
+        if not actual_bal or actual_bal < 0.5:
+            log(f"     ⚠ No shares to sell (balance={actual_bal})")
+            self._record_close(token_id, pos, pos["entry_price"], "SIGNAL_SELL_EMPTY")
+            return
+
+        sell_amt = math.floor(actual_bal * 100) / 100
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                mo = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=sell_amt,
+                    side=SELL,
+                    order_type=OrderType.FAK,
+                )
+                signed = client.create_market_order(mo)
+                resp = client.post_order(signed, OrderType.FAK)
+
+                cp = get_price(token_id, side=SELL)
+                if cp <= 0:
+                    cp = pos["entry_price"]
+                pnl = (cp * sell_amt) - pos["cost"]
+                log(f"     ✓ Sold {sell_amt:.1f}sh @ ~{cp:.2f} (P&L: ${pnl:+.2f}) [attempt {attempt}]")
+                self._apply_profit_reserve(pnl)
+                self._record_close(token_id, pos, cp, "SIGNAL_SELL")
+                return
+
+            except Exception as e:
+                log(f"     ✗ Sell attempt {attempt} failed: {e} — retrying...")
+                time.sleep(min(attempt, 5))
+
+    # ─── PROFIT RESERVE ──────────────────────────────────────────────
+
+    def _apply_profit_reserve(self, pnl):
+        """If profit > $2, keep $1, compound the rest."""
+        if pnl > 2.0:
+            self._reserved += 1.0
+            log(f"     💰 Keeping $1 (total reserved: ${self._reserved:.2f})")
 
     # ─── EXECUTE BUY ─────────────────────────────────────────────────
 
     def _execute_buy(self, *, token_id, condition_id, side, price,
                      wallet_addr, wallet_name, market_info, whale_size):
-        amount = BUY_AMOUNT
-
         balance = get_usdc_balance()
         if balance is None:
             log(f"     ⚠ Can't get balance — skipping")
             return False
-        if balance < MIN_BET:
-            log(f"     ⚠ Balance ${balance:.2f} < ${MIN_BET} — skipping")
+        available = balance - self._reserved
+        if available < MIN_BET:
+            log(f"     ⚠ Available ${available:.2f} < ${MIN_BET} (reserved=${self._reserved:.2f})")
             return False
-        amount = min(amount, math.floor(balance * 100) / 100)
+        amount = math.floor(available * 100) / 100
 
         current_price = get_price(token_id, side=BUY)
         if current_price <= 0:
@@ -998,6 +1088,7 @@ class WhaleBot:
                 pnl = -cost
                 log(f"\n  ❌ LOST: {pos['market_info']['question']}")
 
+            self._apply_profit_reserve(pnl)
             self._session_trades += 1
             self._session_pnl += pnl
             log(f"     {pos['side']} @ {entry_price:.2f} → P&L: ${pnl:+.2f} "
