@@ -57,7 +57,7 @@ DRY_RUN = "--dry-run" in sys.argv
 # STRATEGY PARAMETERS
 # =========================================================================
 MIN_WHALE_SIZE = 100          # Minimum accumulated $ to count as a whale trade
-CONSENSUS_COUNT = 5          # Need N consecutive same-direction whale buys to enter
+CONSENSUS_COUNT = 10          # Need N consecutive same-direction whale buys to enter
 MIN_BET = 1                   # Minimum viable bet
 ACCUM_WINDOW = 15             # Seconds to accumulate fragments from same wallet+token
 COOLDOWN_SECS = 15            # Don't re-enter same market within this window
@@ -93,7 +93,7 @@ CIRCUIT_BREAKER_PAUSE = 300   # Seconds to pause when breaker trips
 
 # Price band — skip buys at extreme prices (bad risk/reward)
 MIN_ENTRY_PRICE = 0.15        # Don't buy below (too speculative)
-MAX_ENTRY_PRICE = 0.85        # Don't buy above (not enough upside)
+MAX_ENTRY_PRICE = 0.92        # Don't buy above (not enough upside)
 
 # Stop-loss: exit if mid-trade price drops this far below entry
 STOP_LOSS_DELTA = 0.15        # Exit if price drops 15 cents below entry
