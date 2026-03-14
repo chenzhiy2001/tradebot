@@ -57,8 +57,8 @@ DRY_RUN = "--dry-run" in sys.argv
 # STRATEGY PARAMETERS
 # =========================================================================
 MIN_WHALE_SIZE = 100          # Minimum accumulated $ to count as a whale trade
-CONSENSUS_COUNT = 10          # Need N consecutive same-direction whale buys to enter
-MIN_BET = 3                   # Minimum viable bet
+CONSENSUS_COUNT = 5          # Need N consecutive same-direction whale buys to enter
+MIN_BET = 1                   # Minimum viable bet
 ACCUM_WINDOW = 15             # Seconds to accumulate fragments from same wallet+token
 COOLDOWN_SECS = 15            # Don't re-enter same market within this window
 MAX_POSITIONS = 6             # Max concurrent positions
