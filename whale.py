@@ -63,7 +63,6 @@ ACCUM_WINDOW = 15             # Seconds to accumulate fragments from same wallet
 COOLDOWN_SECS = 15            # Don't re-enter same market within this window
 MAX_POSITIONS = 6             # Max concurrent positions
 MAX_PER_WINDOW = 5            # Max new entries per 5-min window
-MAX_RISK_PCT = 0.95           # Don't risk more than 95% of balance
 
 # Anti market-maker: if wallet trades both sides within this window, ignore
 MM_DETECT_WINDOW = 60         # Seconds
@@ -78,6 +77,29 @@ MUTE_THRESHOLD = 0            # Mute if PnL below this
 # Polymarket fee
 CRYPTO_FEE_RATE = 0.25
 CRYPTO_FEE_EXPONENT = 2
+
+# =========================================================================
+# RISK CONTROL
+# =========================================================================
+# Position sizing
+MAX_RISK_PCT = 0.30           # Risk at most 30% of available balance per trade
+MAX_BET = 50                  # Absolute max $ per single trade
+MIN_BALANCE_FLOOR = 5         # Stop trading if balance drops below this
+
+# Drawdown circuit breaker
+MAX_CONSECUTIVE_LOSSES = 4    # Pause after N consecutive losses
+MAX_SESSION_LOSS = -30        # Pause if session P&L drops below this
+CIRCUIT_BREAKER_PAUSE = 300   # Seconds to pause when breaker trips
+
+# Price band — skip buys at extreme prices (bad risk/reward)
+MIN_ENTRY_PRICE = 0.15        # Don't buy below (too speculative)
+MAX_ENTRY_PRICE = 0.85        # Don't buy above (not enough upside)
+
+# Stop-loss: exit if mid-trade price drops this far below entry
+STOP_LOSS_DELTA = 0.15        # Exit if price drops 15 cents below entry
+
+# Profit reservation — protect gains
+PROFIT_RESERVE_PCT = 0.30     # Reserve 30% of each win as profit
 
 # Files
 LOG_FILE = "whale_log.txt"
@@ -418,6 +440,10 @@ class WhaleBot:
 
         self._window_entries = {}     # epoch_key → count
 
+        # Risk control state
+        self._consecutive_losses = 0
+        self._circuit_breaker_until = 0  # timestamp when breaker lifts
+
     # ─── MAIN LOOP ───────────────────────────────────────────────────
 
     def run(self):
@@ -426,6 +452,9 @@ class WhaleBot:
         log(f"Whale threshold: ${MIN_WHALE_SIZE}")
         log(f"Consensus: {CONSENSUS_COUNT} buys, max positions: {MAX_POSITIONS}")
         log(f"Markets: {', '.join(sorted(CRYPTOS))} × {INTERVALS}min")
+        log(f"Risk: {MAX_RISK_PCT*100:.0f}% per trade, max ${MAX_BET}, "
+            f"stop-loss {STOP_LOSS_DELTA}, price [{MIN_ENTRY_PRICE}-{MAX_ENTRY_PRICE}]")
+        log(f"Breaker: {MAX_CONSECUTIVE_LOSSES} losses or ${MAX_SESSION_LOSS} session loss → {CIRCUIT_BREAKER_PAUSE}s pause")
         log(f"{'='*60}\n")
 
         self._start_balance = get_usdc_balance()
@@ -455,6 +484,7 @@ class WhaleBot:
                     self.market_cache.refresh()
 
                 self._check_resolutions()
+                self._check_stop_losses()
                 self._clean_mm_tracker()
 
                 if time.time() - last_status > 30:
@@ -709,6 +739,15 @@ class WhaleBot:
             log(f"     ⊘ Skip: cooldown ({remaining:.0f}s left)")
             return
 
+        # Circuit breaker check
+        if time.time() < self._circuit_breaker_until:
+            remaining = self._circuit_breaker_until - time.time()
+            log(f"     ⊘ Skip: circuit breaker active ({remaining:.0f}s left)")
+            return
+        if self._session_pnl < MAX_SESSION_LOSS:
+            log(f"     ⊘ Skip: session loss ${self._session_pnl:+.2f} exceeds limit ${MAX_SESSION_LOSS}")
+            return
+
         if len(self.positions) >= MAX_POSITIONS:
             log(f"     ⊘ Skip: max positions ({MAX_POSITIONS})")
             return
@@ -716,9 +755,22 @@ class WhaleBot:
         # Budget check
         balance = get_usdc_balance()
         if balance is not None:
+            if balance < MIN_BALANCE_FLOOR:
+                log(f"     ⊘ Skip: balance ${balance:.2f} below floor ${MIN_BALANCE_FLOOR}")
+                return
             available = balance - self._reserved
             if available < MIN_BET:
                 log(f"     ⊘ Skip: available ${available:.2f} < ${MIN_BET}")
+                return
+
+        # Price band filter
+        pre_price = get_price(buy_token, side=BUY)
+        if pre_price > 0:
+            if pre_price < MIN_ENTRY_PRICE:
+                log(f"     ⊘ Skip: price {pre_price:.2f} below min {MIN_ENTRY_PRICE} (too speculative)")
+                return
+            if pre_price > MAX_ENTRY_PRICE:
+                log(f"     ⊘ Skip: price {pre_price:.2f} above max {MAX_ENTRY_PRICE} (not enough upside)")
                 return
 
         # Per-window limit
@@ -883,13 +935,39 @@ class WhaleBot:
                 log(f"     ✗ Sell attempt {attempt} failed: {e} — retrying...")
                 time.sleep(min(attempt, 5))
 
+    # ─── STOP-LOSS CHECK ────────────────────────────────────────────
+
+    def _check_stop_losses(self):
+        """Exit positions where price has dropped significantly below entry."""
+        for token_id in list(self.positions.keys()):
+            pos = self.positions.get(token_id)
+            if not pos:
+                continue
+            cp = get_price(token_id, side=SELL)
+            if cp <= 0:
+                continue
+            drop = pos["entry_price"] - cp
+            if drop >= STOP_LOSS_DELTA:
+                log(f"\n  🛑 STOP-LOSS: {pos['market_info']['crypto']} {pos['side']} "
+                    f"dropped {drop:.2f} (entry {pos['entry_price']:.2f} → {cp:.2f})")
+                self._exit_position_retry(token_id)
+
     # ─── PROFIT RESERVE ──────────────────────────────────────────────
 
     def _apply_profit_reserve(self, pnl):
-        """If profit > $2, keep $1, compound the rest."""
-        if pnl > 2.0:
-            self._reserved += 1.0
-            log(f"     💰 Keeping $1 (total reserved: ${self._reserved:.2f})")
+        """Reserve a percentage of profits; track consecutive losses for circuit breaker."""
+        if pnl >= 0:
+            self._consecutive_losses = 0
+            if pnl > 0:
+                reserve = pnl * PROFIT_RESERVE_PCT
+                self._reserved += reserve
+                log(f"     💰 Reserving ${reserve:.2f} (total reserved: ${self._reserved:.2f})")
+        else:
+            self._consecutive_losses += 1
+            if self._consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                self._circuit_breaker_until = time.time() + CIRCUIT_BREAKER_PAUSE
+                log(f"     🛑 CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses "
+                    f"— pausing {CIRCUIT_BREAKER_PAUSE}s")
 
     # ─── EXECUTE BUY ─────────────────────────────────────────────────
 
@@ -903,7 +981,13 @@ class WhaleBot:
         if available < MIN_BET:
             log(f"     ⚠ Available ${available:.2f} < ${MIN_BET} (reserved=${self._reserved:.2f})")
             return False
-        amount = math.floor(available * 100) / 100
+        # Position sizing: risk-adjusted bet
+        risk_amount = available * MAX_RISK_PCT
+        amount = min(risk_amount, MAX_BET)
+        amount = max(amount, MIN_BET)
+        amount = math.floor(amount * 100) / 100
+        if amount > available:
+            amount = math.floor(available * 100) / 100
 
         current_price = get_price(token_id, side=BUY)
         if current_price <= 0:
@@ -1257,10 +1341,13 @@ class WhaleBot:
             f"| Markets: {n_markets} | Pos: {n_pos}/{MAX_POSITIONS} "
             f"| Whales seen: {n_tracked} ({n_muted} muted)")
 
+        breaker_active = time.time() < self._circuit_breaker_until
+        breaker_str = f" | ⚠ BREAKER ({self._circuit_breaker_until - time.time():.0f}s)" if breaker_active else ""
         if self._session_trades > 0:
             wr = self._session_wins / self._session_trades * 100
             log(f"     Session: {self._session_trades} trades, {self._session_wins}W, "
-                f"PnL=${self._session_pnl:+.2f}, WR={wr:.0f}%")
+                f"PnL=${self._session_pnl:+.2f}, WR={wr:.0f}%, "
+                f"streak={self._consecutive_losses}L, reserved=${self._reserved:.2f}{breaker_str}")
 
         if self.positions:
             for tok, pos in self.positions.items():
