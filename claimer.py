@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-Auto-claimer for Polymarket — redeems winning positions gaslessly via Builder Relayer.
+Auto-claimer for Polymarket — redeems winning positions gaslessly via Relayer API key.
 
 Usage:
     python claimer.py                    # one-shot: claim all redeemable positions
     python claimer.py --batch 20         # claim up to 20 positions per run
-    python claimer.py --loop 120         # poll every 120 s (auto-waits on rate limit)
+    python claimer.py --loop 120         # poll every 120 s
     python claimer.py --loop 120 --batch 10
 """
 
 import argparse
 import logging
 import os
-import re
 import sys
 import time
+from json import dumps
 
 import httpx
 from dotenv import load_dotenv
 
 from polymarket_apis.clients.data_client import PolymarketDataClient
 from polymarket_apis.clients.web3_client import PolymarketGaslessWeb3Client
-from polymarket_apis.types.clob_types import ApiCreds
+from polymarket_apis.types.web3_types import TransactionReceipt
 
 # ── logging ─────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -38,28 +38,56 @@ MAX_RETRIES = 5  # per-position retry count
 INITIAL_BACKOFF = 10  # seconds (doubles each attempt)
 
 
-# ── helpers ─────────────────────────────────────────────────────────
-_RESET_RE = re.compile(r"resets?\s+in\s+(\d+)\s+seconds?", re.IGNORECASE)
+# ── Relayer API key client ──────────────────────────────────────────
+class RelayerWeb3Client(PolymarketGaslessWeb3Client):
+    """Gasless client using Relayer API key auth (no daily tx limit)."""
 
+    def __init__(self, private_key, relayer_api_key, relayer_api_key_address,
+                 signature_type=1, chain_id=137):
+        super().__init__(private_key, signature_type=signature_type,
+                         builder_creds=None, chain_id=chain_id)
+        self._relayer_api_key = relayer_api_key
+        self._relayer_api_key_address = relayer_api_key_address
 
-def _parse_reset_seconds(resp: httpx.Response) -> int | None:
-    """Extract the quota-reset countdown from a 429 JSON body."""
-    try:
-        body = resp.json()
-        msg = body.get("error", "") if isinstance(body, dict) else ""
-        m = _RESET_RE.search(msg)
-        if m:
-            return int(m.group(1))
-    except Exception:
-        pass
-    return None
+    def _execute(self, to, data, operation_name, metadata=None):
+        """Execute transaction via relay using Relayer API key headers."""
+        match self.signature_type:
+            case 1:
+                body = self._build_proxy_relay_transaction(to, data, metadata or "")
+            case 2:
+                body = self._build_safe_relay_transaction(to, data, metadata or "")
+            case _:
+                raise ValueError(f"Invalid signature_type: {self.signature_type}")
 
+        headers = {
+            "RELAYER_API_KEY": self._relayer_api_key,
+            "RELAYER_API_KEY_ADDRESS": self._relayer_api_key_address,
+            "Content-Type": "application/json",
+        }
 
-class QuotaExhausted(Exception):
-    """Raised when the builder quota is fully exhausted (long reset)."""
-    def __init__(self, reset_seconds: int):
-        self.reset_seconds = reset_seconds
-        super().__init__(f"Builder quota exhausted — resets in {reset_seconds}s")
+        url = f"{self.relay_url}/submit"
+        response = self.client.post(
+            url, headers=headers, content=dumps(body).encode("utf-8")
+        )
+        response.raise_for_status()
+
+        gasless_response = response.json()
+        print(f"Gasless txn submitted: {gasless_response.get('transactionHash', 'N/A')}")
+        print(f"Transaction ID: {gasless_response.get('transactionID', 'N/A')}")
+        print(f"State: {gasless_response.get('state', 'N/A')}")
+
+        tx_hash = gasless_response.get("transactionHash")
+        if tx_hash:
+            receipt_dict = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            receipt = TransactionReceipt.model_validate(receipt_dict)
+            print(
+                f"{operation_name} succeeded"
+                if receipt.status == 1
+                else f"{operation_name} failed"
+            )
+            return receipt
+        msg = f"No transaction hash in response: {gasless_response}"
+        raise ValueError(msg)
 
 
 # ── env ─────────────────────────────────────────────────────────────
@@ -68,18 +96,16 @@ def load_env():
     load_dotenv()
     private_key = os.getenv("PRIVATE_KEY")
     funder_address = os.getenv("FUNDER_ADDRESS")
-    builder_key = os.getenv("BUILDER_API_KEY")
-    builder_secret = os.getenv("BUILDER_API_SECRET")
-    builder_passphrase = os.getenv("BUILDER_API_PASSPHRASE")
+    relayer_key = os.getenv("RELAYER_API_KEY")
+    relayer_address = os.getenv("RELAYER_API_KEY_ADDRESS")
 
     missing = [
         name
         for name, val in [
             ("PRIVATE_KEY", private_key),
             ("FUNDER_ADDRESS", funder_address),
-            ("BUILDER_API_KEY", builder_key),
-            ("BUILDER_API_SECRET", builder_secret),
-            ("BUILDER_API_PASSPHRASE", builder_passphrase),
+            ("RELAYER_API_KEY", relayer_key),
+            ("RELAYER_API_KEY_ADDRESS", relayer_address),
         ]
         if not val
     ]
@@ -87,12 +113,7 @@ def load_env():
         log.error("Missing env vars: %s", ", ".join(missing))
         sys.exit(1)
 
-    builder_creds = ApiCreds(
-        key=builder_key,
-        secret=builder_secret,
-        passphrase=builder_passphrase,
-    )
-    return private_key, funder_address, builder_creds
+    return private_key, funder_address, relayer_key, relayer_address
 
 
 # ── data fetching ───────────────────────────────────────────────────
@@ -118,17 +139,13 @@ def fetch_redeemable(data_client: PolymarketDataClient, user: str):
 
 # ── single claim ────────────────────────────────────────────────────
 def claim_position(
-    web3_client: PolymarketGaslessWeb3Client,
+    web3_client: RelayerWeb3Client,
     condition_id: str,
     size: float,
     outcome_index: int,
     neg_risk: bool,
 ):
-    """
-    Redeem one position with retry / back-off.
-
-    Raises QuotaExhausted if the 429 body indicates a long reset window (>60 s).
-    """
+    """Redeem one position with retry / back-off."""
     amounts = [0.0, 0.0]
     amounts[outcome_index] = size
 
@@ -140,23 +157,6 @@ def claim_position(
                 neg_risk=neg_risk,
             )
             return receipt
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                reset = _parse_reset_seconds(e.response)
-                if reset and reset > 60:
-                    # quota truly exhausted — bubble up so caller can wait / abort
-                    raise QuotaExhausted(reset) from e
-                wait = INITIAL_BACKOFF * (2 ** (attempt - 1))
-                if attempt < MAX_RETRIES:
-                    log.warning(
-                        "    429 rate-limited. Retry %d/%d in %ds…",
-                        attempt, MAX_RETRIES, wait,
-                    )
-                    time.sleep(wait)
-                else:
-                    raise
-            else:
-                raise
         except Exception:
             wait = INITIAL_BACKOFF * (2 ** (attempt - 1))
             if attempt < MAX_RETRIES:
@@ -172,19 +172,19 @@ def claim_position(
 # ── batch claim ─────────────────────────────────────────────────────
 def claim_all(
     data_client: PolymarketDataClient,
-    web3_client: PolymarketGaslessWeb3Client,
+    web3_client: RelayerWeb3Client,
     user: str,
     batch: int | None = None,
-) -> tuple[int, int, bool]:
+) -> tuple[int, int]:
     """
     Find and redeem redeemable positions.
 
-    Returns (claimed, failed, quota_hit).
+    Returns (claimed, failed).
     """
     positions = fetch_redeemable(data_client, user)
     if not positions:
         log.info("No redeemable positions found.")
-        return 0, 0, False
+        return 0, 0
 
     total_size = sum(p.size for p in positions)
     log.info(
@@ -205,7 +205,6 @@ def claim_all(
 
     claimed = 0
     failed = 0
-    quota_hit = False
 
     for i, p in enumerate(positions):
         log.info(
@@ -224,14 +223,6 @@ def claim_all(
             log.info("  ✓ Claimed  tx=%s", tx_hash)
             claimed += 1
 
-        except QuotaExhausted as qe:
-            log.warning(
-                "  ⏳ Builder quota exhausted — resets in %ds. Stopping batch.",
-                qe.reset_seconds,
-            )
-            quota_hit = True
-            break
-
         except Exception:
             log.exception("  ✗ Failed to redeem %s (%s)", p.title, p.outcome)
             failed += 1
@@ -244,7 +235,7 @@ def claim_all(
         "Batch done: %d claimed, %d failed, %d remaining.",
         claimed, failed, len(positions) - claimed - failed,
     )
-    return claimed, failed, quota_hit
+    return claimed, failed
 
 
 # ── main ────────────────────────────────────────────────────────────
@@ -266,13 +257,14 @@ def main():
     )
     args = parser.parse_args()
 
-    private_key, funder_address, builder_creds = load_env()
+    private_key, funder_address, relayer_key, relayer_address = load_env()
 
     data_client = PolymarketDataClient()
-    web3_client = PolymarketGaslessWeb3Client(
+    web3_client = RelayerWeb3Client(
         private_key=private_key,
+        relayer_api_key=relayer_key,
+        relayer_api_key_address=relayer_address,
         signature_type=1,  # Poly proxy wallets
-        builder_creds=builder_creds,
         chain_id=CHAIN_ID,
     )
 
@@ -284,15 +276,10 @@ def main():
         log.info("Polling every %ds. Ctrl+C to stop.", args.loop)
         try:
             while True:
-                _, _, quota_hit = claim_all(
+                claim_all(
                     data_client, web3_client, funder_address, batch=args.batch
                 )
-                wait = args.loop
-                if quota_hit:
-                    # back off longer when quota is exhausted
-                    wait = max(args.loop, 120)
-                    log.info("Quota hit — sleeping %ds before next cycle.", wait)
-                time.sleep(wait)
+                time.sleep(args.loop)
         except KeyboardInterrupt:
             log.info("Stopped by user.")
 
